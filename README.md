@@ -80,3 +80,53 @@ timestamp,open,high,low,close,volume
 
 Такие источники должны подключаться отдельными providers и не смешиваться
 с расчётами цены без явной атрибуции.
+
+## Crypto Derivatives Intelligence
+
+Модуль добавляет к техническому сигналу независимый информационный контекст
+Bybit: funding rate, текущее open interest, изменения OI/цены/объёма и
+15-минутный quote-notional ликвидаций. Он классифицирует устойчивый рост,
+перегретый LONG, накопление SHORT, short/long squeeze и движение без
+подтверждения OI. Исходный технический сигнал не изменяется.
+
+REST snapshot использует публичные endpoints и не требует API-ключей:
+
+```python
+from market_signal_assistant.composition import build_derivatives_components
+
+components = build_derivatives_components()
+snapshot = components.provider.collect("BTCUSDT")  # сеть только здесь
+positioning = components.intelligence.analyze(snapshot)
+print(positioning.regime.value, positioning.directional_score)
+```
+
+Для liquidation WebSocket установите optional dependency:
+
+```powershell
+python -m pip install -e ".[websocket]"
+```
+
+Поток запускается и останавливается только явно:
+
+```python
+components.stream.start("BTCUSDT")
+try:
+    snapshot = components.provider.collect("BTCUSDT")
+finally:
+    components.stream.stop()
+```
+
+Создание компонентов и импорт package не открывают HTTP или WebSocket
+соединения. REST вызывается только через `collect()`, WebSocket — через
+`start()`. Для корректной интерпретации изменений сравниваемые точки должны
+иметь одинаковые интервалы; до накопления событий liquidation totals равны
+нулю. Поток ликвидаций является live-контекстом и сам по себе не предоставляет
+исторический backfill.
+
+Technical score сохраняется на шкале `0..100`, derivatives direction — на
+шкале `-1..1`. Fusion приводит оба источника к confidence-adjusted signed
+шкале `-100..100`: положительное значение означает bullish-контекст,
+отрицательное — bearish-контекст.
+
+Derivatives intelligence является информационным контекстом, а не торговой
+или инвестиционной рекомендацией.
