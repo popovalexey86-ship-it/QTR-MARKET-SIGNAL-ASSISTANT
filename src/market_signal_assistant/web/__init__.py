@@ -1,0 +1,1 @@
+"""Lightweight WSGI dashboard adapter."""

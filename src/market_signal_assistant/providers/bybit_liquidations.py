@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict, deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from threading import Lock
@@ -13,7 +13,7 @@ from market_signal_assistant.derivatives.provider import DerivativesDataError
 
 class LiquidationSocket(Protocol):
     def all_liquidation_stream(
-        self, symbol: str, callback: Callable[[object], None]
+        self, symbol: str | list[str], callback: Callable[[object], None]
     ) -> object: ...
 
     def exit(self) -> object: ...
@@ -105,11 +105,18 @@ class BybitLiquidationStream:
     def running(self) -> bool:
         return self._socket is not None
 
-    def start(self, symbol: str) -> None:
+    def start(self, symbol: str | Sequence[str]) -> None:
         if self._socket is not None:
             raise RuntimeError("Bybit liquidation stream is already running.")
-        normalized_symbol = symbol.strip().upper()
-        if not normalized_symbol:
+        normalized_symbol: str | list[str]
+        if isinstance(symbol, str):
+            normalized_symbol = symbol.strip().upper()
+        else:
+            normalized_symbol = [item.strip().upper() for item in symbol]
+        if not normalized_symbol or (
+            isinstance(normalized_symbol, list)
+            and any(not item for item in normalized_symbol)
+        ):
             raise ValueError("Liquidation symbol cannot be empty.")
         try:
             socket = self._factory(
@@ -142,7 +149,7 @@ class BybitLiquidationStream:
 
 def _pybit_websocket_factory(**kwargs: object) -> LiquidationSocket:
     try:
-        from pybit.unified_trading import WebSocket  # type: ignore[import-untyped]
+        from pybit.unified_trading import WebSocket  # type: ignore[import-not-found]
     except ImportError:
         raise DerivativesDataError(
             "WebSocket support requires the optional 'websocket' dependency."

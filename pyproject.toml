@@ -11,9 +11,15 @@ dependencies = []
 
 [project.optional-dependencies]
 websocket = ["pybit>=5.11,<6"]
+web = []
+telegram = ["python-telegram-bot>=22.8,<23"]
+all = ["pybit>=5.11,<6", "python-telegram-bot>=22.8,<23"]
 
 [project.scripts]
 market-screener = "market_signal_assistant.cli:main"
+market-signal-cli = "market_signal_assistant.cli:main"
+market-signal-web = "market_signal_assistant.web.app:main"
+market-signal-telegram = "market_signal_assistant.telegram.bot:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

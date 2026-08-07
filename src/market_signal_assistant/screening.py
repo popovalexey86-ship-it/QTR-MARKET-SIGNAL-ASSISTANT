@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from datetime import UTC, datetime
 
+from market_signal_assistant.application.models import ScreeningRequest
+from market_signal_assistant.application.service import MarketScreeningService
 from market_signal_assistant.engine import SignalEngine
 from market_signal_assistant.models import (
     Instrument,
@@ -31,33 +32,42 @@ class MarketScreener:
     ) -> ScreeningResult:
         if limit <= 0:
             raise ValueError("Candle limit must be positive.")
-        signals = []
-        no_signal = []
-        failures = []
-        for instrument in instruments:
-            try:
-                series = self._provider.load(instrument, interval, limit)
-                signal = self._engine.analyze(series)
-            except Exception as error:
-                failures.append(
-                    ScreeningFailure(
-                        instrument=instrument,
-                        error_type=type(error).__name__,
-                        message=str(error),
-                    )
-                )
-                continue
-            if signal is None:
-                no_signal.append(instrument)
-            else:
-                signals.append(signal)
-        signals.sort(
-            key=lambda signal: (signal.confidence, signal.score),
-            reverse=True,
+        selected = tuple(instruments)
+        if not selected:
+            from datetime import UTC, datetime
+
+            return ScreeningResult(datetime.now(UTC), (), (), ())
+        report = MarketScreeningService(
+            provider=self._provider,
+            analyzer=self._engine,
+            candle_limit=limit,
+        ).screen(
+            ScreeningRequest(
+                instruments=selected,
+                interval=interval,
+                minimum_score=0.0,
+                minimum_confidence=0.0,
+                maximum_results=len(selected),
+            )
         )
         return ScreeningResult(
-            generated_at=datetime.now(UTC),
-            signals=tuple(signals),
-            no_signal=tuple(no_signal),
-            failures=tuple(failures),
+            generated_at=report.generated_at,
+            signals=tuple(
+                item.technical_signal
+                for item in report.ranked_signals
+                if item.technical_signal is not None
+            ),
+            no_signal=tuple(
+                item.instrument
+                for item in report.successful_results
+                if item.technical_signal is None
+            ),
+            failures=tuple(
+                ScreeningFailure(
+                    instrument=item.instrument,
+                    error_type=item.error_type,
+                    message=item.message,
+                )
+                for item in report.failed_instruments
+            ),
         )

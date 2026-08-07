@@ -4,31 +4,38 @@ import argparse
 import json
 import sys
 from collections.abc import Sequence
-from dataclasses import asdict
-from datetime import datetime
-from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Protocol
 
-from market_signal_assistant.engine import SignalEngine
-from market_signal_assistant.models import AssetClass, Instrument, ScreeningResult
-from market_signal_assistant.providers import (
-    CsvMarketDataProvider,
-    RoutingMarketDataProvider,
+from market_signal_assistant.application.models import (
+    ScreeningReport,
+    ScreeningRequest,
 )
-from market_signal_assistant.screening import MarketScreener
+from market_signal_assistant.application.presentation import (
+    format_number,
+    present_report,
+)
+from market_signal_assistant.localized_argparse import RussianArgumentParser
+from market_signal_assistant.models import AssetClass, Instrument
+
+
+class ScreeningService(Protocol):
+    def screen(self, request: ScreeningRequest) -> ScreeningReport: ...
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Explainable multi-asset market signal screener."
+    parser = RussianArgumentParser(
+        description="Объяснимый информационный скринер рыночных сигналов."
     )
     parser.add_argument(
         "--instrument",
         action="append",
         required=True,
         type=_instrument,
-        help="SYMBOL:crypto|stock|fund|forex; repeat for a watchlist.",
+        help=(
+            "SYMBOL:crypto|stock|fund|forex; повторите параметр для списка "
+            "наблюдения."
+        ),
     )
     parser.add_argument(
         "--interval",
@@ -38,45 +45,40 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=_positive_int, default=250)
     parser.add_argument("--min-score", type=_score, default=45.0)
     parser.add_argument("--min-confirmations", type=_positive_int, default=2)
+    parser.add_argument("--min-confidence", type=_score, default=0.0)
+    parser.add_argument("--maximum-results", type=_positive_int, default=10)
+    parser.add_argument("--include-derivatives", action="store_true")
     parser.add_argument(
         "--csv",
         action="append",
         default=[],
         type=_csv_mapping,
-        help="Optional offline SYMBOL=path mapping; repeat as needed.",
+        help="Необязательное offline-сопоставление SYMBOL=path.",
     )
     parser.add_argument("--json-output", type=Path)
     return parser
 
 
-def run(args: argparse.Namespace) -> ScreeningResult:
-    csv_paths = dict(args.csv)
-    provider = RoutingMarketDataProvider(
-        csv_provider=(
-            CsvMarketDataProvider(csv_paths) if csv_paths else None
-        )
-    )
-    screener = MarketScreener(
-        provider=provider,
-        engine=SignalEngine(
-            min_score=args.min_score,
-            min_confirmations=args.min_confirmations,
-        ),
-    )
-    result = screener.screen(
-        args.instrument,
+def run(
+    args: argparse.Namespace,
+    service: ScreeningService | None = None,
+) -> ScreeningReport:
+    selected_service = service or _build_service(args)
+    request = ScreeningRequest(
+        instruments=tuple(args.instrument),
         interval=args.interval,
-        limit=args.limit,
+        minimum_score=args.min_score,
+        minimum_confidence=args.min_confidence,
+        include_derivatives=args.include_derivatives,
+        maximum_results=args.maximum_results,
     )
-    _print_result(result)
+    result = selected_service.screen(request)
+    view = present_report(result)
+    _print_view(view)
     if args.json_output is not None:
         args.json_output.parent.mkdir(parents=True, exist_ok=True)
         args.json_output.write_text(
-            json.dumps(
-                _json_value(result),
-                indent=2,
-                ensure_ascii=False,
-            ),
+            json.dumps(view.as_dict(), indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
     return result
@@ -84,33 +86,67 @@ def run(args: argparse.Namespace) -> ScreeningResult:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    result = run(args)
-    return 1 if result.failures and not result.signals else 0
+    report = run(args)
+    return 1 if report.failed_instruments and not report.ranked_signals else 0
 
 
-def _print_result(result: ScreeningResult) -> None:
-    print("Market Signal Assistant")
-    print(f"Generated: {result.generated_at.isoformat()}")
-    print(f"Signals: {len(result.signals)}")
-    for index, signal in enumerate(result.signals, start=1):
+def _build_service(args: argparse.Namespace) -> ScreeningService:
+    # Lazy import keeps --help and module import free of composition/provider setup.
+    from market_signal_assistant.composition import build_screening_service
+    from market_signal_assistant.engine import SignalEngine
+    from market_signal_assistant.providers import (
+        CsvMarketDataProvider,
+        RoutingMarketDataProvider,
+    )
+
+    csv_paths = dict(args.csv)
+    provider = RoutingMarketDataProvider(
+        csv_provider=CsvMarketDataProvider(csv_paths) if csv_paths else None
+    )
+    service, _ = build_screening_service(
+        technical_provider=provider,
+        technical_analyzer=SignalEngine(
+            min_score=1.0,
+            min_confirmations=args.min_confirmations,
+        ),
+        candle_limit=args.limit,
+    )
+    return service
+
+
+def _print_view(view: object) -> None:
+    from market_signal_assistant.application.presentation import ReportView
+
+    if not isinstance(view, ReportView):
+        raise TypeError("Expected ReportView.")
+    print("Информационный помощник по рынку")
+    print(f"Сформировано: {view.generated_at}")
+    print(f"Сигналы: {len(view.ranked_signals)}")
+    if not view.ranked_signals:
+        print("Подходящих сигналов не найдено.")
+    for index, signal in enumerate(view.ranked_signals, start=1):
         print(
-            f"{index}. {signal.instrument.symbol} "
-            f"{signal.direction.value} "
-            f"score={signal.score:.1f} "
-            f"confidence={signal.confidence:.1f}% "
-            f"price={signal.price:.8g}"
+            f"{index}. {signal.symbol} — {signal.direction}\n"
+            f"   Итоговый балл: {format_number(signal.combined_score)}\n"
+            "   Техническая сила сигнала: "
+            f"{format_number(signal.technical_score)}\n"
+            f"   Уверенность: {format_number(signal.confidence)}%\n"
+            f"   Подтверждения: {signal.confirmations}\n"
+            f"   Контекст деривативов: {signal.derivatives_context}"
         )
-        for evidence in signal.evidence:
-            marker = "+" if evidence.direction is signal.direction else "!"
-            print(f"   {marker} {evidence.name}: {evidence.detail}")
-    print(f"No signal: {len(result.no_signal)}")
-    print(f"Failures: {len(result.failures)}")
-    for failure in result.failures:
+        for reason in signal.explanations:
+            print(f"   Причина: {reason}")
+        if signal.conflicts:
+            print(f"   Противоречия: {signal.conflicts}")
+        for warning in signal.warnings:
+            print(f"   Предупреждение: {warning}")
+    for failure in view.failed_instruments:
         print(
-            f"   {failure.instrument.symbol}: "
-            f"{failure.error_type}: {failure.message}",
+            f"   Ошибка анализа {failure.symbol} "
+            f"({failure.stage}): {failure.message}",
             file=sys.stderr,
         )
+    print(view.disclaimer)
 
 
 def _instrument(value: str) -> Instrument:
@@ -119,7 +155,7 @@ def _instrument(value: str) -> Instrument:
         return Instrument(symbol, AssetClass(asset_class.lower()))
     except (ValueError, TypeError):
         raise argparse.ArgumentTypeError(
-            "instrument must be SYMBOL:crypto|stock|fund|forex"
+            "инструмент должен иметь формат SYMBOL:crypto|stock|fund|forex"
         ) from None
 
 
@@ -127,19 +163,24 @@ def _csv_mapping(value: str) -> tuple[str, Path]:
     try:
         symbol, path = value.split("=", 1)
     except ValueError:
-        raise argparse.ArgumentTypeError("CSV mapping must be SYMBOL=path") from None
+        raise argparse.ArgumentTypeError(
+            "CSV-сопоставление должно иметь формат SYMBOL=path"
+        ) from None
     if not symbol.strip() or not path.strip():
-        raise argparse.ArgumentTypeError("CSV mapping must be SYMBOL=path")
-    return symbol, Path(path)
+        raise argparse.ArgumentTypeError(
+            "CSV-сопоставление должно иметь формат SYMBOL=path"
+        )
+    return symbol.strip().upper(), Path(path)
 
 
 def _positive_int(value: str) -> int:
     try:
         parsed = int(value)
     except ValueError:
-        raise argparse.ArgumentTypeError("expected a positive integer") from None
+        message = "ожидается положительное целое число"
+        raise argparse.ArgumentTypeError(message) from None
     if parsed <= 0:
-        raise argparse.ArgumentTypeError("expected a positive integer")
+        raise argparse.ArgumentTypeError("ожидается положительное целое число")
     return parsed
 
 
@@ -147,29 +188,10 @@ def _score(value: str) -> float:
     try:
         parsed = float(value)
     except ValueError:
-        raise argparse.ArgumentTypeError("score must be between 0 and 100") from None
-    if not 0 < parsed <= 100:
-        raise argparse.ArgumentTypeError("score must be between 0 and 100")
+        raise argparse.ArgumentTypeError("балл должен быть от 0 до 100") from None
+    if not 0 <= parsed <= 100:
+        raise argparse.ArgumentTypeError("балл должен быть от 0 до 100")
     return parsed
-
-
-def _json_value(value: Any) -> Any:
-    if isinstance(value, Enum):
-        return value.value
-    if isinstance(value, datetime):
-        return value.isoformat()
-    if isinstance(value, tuple):
-        return [_json_value(item) for item in value]
-    if hasattr(value, "__dataclass_fields__"):
-        return {
-            key: _json_value(item)
-            for key, item in asdict(value).items()
-        }
-    if isinstance(value, dict):
-        return {key: _json_value(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_json_value(item) for item in value]
-    return value
 
 
 if __name__ == "__main__":

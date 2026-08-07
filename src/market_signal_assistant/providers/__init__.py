@@ -10,6 +10,7 @@ from typing import Any, Protocol
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
+from market_signal_assistant.inplay.models import CatalogInstrument
 from market_signal_assistant.models import (
     AssetClass,
     Candle,
@@ -134,6 +135,37 @@ class BybitPublicProvider:
             tuple(sorted(completed, key=lambda item: item.timestamp)),
         )
 
+    def list_instruments(self) -> tuple[CatalogInstrument, ...]:
+        info = self._request(
+            "https://api.bybit.com/v5/market/instruments-info?"
+            "category=linear&limit=1000"
+        )
+        tickers = self._request(
+            "https://api.bybit.com/v5/market/tickers?category=linear"
+        )
+        try:
+            if info.get("retCode") != 0 or tickers.get("retCode") != 0:
+                raise ValueError
+            info_rows = info["result"]["list"]
+            ticker_rows = tickers["result"]["list"]
+            if not isinstance(info_rows, list) or not isinstance(ticker_rows, list):
+                raise ValueError
+            ticker_by_symbol = {
+                str(row["symbol"]): row
+                for row in ticker_rows
+                if isinstance(row, Mapping)
+            }
+            instruments = tuple(
+                _catalog_instrument(row, ticker_by_symbol)
+                for row in info_rows
+                if isinstance(row, Mapping)
+            )
+        except (KeyError, TypeError, ValueError):
+            raise MarketDataError(
+                "Malformed Bybit instrument catalog response."
+            ) from None
+        return instruments
+
     def _request(self, url: str) -> Mapping[str, Any]:
         last_error: MarketDataError | None = None
         for attempt, delay in enumerate((0.0, 0.5, 1.5), start=1):
@@ -148,6 +180,33 @@ class BybitPublicProvider:
         raise MarketDataError(
             "Bybit public market data is temporarily unavailable."
         ) from last_error
+
+
+def _catalog_instrument(
+    row: Mapping[str, Any],
+    ticker_by_symbol: Mapping[str, Mapping[str, Any]],
+) -> CatalogInstrument:
+    try:
+        symbol = str(row["symbol"])
+        ticker = ticker_by_symbol.get(symbol, {})
+        is_pre_listing = row["isPreListing"]
+        if not isinstance(is_pre_listing, bool):
+            raise ValueError
+        return CatalogInstrument(
+            symbol=symbol,
+            quote_coin=str(row["quoteCoin"]),
+            status=str(row["status"]),
+            turnover_24h=float(ticker.get("turnover24h", 0.0)),
+            bid=float(ticker.get("bid1Price", 0.0)),
+            ask=float(ticker.get("ask1Price", 0.0)),
+            base_coin=str(row["baseCoin"]),
+            settle_coin=str(row["settleCoin"]),
+            contract_type=str(row["contractType"]),
+            symbol_type=str(row["symbolType"]),
+            is_pre_listing=is_pre_listing,
+        )
+    except (KeyError, TypeError, ValueError):
+        raise MarketDataError("Malformed Bybit instrument catalog response.") from None
 
 
 class YahooPublicProvider:

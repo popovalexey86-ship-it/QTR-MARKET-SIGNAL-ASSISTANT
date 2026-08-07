@@ -10,3 +10,5 @@ build/
 reports/
 data/
 .env
+
+.pytest_tmp*/

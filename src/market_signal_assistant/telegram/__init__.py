@@ -1,0 +1,1 @@
+"""Optional Telegram delivery adapter."""
