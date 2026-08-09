@@ -652,7 +652,7 @@ runtime lifecycle и включённом `DERIVATIVES_LIVE_ENABLED`.
 
 **Информационный анализ, не торговая рекомендация.**
 
-## Production deploy и rollback
+## Production deploy и rollback v1.1
 
 Скрипты предназначены только для production checkout `/opt/qtr/scanner` на
 ветке `main`. Запускайте их из корня этого checkout с правами, достаточными для
@@ -663,20 +663,38 @@ cd /opt/qtr/scanner
 sudo bash scripts/deploy.sh
 ```
 
-Deploy требует чистое Git working tree, выполняет `git fetch origin`, сохраняет
+Deploy требует запуска от root, проверяет наличие production user/group
+`qtr:qtr`, чистое Git working tree, выполняет `git fetch origin`, сохраняет
 текущий commit в `/opt/qtr/.deploy/scanner-previous-commit` и обновляет checkout
 строго до проверенного `origin/main`. Сервисы `qtr-scanner-web` и
-`qtr-scanner-telegram` останавливаются перед сменой версии. Виртуальное окружение
-всегда удаляется и создаётся заново только по финальному пути
-`/opt/qtr/scanner/.venv`; перенос `.venv` между release paths не используется.
+`qtr-scanner-telegram` останавливаются перед сменой версии. Root управляет Git,
+state-файлом и systemd, но все операции с production Python environment
+выполняются через `runuser` от `qtr` с `umask 022`: создание venv, pip install,
+pytest, mypy, ruff и локальный health-check.
+
+Виртуальное окружение всегда удаляется и создаётся заново только по финальному
+пути `/opt/qtr/scanner/.venv`; перенос `.venv` между release paths не
+используется. После создания скрипт требует ownership `qtr:qtr` и проверяет от
+лица `qtr` traverse access к `.venv`, а после установки — execute access к
+`market-signal-web` и `market-signal-telegram`. Root-owned venv останавливает
+deploy до запуска сервисов.
 
 После установки `.[web,telegram]`, `pytest`, `mypy` и `ruff` deploy выполняет
-полный test suite, `mypy src` и `ruff check .`, запускает оба сервиса, проверяет
-их через `systemctl is-active` и вызывает только локальный endpoint
-`http://127.0.0.1:8000/health`. Ответ должен иметь HTTP 200 и JSON
-`{"status": "ok"}`. Ошибка после остановки сервисов автоматически возвращает
-сохранённый commit, заново строит `.venv` по финальному пути и перезапускает
-сервисы. Если `HEAD` уже равен `origin/main`, deploy завершается без изменений.
+полный test suite, `mypy src` и `ruff check .`, затем неблокирующе запускает оба
+сервиса. Для каждого сервиса до 30 секунд опрашивается `systemctl is-active`:
+`activating` ожидается дальше, `active` считается успехом, а `failed` —
+немедленной ошибкой. Только после `active` Web service до 30 секунд проверяется
+локальный endpoint `http://127.0.0.1:8000/health`; временный connection refused
+повторяется. Ответ должен иметь HTTP 200 и JSON `{"status": "ok"}`. Telegram
+проверяется только через systemd, без обращения к Telegram API.
+
+Ошибка после остановки сервисов автоматически возвращает сохранённый commit,
+заново строит `.venv` от `qtr` по финальному пути, устанавливает runtime,
+запускает сервисы, ждёт `active` и повторяет Web health-check. При окончательной
+ошибке выводятся только ограниченные systemd-диагностики: `systemctl status` и
+последние 50 строк `journalctl` для каждого сервиса. Environment file и значения
+переменных окружения не читаются. Если `HEAD` уже равен `origin/main`, deploy
+завершается без изменений.
 
 Для ручного возврата к commit, сохранённому последним deploy:
 
@@ -686,9 +704,10 @@ sudo bash scripts/rollback.sh
 ```
 
 Rollback проверяет state-файл и существование commit, останавливает оба сервиса,
-выполняет `git reset --hard` на сохранённый commit, заново создаёт только
-`/opt/qtr/scanner/.venv`, устанавливает runtime dependencies и повторяет
-systemd- и Web health-проверки. Скрипты не читают
+выполняет `git reset --hard` на сохранённый commit, заново создаёт от `qtr`
+только `/opt/qtr/scanner/.venv`, проверяет ownership и executables, устанавливает
+runtime dependencies и повторяет ожидание systemd active и Web health retry.
+Скрипты не читают
 `/etc/qtr/scanner-telegram.env`, не выводят environment values, не используют
 внешний health-check и не удаляют persistent data. Перед ручным rollback
 убедитесь, что в production checkout нет нужных незакоммиченных изменений:
