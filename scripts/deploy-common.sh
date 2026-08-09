@@ -46,6 +46,10 @@ run_as_qtr() {
         'umask 022; exec "$@"' qtr-production-command "$@"
 }
 
+git_as_qtr() {
+    run_as_qtr git -C "$PROJECT_DIR" "$@"
+}
+
 rebuild_venv() {
     log "Rebuilding virtual environment as ${PRODUCTION_USER} at ${VENV_DIR}"
     rm -rf -- "$VENV_DIR" || return 1

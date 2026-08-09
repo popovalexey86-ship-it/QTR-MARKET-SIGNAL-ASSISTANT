@@ -652,7 +652,7 @@ runtime lifecycle и включённом `DERIVATIVES_LIVE_ENABLED`.
 
 **Информационный анализ, не торговая рекомендация.**
 
-## Production deploy и rollback v1.1
+## Production deploy и rollback v1.2
 
 Скрипты предназначены только для production checkout `/opt/qtr/scanner` на
 ветке `main`. Запускайте их из корня этого checkout с правами, достаточными для
@@ -667,10 +667,20 @@ Deploy требует запуска от root, проверяет наличи�
 `qtr:qtr`, чистое Git working tree, выполняет `git fetch origin`, сохраняет
 текущий commit в `/opt/qtr/.deploy/scanner-previous-commit` и обновляет checkout
 строго до проверенного `origin/main`. Сервисы `qtr-scanner-web` и
-`qtr-scanner-telegram` останавливаются перед сменой версии. Root управляет Git,
-state-файлом и systemd, но все операции с production Python environment
-выполняются через `runuser` от `qtr` с `umask 022`: создание venv, pip install,
-pytest, mypy, ruff и локальный health-check.
+`qtr-scanner-telegram` останавливаются перед сменой версии. Root используется
+только для systemd, защищённого state-файла и удаления старой `.venv`.
+
+Все Git-операции production checkout с самого начала выполняются от `qtr` через
+единый helper `git_as_qtr`, который запускает
+`git -C /opt/qtr/scanner ...` посредством `runuser`. Это относится к `status`,
+`fetch`, `rev-parse`, `symbolic-ref`, `cat-file`, `reset` и любым добавляемым в
+скрипты Git-командам. Скрипты не запускают Git от root и не исправляют ownership
+после операции через `chown`: `.git/index`, `.git/ORIG_HEAD`, refs и рабочие
+файлы изначально создаются или изменяются процессом `qtr`.
+
+Все операции с production Python environment также выполняются через `runuser`
+от `qtr` с `umask 022`: создание venv, pip install, pytest, mypy, ruff и
+локальный health-check.
 
 Виртуальное окружение всегда удаляется и создаётся заново только по финальному
 пути `/opt/qtr/scanner/.venv`; перенос `.venv` между release paths не
@@ -688,8 +698,9 @@ deploy до запуска сервисов.
 повторяется. Ответ должен иметь HTTP 200 и JSON `{"status": "ok"}`. Telegram
 проверяется только через systemd, без обращения к Telegram API.
 
-Ошибка после остановки сервисов автоматически возвращает сохранённый commit,
-заново строит `.venv` от `qtr` по финальному пути, устанавливает runtime,
+Ошибка после остановки сервисов автоматически через Git от `qtr` возвращает
+сохранённый commit, заново строит `.venv` от `qtr` по финальному пути,
+устанавливает runtime,
 запускает сервисы, ждёт `active` и повторяет Web health-check. При окончательной
 ошибке выводятся только ограниченные systemd-диагностики: `systemctl status` и
 последние 50 строк `journalctl` для каждого сервиса. Environment file и значения
@@ -703,10 +714,11 @@ cd /opt/qtr/scanner
 sudo bash scripts/rollback.sh
 ```
 
-Rollback проверяет state-файл и существование commit, останавливает оба сервиса,
-выполняет `git reset --hard` на сохранённый commit, заново создаёт от `qtr`
-только `/opt/qtr/scanner/.venv`, проверяет ownership и executables, устанавливает
-runtime dependencies и повторяет ожидание systemd active и Web health retry.
+Rollback проверяет state-файл и существование commit от лица `qtr`,
+останавливает оба сервиса, выполняет `git reset --hard` от `qtr` на сохранённый
+commit, заново создаёт от `qtr` только `/opt/qtr/scanner/.venv`, проверяет
+ownership и executables, устанавливает runtime dependencies и повторяет ожидание
+systemd active и Web health retry.
 Скрипты не читают
 `/etc/qtr/scanner-telegram.env`, не выводят environment values, не используют
 внешний health-check и не удаляют persistent data. Перед ручным rollback

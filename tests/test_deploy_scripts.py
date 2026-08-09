@@ -1,3 +1,4 @@
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -78,6 +79,54 @@ def test_venv_creation_install_and_checks_run_as_qtr() -> None:
     assert "python3 -m venv" not in common.replace(
         'run_as_qtr python3 -m venv', ""
     )
+
+
+def test_git_helper_runs_checkout_commands_as_qtr() -> None:
+    source = COMMON.read_text(encoding="utf-8")
+    assert 'git_as_qtr()' in source
+    assert 'run_as_qtr git -C "$PROJECT_DIR" "$@"' in source
+
+    result = run_common_test(
+        """
+runuser() { printf '%s\\n' "$*"; }
+git_as_qtr status --porcelain
+"""
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--user qtr --" in result.stdout
+    assert "git -C /opt/qtr/scanner status --porcelain" in result.stdout
+
+
+@pytest.mark.parametrize("script", [DEPLOY, ROLLBACK])
+def test_production_scripts_have_no_root_git_invocations(script: Path) -> None:
+    source = script.read_text(encoding="utf-8")
+    assert re.search(r"(?m)^\s*git(?:\s|$)", source) is None
+    assert "chown" not in source
+
+
+def test_deploy_routes_all_git_operations_through_qtr() -> None:
+    source = DEPLOY.read_text(encoding="utf-8")
+    expected_commands = (
+        "git_as_qtr rev-parse --show-toplevel",
+        "git_as_qtr symbolic-ref --quiet --short HEAD",
+        "git_as_qtr status --porcelain --untracked-files=normal",
+        'git_as_qtr reset --hard "$PREVIOUS_COMMIT"',
+        "git_as_qtr fetch origin",
+        "git_as_qtr rev-parse --verify HEAD^{commit}",
+        "git_as_qtr rev-parse --verify refs/remotes/origin/main^{commit}",
+        'git_as_qtr reset --hard "$TARGET_COMMIT"',
+    )
+    for command in expected_commands:
+        assert command in source
+
+
+def test_rollback_routes_all_git_operations_through_qtr() -> None:
+    source = ROLLBACK.read_text(encoding="utf-8")
+    assert "git_as_qtr rev-parse --show-toplevel" in source
+    assert "git_as_qtr symbolic-ref --quiet --short HEAD" in source
+    assert 'git_as_qtr rev-parse --verify "${PREVIOUS_COMMIT}^{commit}"' in source
+    assert 'git_as_qtr cat-file -e "${PREVIOUS_COMMIT}^{commit}"' in source
+    assert 'git_as_qtr reset --hard "$PREVIOUS_COMMIT"' in source
 
 
 def test_root_owned_venv_is_rejected() -> None:

@@ -14,11 +14,11 @@ ensure_expected_repository() {
         printf '[rollback] Run this script from %s\n' "$PROJECT_DIR" >&2
         return 1
     }
-    [[ "$(git rev-parse --show-toplevel)" == "$PROJECT_DIR" ]] || {
+    [[ "$(git_as_qtr rev-parse --show-toplevel)" == "$PROJECT_DIR" ]] || {
         printf '[rollback] Unexpected Git repository.\n' >&2
         return 1
     }
-    [[ "$(git symbolic-ref --quiet --short HEAD)" == "main" ]] || {
+    [[ "$(git_as_qtr symbolic-ref --quiet --short HEAD)" == "main" ]] || {
         printf '[rollback] Production checkout must be on branch main.\n' >&2
         return 1
     }
@@ -56,13 +56,15 @@ main() {
         printf '[rollback] Rollback state contains an invalid commit id.\n' >&2
         return 1
     }
-    PREVIOUS_COMMIT="$(git rev-parse --verify "${PREVIOUS_COMMIT}^{commit}")"
-    git cat-file -e "${PREVIOUS_COMMIT}^{commit}"
+    PREVIOUS_COMMIT="$(
+        git_as_qtr rev-parse --verify "${PREVIOUS_COMMIT}^{commit}"
+    )"
+    git_as_qtr cat-file -e "${PREVIOUS_COMMIT}^{commit}"
 
     log "Stopping services"
     systemctl stop "$WEB_SERVICE" "$TELEGRAM_SERVICE"
     log "Restoring commit ${PREVIOUS_COMMIT}"
-    git reset --hard "$PREVIOUS_COMMIT"
+    git_as_qtr reset --hard "$PREVIOUS_COMMIT"
     rebuild_venv
     install_runtime
     start_services_and_wait

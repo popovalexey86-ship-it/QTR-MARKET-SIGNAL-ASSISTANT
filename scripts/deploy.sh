@@ -18,18 +18,18 @@ ensure_expected_repository() {
         printf '[deploy] Run this script from %s\n' "$PROJECT_DIR" >&2
         return 1
     }
-    [[ "$(git rev-parse --show-toplevel)" == "$PROJECT_DIR" ]] || {
+    [[ "$(git_as_qtr rev-parse --show-toplevel)" == "$PROJECT_DIR" ]] || {
         printf '[deploy] Unexpected Git repository.\n' >&2
         return 1
     }
-    [[ "$(git symbolic-ref --quiet --short HEAD)" == "main" ]] || {
+    [[ "$(git_as_qtr symbolic-ref --quiet --short HEAD)" == "main" ]] || {
         printf '[deploy] Production checkout must be on branch main.\n' >&2
         return 1
     }
 }
 
 ensure_clean_worktree() {
-    [[ -z "$(git status --porcelain --untracked-files=normal)" ]] || {
+    [[ -z "$(git_as_qtr status --porcelain --untracked-files=normal)" ]] || {
         printf '[deploy] Git working tree is not clean; deploy aborted.\n' >&2
         return 1
     }
@@ -39,7 +39,7 @@ rollback_after_failure() {
     local recovery_failed=0
     log "Failure detected; restoring ${PREVIOUS_COMMIT}"
     systemctl stop "$WEB_SERVICE" "$TELEGRAM_SERVICE" || recovery_failed=1
-    if git reset --hard "$PREVIOUS_COMMIT"; then
+    if git_as_qtr reset --hard "$PREVIOUS_COMMIT"; then
         if rebuild_venv && install_runtime; then :; else recovery_failed=1; fi
     else
         recovery_failed=1
@@ -89,9 +89,11 @@ main() {
     ensure_clean_worktree
 
     log "Fetching origin"
-    git fetch origin
-    PREVIOUS_COMMIT="$(git rev-parse --verify HEAD^{commit})"
-    TARGET_COMMIT="$(git rev-parse --verify refs/remotes/origin/main^{commit})"
+    git_as_qtr fetch origin
+    PREVIOUS_COMMIT="$(git_as_qtr rev-parse --verify HEAD^{commit})"
+    TARGET_COMMIT="$(
+        git_as_qtr rev-parse --verify refs/remotes/origin/main^{commit}
+    )"
     if [[ "$PREVIOUS_COMMIT" == "$TARGET_COMMIT" ]]; then
         log "already up to date"
         return 0
@@ -109,7 +111,7 @@ main() {
     log "Stopping services"
     systemctl stop "$WEB_SERVICE" "$TELEGRAM_SERVICE"
     log "Updating repository to verified origin/main commit ${TARGET_COMMIT}"
-    git reset --hard "$TARGET_COMMIT"
+    git_as_qtr reset --hard "$TARGET_COMMIT"
 
     rebuild_venv
     install_runtime
