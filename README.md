@@ -651,3 +651,45 @@ runtime lifecycle и включённом `DERIVATIVES_LIVE_ENABLED`.
 - результаты не являются гарантией будущего движения.
 
 **Информационный анализ, не торговая рекомендация.**
+
+## Production deploy и rollback
+
+Скрипты предназначены только для production checkout `/opt/qtr/scanner` на
+ветке `main`. Запускайте их из корня этого checkout с правами, достаточными для
+управления systemd-сервисами и записи в `/opt/qtr/.deploy`:
+
+```bash
+cd /opt/qtr/scanner
+sudo bash scripts/deploy.sh
+```
+
+Deploy требует чистое Git working tree, выполняет `git fetch origin`, сохраняет
+текущий commit в `/opt/qtr/.deploy/scanner-previous-commit` и обновляет checkout
+строго до проверенного `origin/main`. Сервисы `qtr-scanner-web` и
+`qtr-scanner-telegram` останавливаются перед сменой версии. Виртуальное окружение
+всегда удаляется и создаётся заново только по финальному пути
+`/opt/qtr/scanner/.venv`; перенос `.venv` между release paths не используется.
+
+После установки `.[web,telegram]`, `pytest`, `mypy` и `ruff` deploy выполняет
+полный test suite, `mypy src` и `ruff check .`, запускает оба сервиса, проверяет
+их через `systemctl is-active` и вызывает только локальный endpoint
+`http://127.0.0.1:8000/health`. Ответ должен иметь HTTP 200 и JSON
+`{"status": "ok"}`. Ошибка после остановки сервисов автоматически возвращает
+сохранённый commit, заново строит `.venv` по финальному пути и перезапускает
+сервисы. Если `HEAD` уже равен `origin/main`, deploy завершается без изменений.
+
+Для ручного возврата к commit, сохранённому последним deploy:
+
+```bash
+cd /opt/qtr/scanner
+sudo bash scripts/rollback.sh
+```
+
+Rollback проверяет state-файл и существование commit, останавливает оба сервиса,
+выполняет `git reset --hard` на сохранённый commit, заново создаёт только
+`/opt/qtr/scanner/.venv`, устанавливает runtime dependencies и повторяет
+systemd- и Web health-проверки. Скрипты не читают
+`/etc/qtr/scanner-telegram.env`, не выводят environment values, не используют
+внешний health-check и не удаляют persistent data. Перед ручным rollback
+убедитесь, что в production checkout нет нужных незакоммиченных изменений:
+`git reset --hard` удаляет изменения tracked files.
