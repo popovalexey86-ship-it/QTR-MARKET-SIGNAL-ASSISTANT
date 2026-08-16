@@ -1,0 +1,42 @@
+[Unit]
+Description=QTR Micro Scalper V2 Shadow Observer
+Documentation=file:/opt/qtr/scanner/deployment/QTR_SCALPER_SHADOW_INSTALL.md
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/opt/qtr/scanner/.venv/bin/python
+StartLimitIntervalSec=300s
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=qtr
+Group=qtr
+WorkingDirectory=/opt/qtr/scanner
+
+# Fail-closed defaults: no market stream until an explicit operator override.
+Environment=PYTHONUNBUFFERED=1
+Environment=QTR_SCALPER_V2_ENABLED=false
+Environment=QTR_SCALPER_V2_SHADOW_MODE=true
+Environment=QTR_SCALPER_V2_LIVE_ENABLED=false
+
+ExecStart=/opt/qtr/scanner/.venv/bin/python -m market_signal_assistant.qtr_micro_scalper.cli --refresh-seconds 30
+
+Restart=on-failure
+RestartSec=10s
+
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+SendSIGKILL=yes
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=qtr-scanner-scalper-shadow
+
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/qtr/scanner/data
+
+# Intentionally no install section: installation does not enable autostart.

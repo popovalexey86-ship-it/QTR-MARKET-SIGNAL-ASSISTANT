@@ -10,16 +10,17 @@ requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
-websocket = ["pybit>=5.11,<6"]
+websocket = ["pybit>=5.11,<6", "websockets>=15,<16"]
 web = []
 telegram = ["python-telegram-bot>=22.8,<23"]
-all = ["pybit>=5.11,<6", "python-telegram-bot>=22.8,<23"]
+all = ["pybit>=5.11,<6", "websockets>=15,<16", "python-telegram-bot>=22.8,<23"]
 
 [project.scripts]
 market-screener = "market_signal_assistant.cli:main"
 market-signal-cli = "market_signal_assistant.cli:main"
 market-signal-web = "market_signal_assistant.web.app:main"
 market-signal-telegram = "market_signal_assistant.telegram.bot:main"
+market-signal-scalper-shadow = "market_signal_assistant.qtr_micro_scalper.service:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

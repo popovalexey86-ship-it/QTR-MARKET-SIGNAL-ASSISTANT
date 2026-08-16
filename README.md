@@ -646,11 +646,268 @@ runtime lifecycle и включённом `DERIVATIVES_LIVE_ENABLED`.
 - NEUTRAL означает отсутствие сигнала, прошедшего заданные фильтры;
 - derivatives context может усиливать или ослаблять технический результат, но
   не скрывает конфликтующие факторы;
-- приложение не выставляет ордера, не управляет позициями и не запускает
-  trading loop;
+- стандартные CLI/Web/IN PLAY/NEWS интерфейсы не выставляют ордера; единственное
+  исключение — отдельно включаемый QTR Micro, жёстко ограниченный Bybit Demo;
 - результаты не являются гарантией будущего движения.
 
 **Информационный анализ, не торговая рекомендация.**
+
+## QTR Setup Engine
+
+QTR Setup Engine V1 — полностью теневой детерминированный классификатор:
+
+- Early Discovery отвечает: «Где начинается активность?»;
+- Setup Engine отвечает: «Какая торговая конструкция формируется?»;
+- торговое исполнение не входит в проект: модуль не создаёт ордера и не выдаёт
+  BUY/SELL как команду.
+
+Сам Setup Engine не запускает отдельный процесс или scheduler, не подключён к
+IN PLAY и NEWS, не изменяет их notification state и не обращается к Bybit. Он
+принимает явно созданный immutable `SetupAnalysisInput` либо через
+`input_from_early_discovery_v2()` преобразует уже рассчитанный
+`EarlyDiscoveryV2Result`. Дополнительные market-data запросы не выполняются.
+
+Чистая функция `analyze_setup()` не читает системные часы, сеть или state:
+одинаковый input всегда создаёт одинаковый immutable `SetupAnalysisResult`.
+Тип конструкции и её готовность независимы. Например, `РЕТЕСТ / ФОРМИРУЕТСЯ`
+описывает наблюдаемую конструкцию, но не готовую сделку.
+
+Поддерживаемые типы:
+
+1. `ПРОБОЙ` — цена закрылась за подтверждённой границей диапазона.
+2. `РЕТЕСТ` — после пробоя цена вернулась к уровню.
+3. `ИМПУЛЬС` — одновременно подтверждены ускорение объёма и волатильности.
+4. `СЖАТИЕ` — диапазон сжимается возле границы без состоявшегося импульса.
+5. `ПРОДОЛЖЕНИЕ` — после коррекции подтверждается движение по направлению.
+6. `ЛОЖНЫЙ ПРОБОЙ` — завершённая свеча вернулась внутрь диапазона.
+7. `РАЗВОРОТ` — подтверждена структура противоположного направления.
+8. `НЕТ СДЕЛКИ` — структура отсутствует, неполна или противоречива.
+
+Если признаки пересекаются, используется фиксированный приоритет:
+`ЛОЖНЫЙ ПРОБОЙ → РАЗВОРОТ → РЕТЕСТ → ПРОБОЙ → ПРОДОЛЖЕНИЕ → ИМПУЛЬС →
+СЖАТИЕ → НЕТ СДЕЛКИ`.
+
+`ГОТОВО К РАССМОТРЕНИЮ` возможно только при направленном и полном снимке,
+подтверждённых структуре, объёме и волатильности, правильной стороне уровня,
+минимум двух завершённых свечах удержания, достаточной ликвидности и spread не
+выше `0,2%`. Для ретеста дополнительно требуется удержанный ретест. Сжатие,
+ложный пробой и `НЕТ СДЕЛКИ` готовыми не считаются.
+
+Safety gates сохраняют ограничения Early Discovery и не меняют его пороги:
+
+- абсолютное движение за 24 часа от `15%` переводит результат в `ПОЗДНО`;
+- движение от `30%` остаётся `ПОЗДНО` с отдельным предупреждением;
+- расстояние больше `2 ATR` запрещает готовность и означает `ПОЗДНО`;
+- spread больше `0,2%`, слабая ликвидность, neutral direction, failed breakout,
+  конфликт подтверждений или неполные данные запрещают готовность;
+- неполные данные и явный конфликт дают `НЕТ СДЕЛКИ / ОТМЕНЕНО`;
+- неподтверждённое направление или отсутствие конструкции дают
+  `НЕТ СДЕЛКИ / НАБЛЮДАЕМ`.
+
+Audit выключен по умолчанию:
+
+```text
+QTR_SETUP_ENGINE_ENABLED=false
+```
+
+При `QTR_SETUP_ENGINE_ENABLED=true` только явный вызов `SetupEngine.analyze()`
+добавляет запись в `data/qtr_setup_engine_audit.jsonl`: идентификаторы входного
+snapshot, результат, причины, предупреждения и отдельные подтверждения. Audit не
+создаёт расписание, Telegram-сообщения или торговые действия.
+
+### QTR Scanner Telegram Pilot V1
+
+Пилот выключен по умолчанию и включается только явно:
+
+```powershell
+$env:QTR_SETUP_TELEGRAM_ENABLED="true"
+$env:TELEGRAM_BOT_TOKEN="token-from-botfather"
+$env:TELEGRAM_ALLOWED_CHAT_IDS="123456789"
+.\.venv\Scripts\market-signal-telegram.exe
+```
+
+Пилот работает внутри lifecycle существующего Telegram-процесса и использует
+интервал `INPLAY_EARLY_DISCOVERY_V2_INTERVAL_MINUTES`. Один V2 scan загружает
+рыночные данные, после чего Setup Engine анализирует уже готовые snapshots без
+повторных HTTP-запросов. Отдельного bot, cron, daemon или scheduler нет.
+
+Автоматически рассматриваются только состояния `ФОРМИРУЕТСЯ`,
+`ПОДТВЕРЖДАЕТСЯ`, `ГОТОВО К РАССМОТРЕНИЮ`, `ПОЗДНО` и `ОТМЕНЕНО`. За один scan
+отправляется не более трёх событий в порядке: готово, отменено, поздно,
+подтверждается, формируется. Machine enums, BUY/SELL и команды торговли в
+пользовательский текст не выводятся.
+
+Semantic fingerprint не включает цену, score, ATR, объём, spread и время.
+Повтор допускается при новом episode, переходе стадии, смене направления или
+типа, переходе в позднее/отменённое состояние либо после шестичасового cooldown.
+Доставка использует `prepare/commit`: state меняется только после успешной
+отправки во все разрешённые chats. Файлы пилота независимы от IN PLAY и NEWS:
+
+- `data/qtr_setup_notifications.json` — atomic durable state;
+- `data/qtr_setup_telegram_pilot_audit.jsonl` — решение, причина подавления,
+  fingerprint и факт подтверждённой доставки.
+
+Повреждённый state переносится в `.corrupt`, после чего используется безопасное
+пустое состояние. Токен Telegram в state и audit не записывается. Пилот является
+информационным наблюдением: он не рассчитывает позицию, плечо, стоп/тейк и не
+выставляет ордера.
+
+### QTR Micro Demo Trading V1
+
+QTR Micro — отдельный opt-in контур исполнения только для Bybit Demo Trading.
+По умолчанию он выключен:
+
+```text
+QTR_MICRO_ENABLED=false
+QTR_MICRO_MODE=demo
+BYBIT_DEMO_BASE_URL=https://api-demo.bybit.com
+QTR_MICRO_MAX_NOTIONAL_USDT=100000
+QTR_MICRO_MAX_NOTIONAL_EQUITY_PCT=100
+QTR_MICRO_MAX_ESTIMATED_FEES_R_PCT=20
+QTR_MICRO_TAKER_FEE_RATE=0.00055
+QTR_MICRO_ACTUAL_RISK_TOLERANCE_PCT=10
+QTR_MICRO_FILL_CONFIRMATION_TIMEOUT_SECONDS=20
+QTR_MICRO_FILL_POLL_INTERVAL_SECONDS=1
+```
+
+Repair V2 перед каждым Demo entry повторно проверяет тот же setup episode и
+получает свежую цену. Размер позиции ограничивается абсолютным notional,
+долей equity и оценкой двух taker-комиссий. После ACK fill подтверждается в
+том же bounded lifecycle (poll 0,5–2 секунды, timeout 15–30 секунд), затем
+проверяется фактический риск, при необходимости выполняется reduce-only
+resize и только после этого немедленно устанавливается protective stop.
+`ACK != FILL != PROTECTED`; состояние `OPEN` сохраняется только после защиты.
+
+В коде нет live/testnet fallback. Settings, transport и client независимо
+проверяют точный HTTPS host `api-demo.bybit.com`; mainnet, testnet, port,
+credentials в URL и любой другой host приводят к `TRADE BLOCKED`. Ключ и секрет
+берутся только из `BYBIT_DEMO_API_KEY` и `BYBIT_DEMO_API_SECRET`, имеют redacted
+`repr` и не записываются в state, journal или Telegram.
+
+Preflight проверяет Demo connectivity, private wallet, UNIFIED account,
+one-way position mode, открытые позиции, активные ордера, instrument rules и
+возможность установить рабочее плечо. Отчёт отдельно показывает каждую
+проверку, equity и лимиты инструмента, QTR-owned и foreign/manual объекты,
+предупреждения и блокирующие причины, а также результат reconciliation.
+Foreign/manual объекты только отображаются и не передаются под управление QTR.
+При любой ошибке create-order не вызывается. Проверка выполняется явно:
+
+```powershell
+cd C:\Users\Legion\Desktop\MARKET_SIGNAL_ASSISTANT
+$env:QTR_MICRO_ENABLED="true"
+$env:QTR_MICRO_MODE="demo"
+$env:BYBIT_DEMO_BASE_URL="https://api-demo.bybit.com"
+$env:BYBIT_DEMO_API_KEY="ВАШ_DEMO_KEY"
+$env:BYBIT_DEMO_API_SECRET="ВАШ_DEMO_SECRET"
+.\.venv\Scripts\python.exe -m market_signal_assistant.qtr_micro.cli preflight --symbol BTCUSDT
+```
+
+Для безопасного machine-readable отчёта без API key, secret, auth headers и
+private raw payload используется тот же preflight с флагом `--json`:
+
+```powershell
+.\.venv\Scripts\python.exe -m market_signal_assistant.qtr_micro.cli preflight --symbol BTCUSDT --json
+```
+
+Exit code `0` означает готовность; ненулевой код означает блокировку или
+техническую ошибку. Предупреждения сами по себе не блокируют Demo preflight.
+
+`--symbol BTCUSDT` — только параметр точечной CLI-диагностики. Runtime получает
+symbol динамически по цепочке
+`EarlyDiscoveryV2Result → SetupAnalysisResult → QtrSetupCandidate → QTR Micro`.
+Перед entry он загружает `instrument-info` именно для symbol кандидата; из этих
+правил берутся `qtyStep`, `minOrderQty`, `maxMktOrderQty`, `minNotionalValue` и
+`maxLeverage`. Подмена ответа правилами другого symbol блокируется.
+
+Торговая universe QTR Micro V1 ограничена активными Bybit
+`LinearPerpetual` с `quoteCoin=USDT`, `settleCoin=USDT`, `status=Trading`,
+криптовалютным `symbolType` и `isPreListing=false`. Stock/TradFi, PreLaunch,
+pre-listing, non-USDT, inverse, spot, option и прочие контракты исключаются до
+создания ордера. Причины skip пишутся отдельно в
+`data/qtr_micro_decisions.jsonl`; Telegram-сообщение для skip не отправляется.
+
+Вход разрешён только для свежего `ГОТОВО К РАССМОТРЕНИЮ` с
+`trade_eligible=true` и типом `ПРОБОЙ`, `РЕТЕСТ` или `ПРОДОЛЖЕНИЕ`. Neutral,
+forming, confirming, late, cancelled, false breakout, reversal, impulse,
+compression и no-trade не исполняются. Максимальный возраст — 60 секунд,
+максимальное удаление — 0,25 ATR. Одна позиция на symbol, один entry на setup
+episode, максимум две позиции; averaging, pyramiding, martingale, reverse и
+revenge re-entry отсутствуют.
+
+Размер считается от риска и structural stop, а не от плеча:
+
+```text
+risk_amount = demo_equity * risk_pct / 100
+stop_distance = abs(entry_price - structural_stop)
+qty_raw = risk_amount / stop_distance
+```
+
+V1 применяет объективный базовый риск `0,5%`; уровни до `1,0%` остаются
+конфигурируемым потолком и автоматически из confidence не выводятся. Stop берёт
+только подтверждённый `invalidation_level` и добавляет 0,15 ATR наружу. Без
+invalidation или ATR entry запрещён. Qty округляется вниз по `qtyStep` и
+проверяется по min/max qty и min notional. Рабочее плечо начинается с x5 и
+повышается только при необходимости, максимум x10; денежный риск от этого не
+меняется.
+
+Create-order ACK сохраняется как `ENTRY_ACKNOWLEDGED`, но не считается fill.
+После подтверждённого execution fill немедленно ставится protective stop. После
+трёх неудачных попыток отправляется reduce-only Demo close, state блокирует
+новые entries до restart/manual recovery. Все exit orders имеют `reduceOnly` и
+`QTRM-` ownership; foreign/manual Demo orders не отменяются и не управляются.
+
+Partial management детерминирован:
+
+- TP1 `+1R`: закрыть 40%, затем nominal breakeven по фактическому average fill;
+- TP2 `+2R`: закрыть 30%;
+- runner 30%: при отсутствии надёжного нового structural level закрыть на `+3R`;
+- через 15 минут закрывать только при результате ниже `+0,5R` и деградации;
+- обычная позиция закрывается к 45 минутам, прибыльный runner — к 90 минутам;
+- cancelled/current failure/opposite structure дают `STRUCTURE_EXIT`, без
+  автоматического reverse.
+
+Три последовательных убытка создают 30-минутную паузу. Realised daily PnL ниже
+`-2%` day-start equity блокирует entries до следующего UTC дня. Kill switch
+блокирует только новые позиции; protective management открытых продолжается.
+
+Durable файлы изолированы от IN PLAY, NEWS и Setup Pilot:
+
+- `data/qtr_micro_state.json` — atomic state, позиции, limits и idempotency;
+- `data/qtr_micro_trades.jsonl` — одна завершённая trade lifecycle запись;
+- `data/qtr_micro_decisions.jsonl` — причины symbol-level skip без Telegram;
+- `data/qtr_micro_runtime_audit.jsonl` — безопасные переходы entry от
+  `PREPARED` до ACK, fill и установленной защиты либо точная причина abort.
+
+State V1 не содержит отдельных стадий `SUBMITTED`, `FILLED` и `PROTECTED`.
+Фактическая схема: `PREPARED → ENTRY_ACKNOWLEDGED → OPEN`; ACK соответствует
+принятому entry order, а `OPEN` сохраняется только после подтверждённого fill и
+успешной установки protective stop. Между ними runtime audit записывает
+`ENTRY_SUBMIT_ATTEMPT`, `ENTRY_ACK`, `ENTRY_CONFIRMATION_WAIT`, `ENTRY_FILLED`
+и `ENTRY_PROTECTED`. Ошибки получают `ENTRY_REJECTED` или `ENTRY_ABORTED` с
+безопасной причиной без API credentials и raw private payload.
+
+Повреждённый state получает `.corrupt`; новые entries блокируются, а Demo API
+используется как source of truth для reconciliation. Восстановленная owned
+позиция без полного risk state помечается `BLOCKED`, а manual/foreign orders
+игнорируются.
+
+Запуск существующего Telegram runtime в Demo mode:
+
+```powershell
+cd C:\Users\Legion\Desktop\MARKET_SIGNAL_ASSISTANT
+$env:QTR_SETUP_TELEGRAM_ENABLED="true"
+$env:QTR_MICRO_ENABLED="true"
+$env:QTR_MICRO_MODE="demo"
+$env:BYBIT_DEMO_BASE_URL="https://api-demo.bybit.com"
+$env:BYBIT_DEMO_API_KEY="ВАШ_DEMO_KEY"
+$env:BYBIT_DEMO_API_SECRET="ВАШ_DEMO_SECRET"
+$env:TELEGRAM_BOT_TOKEN="ВАШ_TELEGRAM_TOKEN"
+$env:TELEGRAM_ALLOWED_CHAT_IDS="ВАШ_CHAT_ID"
+.\.venv\Scripts\market-signal-telegram.exe
+```
+
+Это только Bybit Demo. Реальные деньги, testnet, withdrawals, transfers,
+borrowing и account funding automation не поддерживаются.
 
 ## Production deploy и rollback v1.2
 
