@@ -225,6 +225,17 @@ class EarlyDiscoveryV2Settings:
 
 
 @dataclass(frozen=True, slots=True)
+class QtrSetupTelegramSettings:
+    """Opt-in Telegram delivery for Setup Engine results."""
+
+    enabled: bool = False
+
+    @classmethod
+    def from_environment(cls) -> QtrSetupTelegramSettings:
+        return cls(enabled=_environment_bool("QTR_SETUP_TELEGRAM_ENABLED"))
+
+
+@dataclass(frozen=True, slots=True)
 class NewsAutoSettings:
     enabled: bool = False
     interval_minutes: int = 60

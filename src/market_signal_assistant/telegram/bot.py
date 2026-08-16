@@ -18,11 +18,13 @@ from market_signal_assistant.news.notifications import NewsNotificationService
 from market_signal_assistant.news.provider import NewsDataError
 from market_signal_assistant.settings import (
     EarlyDiscoverySettings,
+    EarlyDiscoveryV2Settings,
     InPlayAutoSettings,
     InPlayTimingAuditSettings,
     LiveDerivativesSettings,
     NewsAutoSettings,
     NewsSettings,
+    QtrSetupTelegramSettings,
     TelegramSettings,
 )
 from market_signal_assistant.telegram.formatting import (
@@ -47,6 +49,10 @@ from market_signal_assistant.telegram.inplay_timing_audit import (
 )
 from market_signal_assistant.telegram.news_auto import NewsAutoLoop, NewsAutoNotifier
 from market_signal_assistant.telegram.parsing import ParsedCommand, parse_command
+from market_signal_assistant.telegram.qtr_setup_pilot import (
+    QtrSetupPilotLoop,
+    QtrSetupPilotNotifier,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -196,11 +202,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     auto_settings = InPlayAutoSettings.from_environment()
     timing_audit_settings = InPlayTimingAuditSettings.from_environment()
     early_discovery_settings = EarlyDiscoverySettings.from_environment()
+    early_discovery_v2_settings = EarlyDiscoveryV2Settings.from_environment()
+    qtr_setup_settings = QtrSetupTelegramSettings.from_environment()
     news_settings = NewsSettings.from_environment()
     news_auto_settings = NewsAutoSettings.from_environment()
     sdk = _load_telegram_sdk()
     from market_signal_assistant.composition import (
         build_early_discovery_service,
+        build_early_discovery_v2_service,
         build_inplay_notification_service,
         build_inplay_service,
         build_news_notification_service,
@@ -218,6 +227,29 @@ def main(argv: Sequence[str] | None = None) -> None:
         early_discovery_settings,
         inplay_evaluator=inplay_service,
     )
+    qtr_setup_notifier: QtrSetupPilotNotifier | None = None
+    if qtr_setup_settings.enabled:
+        from market_signal_assistant.qtr_setup_pilot.audit import (
+            JsonlQtrSetupTelegramAuditStore,
+        )
+        from market_signal_assistant.qtr_setup_pilot.notifications import (
+            JsonQtrSetupNotificationStore,
+            QtrSetupNotificationService,
+        )
+        from market_signal_assistant.qtr_setup_pilot.service import QtrSetupScanService
+
+        v2_service = build_early_discovery_v2_service(
+            early_discovery_v2_settings,
+            inplay_evaluator=inplay_service,
+        )
+        qtr_setup_notifier = QtrSetupPilotNotifier(
+            scanner=QtrSetupScanService(v2_service),
+            notification_service=QtrSetupNotificationService(
+                JsonQtrSetupNotificationStore()
+            ),
+            audit_store=JsonlQtrSetupTelegramAuditStore(),
+            allowed_chat_ids=telegram_settings.allowed_chat_ids,
+        )
     news_service = build_news_service(news_settings)
     news_notification_service = build_news_notification_service(news_settings)
     if live_settings.enabled:
@@ -237,6 +269,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             timing_audit_settings=timing_audit_settings,
             early_discovery_settings=early_discovery_settings,
             early_discovery_service=early_discovery_service,
+            qtr_setup_settings=qtr_setup_settings,
+            qtr_setup_interval_minutes=early_discovery_v2_settings.interval_minutes,
+            qtr_setup_notifier=qtr_setup_notifier,
             sdk=sdk,
         )
     finally:
@@ -258,6 +293,9 @@ def _run_sdk_bot(
     timing_audit_settings: InPlayTimingAuditSettings | None = None,
     early_discovery_settings: EarlyDiscoverySettings | None = None,
     early_discovery_service: EarlyDiscoveryService | None = None,
+    qtr_setup_settings: QtrSetupTelegramSettings | None = None,
+    qtr_setup_interval_minutes: int = 5,
+    qtr_setup_notifier: QtrSetupPilotNotifier | None = None,
     sdk: TelegramSdk | None = None,
 ) -> None:
     ApplicationBuilder, MessageHandler, filters = sdk or _load_telegram_sdk()
@@ -278,6 +316,9 @@ def _run_sdk_bot(
         timing_audit_settings=timing_audit_settings,
         early_discovery_settings=early_discovery_settings,
         early_discovery_service=early_discovery_service,
+        qtr_setup_settings=qtr_setup_settings,
+        qtr_setup_interval_minutes=qtr_setup_interval_minutes,
+        qtr_setup_notifier=qtr_setup_notifier,
     )
 
 
@@ -312,12 +353,16 @@ def _run_sdk_bot_handlers(
     timing_audit_settings: InPlayTimingAuditSettings | None = None,
     early_discovery_settings: EarlyDiscoverySettings | None = None,
     early_discovery_service: EarlyDiscoveryService | None = None,
+    qtr_setup_settings: QtrSetupTelegramSettings | None = None,
+    qtr_setup_interval_minutes: int = 5,
+    qtr_setup_notifier: QtrSetupPilotNotifier | None = None,
 ) -> None:
     resolved_news_auto = news_auto_settings or NewsAutoSettings()
     resolved_timing_audit = timing_audit_settings or InPlayTimingAuditSettings()
     resolved_early_discovery = (
         early_discovery_settings or EarlyDiscoverySettings()
     )
+    resolved_qtr_setup = qtr_setup_settings or QtrSetupTelegramSettings()
 
     async def handle(update: Any, context: Any) -> None:
         del context
@@ -354,9 +399,11 @@ def _run_sdk_bot_handlers(
     timing_audit_loop: InPlayTimingAuditLoop | None = None
     early_discovery_loop: EarlyDiscoveryLoop | None = None
     news_auto_loop: NewsAutoLoop | None = None
+    qtr_setup_loop: QtrSetupPilotLoop | None = None
 
     async def start_auto(application: Any) -> None:
         nonlocal auto_loop, timing_audit_loop, early_discovery_loop, news_auto_loop
+        nonlocal qtr_setup_loop
 
         async def send(chat_id: int, text: str) -> None:
             await application.bot.send_message(chat_id=chat_id, text=text)
@@ -401,9 +448,18 @@ def _run_sdk_bot_handlers(
                 interval_seconds=resolved_news_auto.interval_minutes * 60,
             )
             news_auto_loop.start()
+        if resolved_qtr_setup.enabled and qtr_setup_notifier is not None:
+            qtr_setup_loop = QtrSetupPilotLoop(
+                qtr_setup_notifier,
+                send,
+                interval_seconds=qtr_setup_interval_minutes * 60,
+            )
+            qtr_setup_loop.start()
 
     async def stop_auto(application: Any) -> None:
         del application
+        if qtr_setup_loop is not None:
+            await qtr_setup_loop.stop()
         if timing_audit_loop is not None:
             await timing_audit_loop.stop()
         if early_discovery_loop is not None:
@@ -440,6 +496,15 @@ def _run_sdk_bot_handlers(
             _LOGGER.warning(
                 "Автоновости не запущены: news service недоступен."
             )
+        else:
+            lifecycle_enabled = True
+    if resolved_qtr_setup.enabled and not settings.allowed_chat_ids:
+        _LOGGER.warning(
+            "QTR Setup Pilot не запущен: TELEGRAM_ALLOWED_CHAT_IDS не задан."
+        )
+    elif resolved_qtr_setup.enabled:
+        if qtr_setup_notifier is None:
+            _LOGGER.warning("QTR Setup Pilot не запущен: сервис недоступен.")
         else:
             lifecycle_enabled = True
     if lifecycle_enabled:
