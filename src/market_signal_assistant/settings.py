@@ -71,6 +71,30 @@ class LiveDerivativesSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class QtrScalperV2LiveSettings:
+    """Shadow-only public WebSocket settings; disabled unless explicitly enabled."""
+
+    enabled: bool = False
+    shadow_mode: bool = True
+
+    def __post_init__(self) -> None:
+        if self.enabled and not self.shadow_mode:
+            raise ValueError("QTR Scalper V2 live data is allowed in shadow mode only.")
+
+    @classmethod
+    def from_environment(cls) -> QtrScalperV2LiveSettings:
+        enabled_name = (
+            "QTR_SCALPER_V2_ENABLED"
+            if "QTR_SCALPER_V2_ENABLED" in os.environ
+            else "QTR_SCALPER_V2_LIVE_ENABLED"
+        )
+        return cls(
+            enabled=_environment_bool(enabled_name),
+            shadow_mode=_environment_bool("QTR_SCALPER_V2_SHADOW_MODE", default=True),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class InPlayAutoSettings:
     enabled: bool = False
     interval_minutes: int = 15
