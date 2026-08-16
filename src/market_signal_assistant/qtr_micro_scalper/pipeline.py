@@ -62,6 +62,7 @@ from market_signal_assistant.qtr_micro_scalper.snapshot import (
 
 MarketDataEvent: TypeAlias = PublicTradeEvent | OrderBookEvent | LiquidationEvent
 PriceContextProvider: TypeAlias = Callable[[str, datetime, float], PriceContext | None]
+TargetProvider: TypeAlias = Callable[[str, datetime], ScalperTarget | None]
 OrderBookStateProvider: TypeAlias = Callable[[str], OrderBookState]
 
 
@@ -146,6 +147,7 @@ class LiveShadowPipeline:
         *,
         symbols: Iterable[str],
         price_context_provider: PriceContextProvider,
+        target_provider: TargetProvider | None = None,
         config: LiveShadowPipelineConfig | None = None,
         trade_flow: TradeFlowAccumulator | None = None,
         orderbook_state_provider: OrderBookStateProvider | None = None,
@@ -167,6 +169,7 @@ class LiveShadowPipeline:
             raise ValueError("Live shadow pipeline requires at least one symbol.")
         self._symbols = normalized
         self._price_context = price_context_provider
+        self._target_provider = target_provider
         self._config = config or LiveShadowPipelineConfig()
         self._clock = clock or (lambda: datetime.now(UTC))
         self._trade_flow = trade_flow or TradeFlowAccumulator(clock=self._clock)
@@ -190,6 +193,7 @@ class LiveShadowPipeline:
         self._current_frames: dict[str, LiquidityBookFrame] = {}
         self._liquidations: dict[str, list[LiquidationEvent]] = {}
         self._seen_events: dict[str, None] = {}
+        self._registered_provider_targets: set[str] = set()
         self._symbol_locks = {symbol: asyncio.Lock() for symbol in normalized}
         self._events: list[LiveShadowPipelineEvent] = []
         self._sequence = 0
@@ -210,6 +214,7 @@ class LiveShadowPipeline:
         *,
         symbols: Iterable[str],
         price_context_provider: PriceContextProvider,
+        target_provider: TargetProvider | None = None,
         websocket_factory: WebSocketFactory = default_websocket_factory,
         orchestrator: ShadowOrchestrator | None = None,
         config: LiveShadowPipelineConfig | None = None,
@@ -252,6 +257,7 @@ class LiveShadowPipeline:
         pipeline = cls(
             symbols=normalized,
             price_context_provider=price_context_provider,
+            target_provider=target_provider,
             config=config,
             trade_flow=accumulator,
             orderbook_state_provider=books.state,
@@ -563,6 +569,14 @@ class LiveShadowPipeline:
         )
         if price_context is None or not price_context.ready:
             return None
+        if (
+            self._target_provider is not None
+            and symbol not in self._registered_provider_targets
+        ):
+            target = self._target_provider(symbol, as_of)
+            if target is None or not self.register_target(target, observed_at=as_of):
+                return None
+            self._registered_provider_targets.add(symbol)
         setup_context = self._setup_context.analyze(market_state, price_context)
         score = self._scoring.score(
             market_state,

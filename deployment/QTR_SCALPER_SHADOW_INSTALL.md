@@ -11,6 +11,7 @@ execution-компонентов, торговых API, реальных орд�
 QTR_SCALPER_V2_ENABLED=false
 QTR_SCALPER_V2_SHADOW_MODE=true
 QTR_SCALPER_V2_LIVE_ENABLED=false
+QTR_SCALPER_V2_SETUP_AUDIT_PATH=/opt/qtr/scanner/data/qtr_setup_telegram_pilot_audit.jsonl
 ```
 
 Поэтому установка, `daemon-reload` и даже случайный ручной запуск не открывают
@@ -42,11 +43,11 @@ sudo useradd --system --user-group --home-dir /opt/qtr --no-create-home \
 Команды выполняют Python-операции сразу от `qtr`, не создавая root-owned `.venv`:
 
 ```bash
-sudo install -d -o qtr -g qtr -m 0750 /opt/qtr/scanner/data
-sudo -u qtr python3 -m venv /opt/qtr/scanner/.venv
-sudo -u qtr /opt/qtr/scanner/.venv/bin/python -m pip install --upgrade pip
-sudo -u qtr /opt/qtr/scanner/.venv/bin/python -m pip install \
-  -e '/opt/qtr/scanner[websocket]'
+sudo install -d -o qtr -g qtr -m 0750 /opt/qtr/scalper-shadow/data
+sudo -u qtr python3 -m venv /opt/qtr/scalper-shadow/.venv
+sudo -u qtr /opt/qtr/scalper-shadow/.venv/bin/python -m pip install --upgrade pip
+sudo -u qtr /opt/qtr/scalper-shadow/.venv/bin/python -m pip install \
+  -e '/opt/qtr/scalper-shadow[websocket]'
 ```
 
 WebSocket dependency устанавливается, но импорт package, установка unit и
@@ -54,7 +55,7 @@ WebSocket dependency устанавливается, но импорт package, 
 
 ## Установка unit без запуска
 
-Из корня checkout `/opt/qtr/scanner`:
+Из корня checkout `/opt/qtr/scalper-shadow`:
 
 ```bash
 sudo install -o root -g root -m 0644 \
@@ -77,5 +78,7 @@ systemd journal под идентификатором `qtr-scanner-scalper-shado
 сбрасывается журнал. systemd ожидает до 30 секунд, затем завершает зависший
 процесс.
 
-Unit разрешает запись только в `/opt/qtr/scanner/data`. API keys и торговые
+Unit разрешает запись только в `/opt/qtr/scalper-shadow/data`. Production audit
+`/opt/qtr/scanner/data/qtr_setup_telegram_pilot_audit.jsonl` доступен Shadow
+только для чтения. API keys и торговые
 credentials для Shadow Observer не требуются и не должны добавляться в unit.

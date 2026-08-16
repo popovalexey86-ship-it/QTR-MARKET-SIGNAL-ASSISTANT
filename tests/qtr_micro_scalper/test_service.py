@@ -14,6 +14,7 @@ from market_signal_assistant.qtr_micro_scalper.service import (
     ShadowService,
     ShadowServiceConfig,
     ShadowServiceStatus,
+    _setup_audit_path,
     build_shadow_service_from_environment,
     main,
 )
@@ -256,6 +257,16 @@ def test_environment_composition_is_lazy_without_websocket(
     )
     runtime = build_shadow_service_from_environment()
     assert runtime.health().status is ShadowServiceStatus.STOPPED
+
+
+def test_setup_audit_path_uses_explicit_external_configuration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    external = tmp_path / "scanner" / "qtr_setup_audit.jsonl"
+    monkeypatch.setenv("QTR_SCALPER_V2_SETUP_AUDIT_PATH", str(external))
+
+    assert _setup_audit_path() == external.resolve()
 
 
 def test_systemd_entrypoint_is_declared() -> None:

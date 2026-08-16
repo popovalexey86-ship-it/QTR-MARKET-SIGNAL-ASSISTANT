@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -22,6 +23,10 @@ from market_signal_assistant.qtr_micro_scalper.pipeline import (
     LiveShadowPipelineEvent,
     PipelineEventType,
     PipelineProcessResult,
+)
+from market_signal_assistant.qtr_micro_scalper.price_context_adapter import (
+    JsonlVerifiedSetupProvider,
+    VerifiedPriceContextAdapter,
 )
 from market_signal_assistant.qtr_micro_scalper.setup_context import (
     PriceContext,
@@ -172,6 +177,52 @@ def test_ready_market_data_reaches_shadow_journal(tmp_path: Path) -> None:
         assert (tmp_path / "pipeline-shadow.jsonl").exists()
 
     asyncio.run(scenario())
+
+
+def test_external_production_record_can_create_ready_snapshot_read_only(
+    tmp_path: Path,
+) -> None:
+    audit_path = tmp_path / "scanner" / "qtr_setup_audit.jsonl"
+    audit_path.parent.mkdir()
+    payload = {
+        "symbol": "BTCUSDT",
+        "price_context": {
+            "observed_at": NOW.isoformat(),
+            "source_direction": "UP",
+            "setup_direction": "UP",
+            "market_price": 100.0,
+            "atr": 1.0,
+            "trigger_price": 100.0,
+            "invalidation_price": 99.0,
+            "local_range_low": 98.0,
+            "local_range_high": 100.0,
+            "setup_state": "CONFIRMING",
+            "setup_confidence": 90.0,
+            "volume_confirmation": True,
+            "volatility_confirmation": True,
+            "liquidity_ok": True,
+            "confirmations": ["Verified breakout."],
+            "warnings": [],
+        },
+    }
+    audit_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    original = audit_path.read_bytes()
+    adapter = VerifiedPriceContextAdapter(JsonlVerifiedSetupProvider(audit_path))
+    service = LiveShadowPipeline(
+        symbols=("BTCUSDT",),
+        price_context_provider=adapter,
+        target_provider=adapter.target,
+        orchestrator=ShadowOrchestrator(
+            journal=ShadowTradeJournal(tmp_path / "shadow" / "journal.jsonl")
+        ),
+        clock=lambda: NOW,
+    )
+
+    result = asyncio.run(ready_result(service))
+
+    assert result.snapshot is not None
+    assert result.snapshot.readiness is SnapshotReadiness.READY
+    assert audit_path.read_bytes() == original
 
 
 def test_snapshot_is_created_only_after_book_and_flow_are_ready(tmp_path: Path) -> None:

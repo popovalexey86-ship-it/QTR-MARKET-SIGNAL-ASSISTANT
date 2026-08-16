@@ -20,6 +20,10 @@ def test_shadow_systemd_unit_has_fail_closed_environment() -> None:
     assert "Environment=QTR_SCALPER_V2_ENABLED=false" in text
     assert "Environment=QTR_SCALPER_V2_SHADOW_MODE=true" in text
     assert "Environment=QTR_SCALPER_V2_LIVE_ENABLED=false" in text
+    assert (
+        "Environment=QTR_SCALPER_V2_SETUP_AUDIT_PATH="
+        "/opt/qtr/scanner/data/qtr_setup_telegram_pilot_audit.jsonl"
+    ) in text
     assert "\n[Install]\n" not in text
 
 
@@ -27,14 +31,14 @@ def test_unit_uses_existing_dedicated_identity_and_working_directory() -> None:
     text = unit_text()
     assert "User=qtr" in text
     assert "Group=qtr" in text
-    assert "WorkingDirectory=/opt/qtr/scanner" in text
+    assert "WorkingDirectory=/opt/qtr/scalper-shadow" in text
     assert "UMask=0027" in text
 
 
 def test_unit_runs_only_shadow_cli_without_execution() -> None:
     text = unit_text().casefold()
     assert (
-        "execstart=/opt/qtr/scanner/.venv/bin/python -m "
+        "execstart=/opt/qtr/scalper-shadow/.venv/bin/python -m "
         "market_signal_assistant.qtr_micro_scalper.cli --refresh-seconds 30"
     ) in text
     for forbidden in (
@@ -44,7 +48,7 @@ def test_unit_runs_only_shadow_cli_without_execution() -> None:
         "place-order",
         "api_key",
         "api_secret",
-        "telegram",
+        "market_signal_assistant.telegram",
     ):
         assert forbidden not in text
 
@@ -65,7 +69,12 @@ def test_unit_limits_writes_to_project_data() -> None:
     assert "NoNewPrivileges=true" in text
     assert "ProtectSystem=strict" in text
     assert "ProtectHome=true" in text
-    assert "ReadWritePaths=/opt/qtr/scanner/data" in text
+    assert (
+        "ReadOnlyPaths=-"
+        "/opt/qtr/scanner/data/qtr_setup_telegram_pilot_audit.jsonl"
+    ) in text
+    assert "ReadWritePaths=/opt/qtr/scalper-shadow/data" in text
+    assert "ReadWritePaths=/opt/qtr/scanner" not in text
 
 
 def test_installation_guide_does_not_start_or_enable_service() -> None:
@@ -82,7 +91,7 @@ def test_installation_guide_preserves_qtr_ownership() -> None:
     text = guide_text()
     assert "sudo useradd --system --user-group" in text
     assert "sudo -u qtr python3 -m venv" in text
-    assert "sudo -u qtr /opt/qtr/scanner/.venv/bin/python" in text
+    assert "sudo -u qtr /opt/qtr/scalper-shadow/.venv/bin/python" in text
     assert "chown" not in text
 
 

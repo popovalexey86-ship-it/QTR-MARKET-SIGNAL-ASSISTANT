@@ -1,9 +1,9 @@
 [Unit]
 Description=QTR Micro Scalper V2 Shadow Observer
-Documentation=file:/opt/qtr/scanner/deployment/QTR_SCALPER_SHADOW_INSTALL.md
+Documentation=file:/opt/qtr/scalper-shadow/deployment/QTR_SCALPER_SHADOW_INSTALL.md
 After=network-online.target
 Wants=network-online.target
-ConditionPathExists=/opt/qtr/scanner/.venv/bin/python
+ConditionPathExists=/opt/qtr/scalper-shadow/.venv/bin/python
 StartLimitIntervalSec=300s
 StartLimitBurst=5
 
@@ -11,15 +11,16 @@ StartLimitBurst=5
 Type=simple
 User=qtr
 Group=qtr
-WorkingDirectory=/opt/qtr/scanner
+WorkingDirectory=/opt/qtr/scalper-shadow
 
 # Fail-closed defaults: no market stream until an explicit operator override.
 Environment=PYTHONUNBUFFERED=1
 Environment=QTR_SCALPER_V2_ENABLED=false
 Environment=QTR_SCALPER_V2_SHADOW_MODE=true
 Environment=QTR_SCALPER_V2_LIVE_ENABLED=false
+Environment=QTR_SCALPER_V2_SETUP_AUDIT_PATH=/opt/qtr/scanner/data/qtr_setup_telegram_pilot_audit.jsonl
 
-ExecStart=/opt/qtr/scanner/.venv/bin/python -m market_signal_assistant.qtr_micro_scalper.cli --refresh-seconds 30
+ExecStart=/opt/qtr/scalper-shadow/.venv/bin/python -m market_signal_assistant.qtr_micro_scalper.cli --refresh-seconds 30
 
 Restart=on-failure
 RestartSec=10s
@@ -37,6 +38,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/qtr/scanner/data
+ReadOnlyPaths=-/opt/qtr/scanner/data/qtr_setup_telegram_pilot_audit.jsonl
+ReadWritePaths=/opt/qtr/scalper-shadow/data
 
 # Intentionally no install section: installation does not enable autostart.

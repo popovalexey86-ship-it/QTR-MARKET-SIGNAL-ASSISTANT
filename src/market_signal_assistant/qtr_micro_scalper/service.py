@@ -20,7 +20,11 @@ from market_signal_assistant.qtr_micro_scalper.pipeline import (
     LiveShadowPipeline,
     LiveShadowPipelineMetrics,
 )
-from market_signal_assistant.qtr_micro_scalper.setup_context import PriceContext
+from market_signal_assistant.qtr_micro_scalper.price_context_adapter import (
+    DEFAULT_VERIFIED_SETUP_PATH,
+    JsonlVerifiedSetupProvider,
+    VerifiedPriceContextAdapter,
+)
 from market_signal_assistant.qtr_micro_scalper.shadow_journal import (
     DEFAULT_SHADOW_JOURNAL_PATH,
     ShadowTradeJournal,
@@ -266,9 +270,13 @@ def build_shadow_service_from_environment() -> ShadowService:
         journal=journal,
         decision_journal=decision_journal,
     )
+    price_context = VerifiedPriceContextAdapter(
+        JsonlVerifiedSetupProvider(_setup_audit_path())
+    )
     pipeline = LiveShadowPipeline.with_live_collectors(
         symbols=symbols,
-        price_context_provider=_unavailable_price_context,
+        price_context_provider=price_context,
+        target_provider=price_context.target,
         orchestrator=orchestrator,
     )
     return ShadowService(pipeline, journal, settings)
@@ -313,14 +321,11 @@ def _environment_symbols() -> tuple[str, ...]:
     return values
 
 
-def _unavailable_price_context(
-    _symbol: str,
-    _assessed_at: datetime,
-    _market_price: float,
-) -> PriceContext | None:
-    """Fail closed until a verified price-context adapter is composed."""
-
-    return None
+def _setup_audit_path() -> Path:
+    configured = os.getenv("QTR_SCALPER_V2_SETUP_AUDIT_PATH", "").strip()
+    if not configured:
+        return DEFAULT_VERIFIED_SETUP_PATH.resolve()
+    return Path(configured).expanduser().resolve()
 
 
 def _install_signal_handlers(callback: Callable[[], None]) -> None:
