@@ -207,7 +207,8 @@ def test_external_production_record_can_create_ready_snapshot_read_only(
     }
     audit_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
     original = audit_path.read_bytes()
-    adapter = VerifiedPriceContextAdapter(JsonlVerifiedSetupProvider(audit_path))
+    provider = JsonlVerifiedSetupProvider(audit_path)
+    adapter = VerifiedPriceContextAdapter(provider)
     service = LiveShadowPipeline(
         symbols=("BTCUSDT",),
         price_context_provider=adapter,
@@ -223,6 +224,8 @@ def test_external_production_record_can_create_ready_snapshot_read_only(
     assert result.snapshot is not None
     assert result.snapshot.readiness is SnapshotReadiness.READY
     assert audit_path.read_bytes() == original
+    assert provider.metrics.bootstrap_scans == 1
+    assert provider.metrics.incremental_reads == 0
 
 
 def test_snapshot_is_created_only_after_book_and_flow_are_ready(tmp_path: Path) -> None:

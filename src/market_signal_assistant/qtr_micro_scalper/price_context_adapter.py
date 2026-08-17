@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import RLock
 from typing import Protocol
 
 from market_signal_assistant.qtr_micro_scalper.inplay_bridge import ScalperTarget
@@ -50,32 +53,158 @@ class VerifiedSetupProvider(Protocol):
     def latest(self, symbol: str) -> VerifiedSetupRecord | None: ...
 
 
+@dataclass(frozen=True, slots=True)
+class VerifiedSetupProviderMetrics:
+    bootstrap_scans: int
+    incremental_reads: int
+    bytes_read: int
+    cached_symbols: int
+    malformed_lines: int
+    resets_rotations: int
+
+
 class JsonlVerifiedSetupProvider:
-    """Read the latest complete Setup Pilot record without network access."""
+    """Incrementally tail and cache verified Setup Pilot JSONL records."""
 
     def __init__(self, path: Path = DEFAULT_VERIFIED_SETUP_PATH) -> None:
         self._path = path.resolve()
+        self._lock = RLock()
+        self._file_identity: tuple[int, int] | None = None
+        self._offset = 0
+        self._pending = b""
+        self._latest_by_symbol: dict[str, VerifiedSetupRecord] = {}
+        self._bootstrap_scans = 0
+        self._incremental_reads = 0
+        self._bytes_read = 0
+        self._malformed_lines = 0
+        self._resets_rotations = 0
+        with self._lock:
+            self._refresh_locked()
 
     @property
     def path(self) -> Path:
         return self._path
 
+    @property
+    def metrics(self) -> VerifiedSetupProviderMetrics:
+        with self._lock:
+            return VerifiedSetupProviderMetrics(
+                bootstrap_scans=self._bootstrap_scans,
+                incremental_reads=self._incremental_reads,
+                bytes_read=self._bytes_read,
+                cached_symbols=len(self._latest_by_symbol),
+                malformed_lines=self._malformed_lines,
+                resets_rotations=self._resets_rotations,
+            )
+
     def latest(self, symbol: str) -> VerifiedSetupRecord | None:
         normalized = symbol.strip().upper()
-        if not normalized or not self._path.is_file():
+        if not normalized:
             return None
-        latest: VerifiedSetupRecord | None = None
+        with self._lock:
+            self._refresh_locked()
+            return self._latest_by_symbol.get(normalized)
+
+    def _refresh_locked(self) -> None:
         try:
-            with self._path.open("r", encoding="utf-8") as stream:
-                for line in stream:
-                    record = _record_from_line(line, normalized)
-                    if record is not None and (
-                        latest is None or record.observed_at >= latest.observed_at
-                    ):
-                        latest = record
+            metadata = self._path.stat()
         except OSError:
-            return None
-        return latest
+            self._reset_missing_locked()
+            return
+        if not stat.S_ISREG(metadata.st_mode):
+            self._reset_missing_locked()
+            return
+        identity = _file_identity(metadata)
+        if self._file_identity is None:
+            self._bootstrap_locked()
+            return
+        if identity != self._file_identity or metadata.st_size < self._offset:
+            self._reset_locked()
+            self._bootstrap_locked()
+            return
+        if metadata.st_size > self._offset:
+            self._read_increment_locked(identity)
+
+    def _bootstrap_locked(self) -> None:
+        try:
+            with self._path.open("rb") as stream:
+                metadata = os.fstat(stream.fileno())
+                if not stat.S_ISREG(metadata.st_mode):
+                    self._reset_missing_locked()
+                    return
+                data = stream.read()
+        except OSError:
+            self._reset_missing_locked()
+            return
+        self._file_identity = _file_identity(metadata)
+        self._offset = len(data)
+        self._pending = b""
+        self._latest_by_symbol.clear()
+        self._bootstrap_scans += 1
+        self._bytes_read += len(data)
+        self._consume_locked(data)
+
+    def _read_increment_locked(self, expected_identity: tuple[int, int]) -> None:
+        try:
+            with self._path.open("rb") as stream:
+                metadata = os.fstat(stream.fileno())
+                identity = _file_identity(metadata)
+                if identity != expected_identity or metadata.st_size < self._offset:
+                    self._reset_locked()
+                    data = stream.read()
+                    self._file_identity = identity
+                    self._offset = len(data)
+                    self._bootstrap_scans += 1
+                    self._bytes_read += len(data)
+                    self._consume_locked(data)
+                    return
+                stream.seek(self._offset)
+                data = stream.read()
+        except OSError:
+            return
+        if not data:
+            return
+        self._offset += len(data)
+        self._incremental_reads += 1
+        self._bytes_read += len(data)
+        self._consume_locked(data)
+
+    def _consume_locked(self, data: bytes) -> None:
+        chunks = (self._pending + data).split(b"\n")
+        self._pending = chunks.pop()
+        for raw_line in chunks:
+            raw_line = raw_line.removesuffix(b"\r")
+            if not raw_line:
+                continue
+            try:
+                line = raw_line.decode("utf-8")
+            except UnicodeDecodeError:
+                self._malformed_lines += 1
+                continue
+            record, malformed = _parse_record_line(line)
+            if malformed:
+                self._malformed_lines += 1
+            if record is None:
+                continue
+            current = self._latest_by_symbol.get(record.symbol)
+            if current is None or record.observed_at >= current.observed_at:
+                self._latest_by_symbol[record.symbol] = record
+
+    def _reset_missing_locked(self) -> None:
+        if (
+            self._file_identity is not None
+            or self._offset
+            or self._pending
+            or self._latest_by_symbol
+        ):
+            self._reset_locked()
+
+    def _reset_locked(self) -> None:
+        self._file_identity = None
+        self._offset = 0
+        self._pending = b""
+        self._latest_by_symbol.clear()
+        self._resets_rotations += 1
 
 
 class VerifiedPriceContextAdapter:
@@ -141,21 +270,23 @@ class VerifiedPriceContextAdapter:
         )
 
 
-def _record_from_line(line: str, symbol: str) -> VerifiedSetupRecord | None:
+def _parse_record_line(
+    line: str,
+) -> tuple[VerifiedSetupRecord | None, bool]:
     try:
         payload = json.loads(line)
     except (json.JSONDecodeError, TypeError):
-        return None
-    if (
-        not isinstance(payload, Mapping)
-        or str(payload.get("symbol", "")).upper() != symbol
-    ):
-        return None
+        return None, True
+    if not isinstance(payload, Mapping):
+        return None, True
+    symbol = str(payload.get("symbol", "")).strip().upper()
+    if not symbol:
+        return None, False
     context = payload.get("price_context")
     if not isinstance(context, Mapping):
-        return None
+        return None, False
     try:
-        return VerifiedSetupRecord(
+        record = VerifiedSetupRecord(
             symbol=symbol,
             observed_at=datetime.fromisoformat(str(context["observed_at"])),
             source_direction=str(context["source_direction"]),
@@ -175,7 +306,12 @@ def _record_from_line(line: str, symbol: str) -> VerifiedSetupRecord | None:
             warnings=_strings(context.get("warnings", ())),
         )
     except (KeyError, TypeError, ValueError):
-        return None
+        return None, False
+    return record, False
+
+
+def _file_identity(metadata: os.stat_result) -> tuple[int, int]:
+    return metadata.st_dev, metadata.st_ino
 
 
 def _valid_source(

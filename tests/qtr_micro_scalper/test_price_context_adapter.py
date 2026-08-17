@@ -24,6 +24,7 @@ def _payload(
     setup_direction: str = "UP",
     atr: float | None = 100.0,
     invalidation_price: float | None = 59_800.0,
+    setup_state: str = "CONFIRMING",
 ) -> dict[str, object]:
     return {
         "symbol": symbol,
@@ -37,7 +38,7 @@ def _payload(
             "invalidation_price": invalidation_price,
             "local_range_low": 59_500.0,
             "local_range_high": 60_000.0,
-            "setup_state": "CONFIRMING",
+            "setup_state": setup_state,
             "setup_confidence": 75.0,
             "volume_confirmation": True,
             "volatility_confirmation": True,
@@ -51,6 +52,13 @@ def _payload(
 def _adapter(path: Path, payload: dict[str, object]) -> VerifiedPriceContextAdapter:
     path.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
     return VerifiedPriceContextAdapter(JsonlVerifiedSetupProvider(path))
+
+
+def _append_payload(path: Path, payload: dict[str, object]) -> int:
+    line = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+    with path.open("ab") as stream:
+        stream.write(line)
+    return len(line)
 
 
 def test_valid_long_price_context(tmp_path: Path) -> None:
@@ -181,3 +189,141 @@ def test_clean_import_and_cli_help(capsys: pytest.CaptureFixture[str]) -> None:
 
     assert error.value.code == 0
     assert "QTR Micro Scalper V2" in capsys.readouterr().out
+
+
+def test_large_existing_jsonl_is_bootstrapped_once(tmp_path: Path) -> None:
+    path = tmp_path / "setup.jsonl"
+    legacy = json.dumps({"symbol": "LEGACYUSDT", "decision": "send"}) + "\n"
+    path.write_text(legacy * 20_000, encoding="utf-8")
+    _append_payload(path, _payload(symbol="BTCUSDT"))
+    _append_payload(path, _payload(symbol="ETHUSDT"))
+
+    provider = JsonlVerifiedSetupProvider(path)
+
+    bitcoin = provider.latest("BTCUSDT")
+    assert bitcoin is not None
+    assert bitcoin.confirmations == ("Пробой подтверждён.",)
+    assert provider.latest("ETHUSDT") is not None
+    assert provider.metrics.bootstrap_scans == 1
+    assert provider.metrics.incremental_reads == 0
+    assert provider.metrics.bytes_read == path.stat().st_size
+    assert provider.metrics.cached_symbols == 2
+
+
+def test_repeated_latest_calls_do_not_rescan_file(tmp_path: Path) -> None:
+    path = tmp_path / "setup.jsonl"
+    path.write_text(json.dumps(_payload()) + "\n", encoding="utf-8")
+    provider = JsonlVerifiedSetupProvider(path)
+    after_bootstrap = provider.metrics
+
+    for _ in range(1_000):
+        assert provider.latest("BTCUSDT") is not None
+
+    assert provider.metrics == after_bootstrap
+    assert provider.metrics.bootstrap_scans == 1
+
+
+def test_appended_record_is_read_from_saved_offset(tmp_path: Path) -> None:
+    path = tmp_path / "setup.jsonl"
+    path.write_text(json.dumps(_payload()) + "\n", encoding="utf-8")
+    provider = JsonlVerifiedSetupProvider(path)
+    initial = provider.metrics
+    appended = _append_payload(
+        path,
+        _payload(observed_at=NOW + timedelta(minutes=2), atr=125.0),
+    )
+
+    record = provider.latest("BTCUSDT")
+
+    assert record is not None
+    assert record.atr == 125.0
+    assert provider.metrics.bootstrap_scans == 1
+    assert provider.metrics.incremental_reads == 1
+    assert provider.metrics.bytes_read == initial.bytes_read + appended
+
+
+def test_file_that_appears_after_provider_creation_is_bootstrapped(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "later.jsonl"
+    provider = JsonlVerifiedSetupProvider(path)
+    assert provider.latest("BTCUSDT") is None
+    assert provider.metrics.bootstrap_scans == 0
+
+    path.write_text(json.dumps(_payload()) + "\n", encoding="utf-8")
+
+    assert provider.latest("BTCUSDT") is not None
+    assert provider.metrics.bootstrap_scans == 1
+
+
+def test_multiple_symbols_and_malformed_utf8_are_isolated(tmp_path: Path) -> None:
+    path = tmp_path / "setup.jsonl"
+    path.write_bytes(b"not-json\n\xff\xfe\n")
+    _append_payload(path, _payload(symbol="BTCUSDT"))
+    _append_payload(path, _payload(symbol="ETHUSDT"))
+    provider = JsonlVerifiedSetupProvider(path)
+
+    assert provider.latest("BTCUSDT") is not None
+    assert provider.latest("ETHUSDT") is not None
+    assert provider.latest("SOLUSDT") is None
+    assert provider.metrics.cached_symbols == 2
+    assert provider.metrics.malformed_lines == 2
+
+
+def test_partial_trailing_line_waits_for_completion(tmp_path: Path) -> None:
+    path = tmp_path / "setup.jsonl"
+    line = json.dumps(_payload(), ensure_ascii=False).encode("utf-8")
+    path.write_bytes(line)
+    provider = JsonlVerifiedSetupProvider(path)
+
+    assert provider.latest("BTCUSDT") is None
+    assert provider.metrics.malformed_lines == 0
+
+    with path.open("ab") as stream:
+        stream.write(b"\n")
+
+    assert provider.latest("BTCUSDT") is not None
+    assert provider.metrics.incremental_reads == 1
+
+
+def test_truncation_resets_cache_and_bootstraps_new_file(tmp_path: Path) -> None:
+    path = tmp_path / "setup.jsonl"
+    path.write_text((json.dumps(_payload()) + "\n") * 3, encoding="utf-8")
+    provider = JsonlVerifiedSetupProvider(path)
+
+    path.write_text(json.dumps(_payload(symbol="ETHUSDT")) + "\n", encoding="utf-8")
+
+    assert provider.latest("BTCUSDT") is None
+    assert provider.latest("ETHUSDT") is not None
+    assert provider.metrics.bootstrap_scans == 2
+    assert provider.metrics.resets_rotations == 1
+
+
+def test_rotated_file_replaces_cached_generation(tmp_path: Path) -> None:
+    path = tmp_path / "setup.jsonl"
+    path.write_text(json.dumps(_payload()) + "\n", encoding="utf-8")
+    provider = JsonlVerifiedSetupProvider(path)
+    replacement = tmp_path / "replacement.jsonl"
+    replacement.write_text(
+        json.dumps(_payload(symbol="ETHUSDT")) + "\n",
+        encoding="utf-8",
+    )
+    replacement.replace(path)
+
+    assert provider.latest("BTCUSDT") is None
+    assert provider.latest("ETHUSDT") is not None
+    assert provider.metrics.bootstrap_scans == 2
+    assert provider.metrics.resets_rotations == 1
+
+
+@pytest.mark.parametrize("setup_state", ("CANCELLED", "LATE"))
+def test_rejected_setup_states_remain_fail_closed(
+    tmp_path: Path,
+    setup_state: str,
+) -> None:
+    adapter = _adapter(
+        tmp_path / "setup.jsonl",
+        _payload(setup_state=setup_state),
+    )
+
+    assert adapter("BTCUSDT", NOW, 60_050.0) is None
