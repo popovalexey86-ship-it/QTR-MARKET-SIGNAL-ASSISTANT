@@ -29,6 +29,10 @@ from market_signal_assistant.qtr_micro_scalper.inplay_bridge import (
     TargetBridgeDecision,
     TargetSyncResult,
 )
+from market_signal_assistant.qtr_micro_scalper.lifecycle_bridge import (
+    LiveShadowLifecycleBridge,
+    LiveShadowLifecycleConfig,
+)
 from market_signal_assistant.qtr_micro_scalper.metrics import (
     MetricsSlice,
     MetricsSnapshot,
@@ -153,6 +157,8 @@ __all__ = (
     "ScalperTargetLifecycle",
     "TargetBridgeDecision",
     "TargetSyncResult",
+    "LiveShadowLifecycleBridge",
+    "LiveShadowLifecycleConfig",
     "MetricsSlice",
     "MetricsSnapshot",
     "ShadowMetricsAggregator",

@@ -30,10 +30,12 @@ from market_signal_assistant.qtr_micro_scalper.snapshot import (
 
 class ShadowRuntimeEventType(StrEnum):
     ENTRY_CREATED = "ENTRY_CREATED"
+    OPEN = "OPEN"
     TP1_REACHED = "TP1_REACHED"
     TP2_REACHED = "TP2_REACHED"
     STOPPED = "STOPPED"
     EXPIRED = "EXPIRED"
+    TIME_EXIT = "TIME_EXIT"
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,7 +153,6 @@ class ShadowRuntime:
             runtime_events = tuple(
                 _runtime_event(updated, event)
                 for event in updated.events[previous_event_count:]
-                if event.event_type is not ShadowTradeEventType.ENTRY
             )
             self._journal.extend(runtime_events)
             if updated.terminal:
@@ -283,6 +284,11 @@ def _runtime_event(
     event: ShadowTradeEvent,
 ) -> ShadowRuntimeEvent:
     event_type, stage, message = {
+        ShadowTradeEventType.ENTRY: (
+            ShadowRuntimeEventType.OPEN,
+            ShadowTradeStage.OPEN,
+            "⚔️ Virtual entry level touched; shadow trade opened.",
+        ),
         ShadowTradeEventType.TP1: (
             ShadowRuntimeEventType.TP1_REACHED,
             ShadowTradeStage.TP1_HIT,
@@ -299,7 +305,7 @@ def _runtime_event(
             "🛑 Virtual stop reached.",
         ),
         ShadowTradeEventType.TIME_EXIT: (
-            ShadowRuntimeEventType.EXPIRED,
+            ShadowRuntimeEventType.TIME_EXIT,
             ShadowTradeStage.CLOSED,
             "⏱ Virtual holding period expired.",
         ),

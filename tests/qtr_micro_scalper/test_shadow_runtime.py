@@ -10,6 +10,8 @@ from test_snapshot import (
 )
 
 from market_signal_assistant.qtr_micro_scalper.shadow_decision import (
+    ShadowDecisionConfig,
+    ShadowDecisionEngine,
     ShadowPriceBar,
     ShadowTradeStage,
 )
@@ -190,7 +192,7 @@ def test_open_tp1_tp2_lifecycle_and_journal() -> None:
     opened = runtime.process_bar(bar(1))
     assert opened.trade is not None
     assert opened.trade.stage is ShadowTradeStage.OPEN
-    assert opened.events == ()
+    assert opened.events[0].event_type is ShadowRuntimeEventType.OPEN
 
     tp1 = runtime.process_bar(bar(3, high=102.3, low=100.0, close=102.0))
     assert tp1.trade is not None
@@ -209,6 +211,7 @@ def test_open_tp1_tp2_lifecycle_and_journal() -> None:
     assert runtime.completed_trades() == (tp2.trade,)
     assert [event.event_type for event in runtime.journal()] == [
         ShadowRuntimeEventType.ENTRY_CREATED,
+        ShadowRuntimeEventType.OPEN,
         ShadowRuntimeEventType.TP1_REACHED,
         ShadowRuntimeEventType.TP2_REACHED,
     ]
@@ -220,8 +223,26 @@ def test_stop_closes_and_emits_stopped() -> None:
     stopped = runtime.process_bar(bar(1, high=101.0, low=97.0, close=98.0))
     assert stopped.trade is not None
     assert stopped.trade.stage is ShadowTradeStage.CLOSED
-    assert stopped.events[0].event_type is ShadowRuntimeEventType.STOPPED
-    assert stopped.events[0].message.startswith("🛑")
+    assert [event.event_type for event in stopped.events] == [
+        ShadowRuntimeEventType.OPEN,
+        ShadowRuntimeEventType.STOPPED,
+    ]
+    assert stopped.events[-1].message.startswith("🛑")
+
+
+def test_time_exit_has_distinct_runtime_event() -> None:
+    runtime = ShadowRuntime(
+        decision_engine=ShadowDecisionEngine(
+            ShadowDecisionConfig(maximum_holding_bars=1)
+        )
+    )
+    runtime.process_snapshot(build_complete())
+
+    exited = runtime.process_bar(bar(1, high=101.0, low=99.0, close=100.5))
+
+    assert exited.trade is not None
+    assert exited.trade.stage is ShadowTradeStage.CLOSED
+    assert exited.events[-1].event_type is ShadowRuntimeEventType.TIME_EXIT
 
 
 def test_waiting_entry_expires() -> None:

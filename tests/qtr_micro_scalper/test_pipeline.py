@@ -32,8 +32,14 @@ from market_signal_assistant.qtr_micro_scalper.setup_context import (
     PriceContext,
     ShadowDirection,
 )
+from market_signal_assistant.qtr_micro_scalper.shadow_decision import (
+    ShadowTradeStage,
+)
 from market_signal_assistant.qtr_micro_scalper.shadow_journal import (
     ShadowTradeJournal,
+)
+from market_signal_assistant.qtr_micro_scalper.shadow_runtime import (
+    ShadowRuntimeEventType,
 )
 from market_signal_assistant.qtr_micro_scalper.snapshot import SnapshotReadiness
 
@@ -89,6 +95,7 @@ def trade(
     *,
     trade_id: str = "trade-1",
     at: datetime = NOW + timedelta(milliseconds=100),
+    price: float = 100.0,
 ) -> PublicTradeEvent:
     return PublicTradeEvent(
         symbol=symbol,
@@ -96,9 +103,9 @@ def trade(
         exchange_at=at,
         received_at=at,
         side=TradeSide.BUY,
-        price=100.0,
+        price=price,
         quantity=100.0,
-        quote_notional=10_000.0,
+        quote_notional=price * 100.0,
     )
 
 
@@ -175,6 +182,123 @@ def test_ready_market_data_reaches_shadow_journal(tmp_path: Path) -> None:
         ]
         assert service.metrics().journal_updates == 1
         assert (tmp_path / "pipeline-shadow.jsonl").exists()
+
+    asyncio.run(scenario())
+
+
+def test_live_trade_bar_opens_trade_and_persists_journal(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        service = pipeline(tmp_path)
+        created = await ready_result(service)
+        assert created.trade is not None
+        assert created.trade.stage is ShadowTradeStage.WAITING_ENTRY
+
+        await service.process_event(
+            trade(
+                trade_id="lifecycle-entry",
+                at=NOW + timedelta(milliseconds=300),
+                price=created.trade.entry_price,
+            )
+        )
+        opened = await service.process_event(
+            book(
+                OrderBookEventType.SNAPSHOT,
+                3,
+                at=NOW + timedelta(seconds=1, milliseconds=300),
+            )
+        )
+
+        assert opened.trade is not None
+        assert opened.trade.stage is ShadowTradeStage.OPEN
+        records = ShadowTradeJournal(tmp_path / "pipeline-shadow.jsonl").records()
+        assert [record.stage for record in records] == [
+            ShadowTradeStage.WAITING_ENTRY,
+            ShadowTradeStage.OPEN,
+        ]
+        assert records[-1].events[-1].event_type is ShadowRuntimeEventType.OPEN
+
+    asyncio.run(scenario())
+
+
+def test_active_trade_lifecycle_survives_unavailable_new_setup(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        available = True
+
+        def changing_context(
+            symbol: str,
+            assessed_at: datetime,
+            market_price: float,
+        ) -> PriceContext | None:
+            if not available:
+                return None
+            return price_context(symbol, assessed_at, market_price)
+
+        journal = ShadowTradeJournal(tmp_path / "conflicted-shadow.jsonl")
+        coordinator = ShadowOrchestrator(journal=journal)
+        service = LiveShadowPipeline(
+            symbols=("BTCUSDT",),
+            price_context_provider=changing_context,
+            orchestrator=coordinator,
+            clock=lambda: NOW,
+        )
+        assert service.register_target(target(), observed_at=NOW)
+        created = await ready_result(service)
+        assert created.trade is not None
+        available = False
+
+        await service.process_event(
+            trade(
+                trade_id="conflicted-entry",
+                at=NOW + timedelta(milliseconds=300),
+                price=created.trade.entry_price,
+            )
+        )
+        opened = await service.process_event(
+            book(
+                OrderBookEventType.SNAPSHOT,
+                3,
+                at=NOW + timedelta(seconds=1, milliseconds=300),
+            )
+        )
+
+        assert opened.snapshot is None
+        assert opened.trade is not None
+        assert opened.trade.trade_id == created.trade.trade_id
+        assert opened.trade.stage is ShadowTradeStage.OPEN
+        assert len({record.trade_id for record in journal.records()}) == 1
+
+    asyncio.run(scenario())
+
+
+def test_live_waiting_entry_expires_without_synthetic_fill(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        service = pipeline(tmp_path)
+        created = await ready_result(service)
+        assert created.trade is not None
+
+        await service.process_event(
+            trade(
+                trade_id="post-deadline",
+                at=NOW + timedelta(seconds=60, milliseconds=300),
+                price=99.0,
+            )
+        )
+        expired = await service.process_event(
+            book(
+                OrderBookEventType.SNAPSHOT,
+                3,
+                at=NOW + timedelta(seconds=61, milliseconds=300),
+            )
+        )
+
+        assert expired.trade is not None
+        assert expired.trade.stage is ShadowTradeStage.EXPIRED
+        assert expired.trade.entry_at is None
+        final_record = ShadowTradeJournal(
+            tmp_path / "pipeline-shadow.jsonl"
+        ).records()[-1]
+        assert final_record.outcome.value == "NOT_TRIGGERED"
+        assert final_record.events[-1].event_type is ShadowRuntimeEventType.EXPIRED
 
     asyncio.run(scenario())
 

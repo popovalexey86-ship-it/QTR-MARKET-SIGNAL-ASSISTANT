@@ -26,6 +26,9 @@ from market_signal_assistant.qtr_micro_scalper.data.trades import (
     TradeFlowAccumulator,
 )
 from market_signal_assistant.qtr_micro_scalper.inplay_bridge import ScalperTarget
+from market_signal_assistant.qtr_micro_scalper.lifecycle_bridge import (
+    LiveShadowLifecycleBridge,
+)
 from market_signal_assistant.qtr_micro_scalper.live.collector import (
     ManagedMarketStream,
     UnifiedMarketDataCollector,
@@ -157,6 +160,7 @@ class LiveShadowPipeline:
         snapshot_builder: MicrostructureSnapshotBuilder | None = None,
         scoring_engine: ScalperScoringEngine | None = None,
         orchestrator: ShadowOrchestrator | None = None,
+        lifecycle_bridge: LiveShadowLifecycleBridge | None = None,
         market_collector: ManagedMarketStream | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
@@ -188,6 +192,9 @@ class LiveShadowPipeline:
         self._snapshots = snapshot_builder or MicrostructureSnapshotBuilder()
         self._scoring = scoring_engine or ScalperScoringEngine()
         self._orchestrator = orchestrator or ShadowOrchestrator()
+        self._lifecycle = lifecycle_bridge or LiveShadowLifecycleBridge(
+            self._orchestrator
+        )
         self._market_collector = market_collector
         self._previous_frames: dict[str, LiquidityBookFrame] = {}
         self._current_frames: dict[str, LiquidityBookFrame] = {}
@@ -300,6 +307,7 @@ class LiveShadowPipeline:
         if worker is not None:
             worker.cancel()
             await asyncio.gather(worker, return_exceptions=True)
+        self._lifecycle.stop()
 
     def enqueue_event(
         self,
@@ -415,6 +423,22 @@ class LiveShadowPipeline:
             self._capture_book_frame(event.symbol, as_of=as_of)
 
         self._received += 1
+        journal_before = self._orchestrator.metrics().journal_records
+        lifecycle_results = self._lifecycle.process_event(event)
+        lifecycle_error = next(
+            (item.error for item in lifecycle_results if item.error is not None),
+            None,
+        )
+        if lifecycle_error is not None:
+            raise RuntimeError(lifecycle_error)
+        lifecycle_trade = next(
+            (
+                item.trade
+                for item in reversed(lifecycle_results)
+                if item.trade is not None
+            ),
+            None,
+        )
         emitted = [
             self._emit(
                 PipelineEventType.MARKET_DATA_RECEIVED,
@@ -426,12 +450,19 @@ class LiveShadowPipeline:
         ]
         prepared = self._prepare_analysis(event.symbol, as_of=as_of)
         if prepared is None:
+            self._append_journal_update(
+                emitted,
+                journal_before=journal_before,
+                occurred_at=as_of,
+                symbol=event.symbol,
+                semantic_key=fingerprint,
+            )
             return PipelineProcessResult(
                 symbol=event.symbol,
                 accepted=True,
                 snapshot=None,
                 score=None,
-                trade=None,
+                trade=lifecycle_trade,
                 events=tuple(emitted),
                 reason="Market data accepted; analysis inputs are not ready.",
             )
@@ -454,7 +485,6 @@ class LiveShadowPipeline:
                 ),
             )
         )
-        before_journal = self._orchestrator.metrics().journal_records
         decision = self._orchestrator.analyze(analysis)
         if decision.error is not None:
             raise RuntimeError(decision.error)
@@ -472,25 +502,52 @@ class LiveShadowPipeline:
             )
         )
         after_journal = self._orchestrator.metrics().journal_records
-        if after_journal > before_journal:
-            self._journal_updates += 1
-            emitted.append(
-                self._emit(
-                    PipelineEventType.JOURNAL_UPDATED,
-                    occurred_at=as_of,
-                    symbol=event.symbol,
-                    semantic_key=f"{fingerprint}|{after_journal}",
-                    message="📝 JOURNAL_UPDATED: shadow lifecycle persisted.",
-                )
-            )
+        if decision.trade is not None:
+            self._lifecycle.activate(decision.trade)
+        self._append_journal_update(
+            emitted,
+            journal_before=journal_before,
+            occurred_at=as_of,
+            symbol=event.symbol,
+            semantic_key=fingerprint,
+            journal_after=after_journal,
+        )
         return PipelineProcessResult(
             symbol=event.symbol,
             accepted=True,
             snapshot=snapshot,
             score=decision.score or score,
-            trade=decision.trade,
+            trade=decision.trade or lifecycle_trade,
             events=tuple(emitted),
             reason="Fresh market snapshot processed by the shadow orchestrator.",
+        )
+
+    def _append_journal_update(
+        self,
+        emitted: list[LiveShadowPipelineEvent],
+        *,
+        journal_before: int,
+        occurred_at: datetime,
+        symbol: str,
+        semantic_key: str,
+        journal_after: int | None = None,
+    ) -> None:
+        resolved_after = (
+            self._orchestrator.metrics().journal_records
+            if journal_after is None
+            else journal_after
+        )
+        if resolved_after <= journal_before:
+            return
+        self._journal_updates += 1
+        emitted.append(
+            self._emit(
+                PipelineEventType.JOURNAL_UPDATED,
+                occurred_at=occurred_at,
+                symbol=symbol,
+                semantic_key=f"{semantic_key}|{resolved_after}",
+                message="📝 JOURNAL_UPDATED: shadow lifecycle persisted.",
+            )
         )
 
     def _apply(self, event: MarketDataEvent, *, as_of: datetime) -> bool:
