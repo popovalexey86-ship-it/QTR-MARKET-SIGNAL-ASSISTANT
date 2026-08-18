@@ -10,6 +10,7 @@ from test_orchestrator import activate, analysis_input
 from test_shadow_runtime import bar
 
 from market_signal_assistant.qtr_micro_scalper.decision_journal import (
+    DecisionJournalIndex,
     DecisionJournalRecovery,
     ShadowDecisionEventType,
     ShadowDecisionJournal,
@@ -270,3 +271,127 @@ def test_orchestrator_persists_blocked_decision(tmp_path: Path) -> None:
     blocked = decisions.records()[-1]
     assert blocked.event_type is ShadowDecisionEventType.DECISION_BLOCKED
     assert blocked.score is not None
+
+def test_streaming_index_bootstraps_once_and_reads_only_append_delta(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "large-decisions.jsonl"
+    records = tuple(record(seconds=index) for index in range(2_000))
+    path.write_text(
+        "".join(f"{serialize_decision_record(item)}\n" for item in records),
+        encoding="utf-8",
+    )
+    seen: list[ShadowDecisionRecord] = []
+    index = DecisionJournalIndex(path, on_record=seen.append)
+
+    assert index.refresh() == len(records)
+    bootstrapped = index.metrics()
+    assert bootstrapped.bootstrap_scans == 1
+    assert bootstrapped.incremental_reads == 0
+    assert bootstrapped.records_processed == len(records)
+    assert bootstrapped.bytes_read == path.stat().st_size
+
+    for _ in range(100):
+        assert index.refresh() == 0
+    unchanged = index.metrics()
+    assert unchanged == bootstrapped
+    assert len(seen) == len(records)
+
+    appended = record(seconds=2_001)
+    encoded = f"{serialize_decision_record(appended)}\n"
+    with path.open("a", encoding="utf-8", newline="\n") as stream:
+        stream.write(encoded)
+    assert index.refresh() == 1
+    updated = index.metrics()
+    assert updated.bootstrap_scans == 1
+    assert updated.incremental_reads == 1
+    assert updated.records_processed == len(records) + 1
+    assert updated.bytes_read == bootstrapped.bytes_read + len(
+        encoded.encode("utf-8")
+    )
+
+
+def test_streaming_index_defers_incomplete_trailing_line(tmp_path: Path) -> None:
+    path = tmp_path / "partial.jsonl"
+    first = f"{serialize_decision_record(record())}\n".encode()
+    second = f"{serialize_decision_record(record(seconds=1))}\n".encode()
+    split_at = len(second) // 2
+    path.write_bytes(first + second[:split_at])
+    index = DecisionJournalIndex(path)
+
+    assert index.refresh() == 1
+    partial_metrics = index.metrics()
+    assert partial_metrics.records_processed == 1
+    assert index.refresh() == 0
+    assert index.metrics() == partial_metrics
+
+    with path.open("ab") as stream:
+        stream.write(second[split_at:])
+    assert index.refresh() == 1
+    assert index.metrics().records_processed == 2
+
+
+def test_streaming_index_resets_after_truncation(tmp_path: Path) -> None:
+    path = tmp_path / "rotated.jsonl"
+    original = tuple(record(seconds=index) for index in range(10))
+    path.write_text(
+        "".join(f"{serialize_decision_record(item)}\n" for item in original),
+        encoding="utf-8",
+    )
+    seen: list[ShadowDecisionRecord] = []
+    resets = 0
+
+    def reset() -> None:
+        nonlocal resets
+        resets += 1
+        seen.clear()
+
+    index = DecisionJournalIndex(path, on_record=seen.append, on_reset=reset)
+    assert index.refresh() == len(original)
+    replacement = record(seconds=100)
+    path.write_text(
+        f"{serialize_decision_record(replacement)}\n",
+        encoding="utf-8",
+    )
+
+    assert index.refresh() == 1
+    assert seen == [replacement]
+    assert resets == 1
+    assert index.metrics().resets_rotations == 1
+
+
+def test_lean_runtime_journal_does_not_retain_full_records(tmp_path: Path) -> None:
+    path = tmp_path / "lean.jsonl"
+    values = tuple(record(seconds=index) for index in range(500))
+    path.write_text(
+        "".join(f"{serialize_decision_record(item)}\n" for item in values),
+        encoding="utf-8",
+    )
+
+    journal = ShadowDecisionJournal(path, retain_records=False)
+
+    assert journal.record_count == len(values)
+    assert journal.records() == ()
+    assert journal.index_metrics.cached_event_ids == len(values)
+    assert not journal.append(values[-1])
+    assert journal.append(record(seconds=501))
+    assert journal.records() == ()
+
+
+def test_explicit_recovery_streams_without_path_read_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "streamed.jsonl"
+    path.write_text(
+        f"{serialize_decision_record(record())}\n",
+        encoding="utf-8",
+    )
+
+    def forbidden_read_bytes(self: Path) -> bytes:
+        del self
+        raise AssertionError("raw full-file recovery is forbidden")
+
+    monkeypatch.setattr(Path, "read_bytes", forbidden_read_bytes)
+    recovery = recover_decision_journal(path)
+    assert recovery.records == (record(),)

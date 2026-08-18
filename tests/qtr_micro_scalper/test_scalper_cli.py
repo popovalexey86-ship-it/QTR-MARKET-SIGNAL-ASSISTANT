@@ -23,6 +23,7 @@ from market_signal_assistant.qtr_micro_scalper.decision_journal import (
     ShadowDecisionEventType,
     ShadowDecisionJournal,
     ShadowDecisionRecord,
+    serialize_decision_record,
 )
 from market_signal_assistant.qtr_micro_scalper.metrics import (
     aggregate_shadow_metrics,
@@ -312,3 +313,54 @@ def test_help_does_not_build_service_or_open_runtime(
         main(("--help",))
     assert exit_info.value.code == 0
     assert called is False
+
+def test_journal_source_refreshes_large_history_incrementally(tmp_path: Path) -> None:
+    decision_path = tmp_path / "large-decisions.jsonl"
+    trade_path = tmp_path / "trades.jsonl"
+    records = tuple(
+        decision(
+            ShadowDecisionEventType.SCORE_CREATED,
+            seconds=index,
+        )
+        for index in range(5_000)
+    )
+    decision_path.write_text(
+        "".join(f"{serialize_decision_record(item)}\n" for item in records),
+        encoding="utf-8",
+    )
+    source = JournalObservationSource(
+        decision_journal_path=decision_path,
+        trade_journal_path=trade_path,
+    )
+    initial = source.observe(generated_at=NOW)
+    bootstrapped = source.metrics()
+
+    for _ in range(100):
+        observation = source.observe(generated_at=NOW)
+
+    unchanged = source.metrics()
+    assert initial.analytics.decision_journal_records == len(records)
+    assert observation.analytics.decision_journal_records == len(records)
+    assert unchanged == bootstrapped
+    assert unchanged.decision_index.bootstrap_scans == 1
+    assert unchanged.decision_index.incremental_reads == 0
+    assert unchanged.decision_index.bytes_read == decision_path.stat().st_size
+    assert unchanged.decision_analytics.records_processed == len(records)
+    assert unchanged.decision_analytics.retained_entry_records == 0
+    assert unchanged.decision_analytics.aggregate_state_size == 1
+
+    appended = decision(
+        ShadowDecisionEventType.DECISION_BLOCKED,
+        reasons=("Spread is too wide.",),
+        seconds=5_001,
+    )
+    with decision_path.open("a", encoding="utf-8", newline="\n") as stream:
+        stream.write(f"{serialize_decision_record(appended)}\n")
+    refreshed = source.observe(generated_at=NOW)
+    after_append = source.metrics()
+
+    assert refreshed.analytics.decision_journal_records == len(records) + 1
+    assert refreshed.analytics.overall.blocked_decisions == 1
+    assert after_append.decision_index.bootstrap_scans == 1
+    assert after_append.decision_index.incremental_reads == 1
+    assert after_append.decision_analytics.records_processed == len(records) + 1

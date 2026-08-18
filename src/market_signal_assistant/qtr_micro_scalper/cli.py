@@ -12,10 +12,13 @@ from typing import Protocol
 
 from market_signal_assistant.qtr_micro_scalper.analytics import (
     AnalyticsSnapshot,
-    ShadowAnalyticsEngine,
+    DecisionAnalyticsCacheMetrics,
+    IncrementalDecisionAnalytics,
 )
 from market_signal_assistant.qtr_micro_scalper.decision_journal import (
     DEFAULT_DECISION_JOURNAL_PATH,
+    DecisionJournalIndex,
+    DecisionJournalIndexMetrics,
     ShadowDecisionJournal,
 )
 from market_signal_assistant.qtr_micro_scalper.metrics import (
@@ -59,33 +62,91 @@ class ShadowCliObservation:
     summary: ShadowObserverSummary
 
 
+@dataclass(frozen=True, slots=True)
+class JournalObservationMetrics:
+    decision_index: DecisionJournalIndexMetrics
+    decision_analytics: DecisionAnalyticsCacheMetrics
+
+
 class JournalObservationSource:
-    """Read fresh journal state on every refresh without network activity."""
+    """Incrementally observe durable journals without repeated full recovery."""
 
     def __init__(
         self,
         *,
         decision_journal_path: Path = DEFAULT_DECISION_JOURNAL_PATH,
         trade_journal_path: Path = DEFAULT_SHADOW_JOURNAL_PATH,
+        decision_index: DecisionJournalIndex | None = None,
+        decision_analytics: IncrementalDecisionAnalytics | None = None,
+        trade_journal: ShadowTradeJournal | None = None,
         observer: ShadowObserver | None = None,
     ) -> None:
-        self._decision_journal_path = decision_journal_path.resolve()
-        self._trade_journal_path = trade_journal_path.resolve()
+        decision_path = decision_journal_path.resolve()
+        trade_path = trade_journal_path.resolve()
+        if (decision_index is None) != (decision_analytics is None):
+            raise ValueError(
+                "Decision index and analytics cache must be provided together."
+            )
+        analytics = decision_analytics or IncrementalDecisionAnalytics()
+        index = decision_index or DecisionJournalIndex(
+            decision_path,
+            on_record=analytics.consume,
+            on_reset=analytics.reset,
+        )
+        if index.path != decision_path:
+            raise ValueError("Decision observation index path does not match.")
+        trades = trade_journal or ShadowTradeJournal(trade_path)
+        if trades.path != trade_path:
+            raise ValueError("Trade observation journal path does not match.")
+        self._decision_index = index
+        self._decision_analytics = analytics
+        self._trades = trades
+        self._trade_path = trade_path
+        self._trade_signature = self._file_signature(trade_path)
         self._observer = observer or ShadowObserver()
+        self._decision_index.refresh()
 
+        self._refresh_trades()
     def observe(self, *, generated_at: datetime) -> ShadowCliObservation:
-        decisions = ShadowDecisionJournal(self._decision_journal_path)
-        trades = ShadowTradeJournal(self._trade_journal_path)
-        metrics = ShadowMetricsAggregator(trades).snapshot(
+        self._refresh_trades()
+        self._decision_index.refresh()
+        metrics = ShadowMetricsAggregator(self._trades).snapshot(
             generated_at=generated_at,
         )
-        analytics = ShadowAnalyticsEngine(decisions, trades).snapshot(
+        analytics = self._decision_analytics.snapshot(
+            self._trades.records(),
             generated_at=generated_at,
+            recovery_warnings=(
+                *self._decision_index.recovery.warnings,
+                *self._trades.recovery.warnings,
+            ),
         )
         return ShadowCliObservation(
             metrics=metrics,
             analytics=analytics,
             summary=self._observer.summarize(metrics, analytics),
+        )
+
+    def _refresh_trades(self) -> None:
+        signature = self._file_signature(self._trade_path)
+        if signature == self._trade_signature:
+            return
+        self._trades = ShadowTradeJournal(self._trade_path)
+        self._trade_signature = signature
+
+    @staticmethod
+    def _file_signature(path: Path) -> tuple[int, int, int, int] | None:
+        if not path.exists():
+            return None
+        stat = path.stat()
+        return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
+
+    def metrics(self) -> JournalObservationMetrics:
+        return JournalObservationMetrics(
+            decision_index=self._decision_index.metrics(),
+            decision_analytics=self._decision_analytics.metrics(),
         )
 
 
@@ -217,15 +278,33 @@ def build_cli_runner_from_environment(
             "QTR_SCALPER_V2_DECISION_JOURNAL_PATH",
             str(DEFAULT_DECISION_JOURNAL_PATH),
         )
-    )
+    ).resolve()
     trade_path = Path(
         os.getenv("QTR_SCALPER_V2_JOURNAL_PATH", str(DEFAULT_SHADOW_JOURNAL_PATH))
+    ).resolve()
+    decision_analytics = IncrementalDecisionAnalytics()
+    decision_index = DecisionJournalIndex(
+        decision_path,
+        on_record=decision_analytics.consume,
+        on_reset=decision_analytics.reset,
     )
+    decision_journal = ShadowDecisionJournal(
+        decision_path,
+        index=decision_index,
+        retain_records=False,
+    )
+    trade_journal = ShadowTradeJournal(trade_path)
     return ShadowCliRunner(
-        build_shadow_service_from_environment(),
+        build_shadow_service_from_environment(
+            journal=trade_journal,
+            decision_journal=decision_journal,
+        ),
         JournalObservationSource(
             decision_journal_path=decision_path,
             trade_journal_path=trade_path,
+            decision_index=decision_index,
+            decision_analytics=decision_analytics,
+            trade_journal=trade_journal,
         ),
         refresh_seconds=refresh_seconds,
         output=output,

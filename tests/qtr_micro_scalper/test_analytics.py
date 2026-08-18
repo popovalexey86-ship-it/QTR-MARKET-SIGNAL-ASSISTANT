@@ -11,6 +11,7 @@ from test_metrics import runtime_event
 from market_signal_assistant.qtr_micro_scalper.analytics import (
     AnalyticsMetrics,
     AnalyticsSlice,
+    IncrementalDecisionAnalytics,
     ShadowAnalyticsEngine,
     analyze_shadow_journals,
 )
@@ -322,3 +323,57 @@ def test_naive_generated_at_is_rejected() -> None:
             (),
             generated_at=datetime(2026, 8, 16, 12),
         )
+
+def test_incremental_analytics_is_semantically_equivalent() -> None:
+    decisions = (
+        decision(ShadowDecisionEventType.SCORE_CREATED, seconds=0),
+        decision(ShadowDecisionEventType.SHADOW_ENTRY_CREATED, seconds=1),
+        decision(
+            ShadowDecisionEventType.DECISION_BLOCKED,
+            symbol="ETHUSDT",
+            score=55.0,
+            market_state="SELL_PRESSURE",
+            setup_context="RETEST",
+            reasons=("Spread is too wide.",),
+            seconds=2,
+        ),
+    )
+    trades = (trade_record("win"),)
+    incremental = IncrementalDecisionAnalytics()
+    for item in decisions:
+        incremental.consume(item)
+
+    expected = analyze_shadow_journals(decisions, trades, generated_at=NOW)
+    actual = incremental.snapshot(trades, generated_at=NOW)
+
+    assert actual == expected
+
+
+def test_incremental_analytics_retains_only_entry_records() -> None:
+    incremental = IncrementalDecisionAnalytics()
+    for seconds in range(1_000):
+        incremental.consume(
+            decision(
+                ShadowDecisionEventType.SCORE_CREATED,
+                seconds=seconds,
+            )
+        )
+    incremental.consume(
+        decision(
+            ShadowDecisionEventType.DECISION_BLOCKED,
+            seconds=1_001,
+            reasons=("Stale data.",),
+        )
+    )
+    incremental.consume(
+        decision(
+            ShadowDecisionEventType.SHADOW_ENTRY_CREATED,
+            seconds=1_002,
+        )
+    )
+
+    metrics = incremental.metrics()
+
+    assert metrics.records_processed == 1_002
+    assert metrics.retained_entry_records == 1
+    assert metrics.aggregate_state_size < 20

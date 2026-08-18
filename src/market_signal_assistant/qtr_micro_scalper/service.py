@@ -250,7 +250,11 @@ class ShadowService:
         return value.astimezone(UTC)
 
 
-def build_shadow_service_from_environment() -> ShadowService:
+def build_shadow_service_from_environment(
+    *,
+    journal: ShadowTradeJournal | None = None,
+    decision_journal: ShadowDecisionJournal | None = None,
+) -> ShadowService:
     """Build the safe systemd runtime; construction itself remains offline."""
 
     settings = QtrScalperV2LiveSettings.from_environment()
@@ -264,11 +268,14 @@ def build_shadow_service_from_environment() -> ShadowService:
             str(DEFAULT_DECISION_JOURNAL_PATH),
         )
     )
-    journal = ShadowTradeJournal(journal_path)
-    decision_journal = ShadowDecisionJournal(decision_journal_path)
+    resolved_journal = journal or ShadowTradeJournal(journal_path)
+    resolved_decisions = decision_journal or ShadowDecisionJournal(
+        decision_journal_path,
+        retain_records=False,
+    )
     orchestrator = ShadowOrchestrator(
-        journal=journal,
-        decision_journal=decision_journal,
+        journal=resolved_journal,
+        decision_journal=resolved_decisions,
     )
     price_context = VerifiedPriceContextAdapter(
         JsonlVerifiedSetupProvider(_setup_audit_path())
@@ -279,7 +286,7 @@ def build_shadow_service_from_environment() -> ShadowService:
         target_provider=price_context.target,
         orchestrator=orchestrator,
     )
-    return ShadowService(pipeline, journal, settings)
+    return ShadowService(pipeline, resolved_journal, settings)
 
 
 async def serve(service: ShadowService) -> int:

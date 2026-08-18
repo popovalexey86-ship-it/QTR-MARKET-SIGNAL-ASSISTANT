@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -88,16 +89,185 @@ class DecisionJournalRecovery:
     warnings: tuple[str, ...]
 
 
-class ShadowDecisionJournal:
-    """Thread-safe, restart-safe append-only decision event journal."""
+@dataclass(frozen=True, slots=True)
+class DecisionJournalIndexMetrics:
+    bootstrap_scans: int
+    incremental_reads: int
+    bytes_read: int
+    records_processed: int
+    cached_event_ids: int
+    malformed_lines: int
+    resets_rotations: int
+    file_offset: int
 
-    def __init__(self, path: Path = DEFAULT_DECISION_JOURNAL_PATH) -> None:
+
+class DecisionJournalIndex:
+    """Streaming, exact-ID index over an append-only decision JSONL file."""
+
+    def __init__(
+        self,
+        path: Path = DEFAULT_DECISION_JOURNAL_PATH,
+        *,
+        on_record: Callable[[ShadowDecisionRecord], None] | None = None,
+        on_reset: Callable[[], None] | None = None,
+    ) -> None:
+        self._path = path.resolve()
+        self._on_record = on_record
+        self._on_reset = on_reset
+        self._event_ids: set[bytes] = set()
+        self._offset = 0
+        self._line_number = 0
+        self._observed_size = 0
+        self._identity: tuple[int, int] | None = None
+        self._bootstrapped = False
+        self._bootstrap_scans = 0
+        self._incremental_reads = 0
+        self._bytes_read = 0
+        self._records_processed = 0
+        self._malformed_lines = 0
+        self._resets_rotations = 0
+        self._corrupted_line_numbers: list[int] = []
+        self._warnings: list[str] = []
+        self._lock = Lock()
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    @property
+    def record_count(self) -> int:
+        with self._lock:
+            return len(self._event_ids)
+
+    @property
+    def recovery(self) -> DecisionJournalRecovery:
+        with self._lock:
+            return DecisionJournalRecovery(
+                records=(),
+                corrupted_line_numbers=tuple(self._corrupted_line_numbers),
+                warnings=tuple(self._warnings),
+            )
+
+    def contains(self, event_id: str) -> bool:
+        with self._lock:
+            return _event_key(event_id) in self._event_ids
+
+    def metrics(self) -> DecisionJournalIndexMetrics:
+        with self._lock:
+            return DecisionJournalIndexMetrics(
+                bootstrap_scans=self._bootstrap_scans,
+                incremental_reads=self._incremental_reads,
+                bytes_read=self._bytes_read,
+                records_processed=self._records_processed,
+                cached_event_ids=len(self._event_ids),
+                malformed_lines=self._malformed_lines,
+                resets_rotations=self._resets_rotations,
+                file_offset=self._offset,
+            )
+
+    def refresh(self) -> int:
+        """Consume complete lines appended after the current byte offset."""
+
+        with self._lock:
+            if not self._path.exists():
+                if self._identity is not None:
+                    self._reset_locked()
+                return 0
+            stat = self._path.stat()
+            identity = (stat.st_dev, stat.st_ino)
+            if (
+                self._identity is not None
+                and (identity != self._identity or stat.st_size < self._offset)
+            ):
+                self._reset_locked()
+            if stat.st_size == self._observed_size:
+                return 0
+            self._observed_size = stat.st_size
+            self._identity = identity
+            if stat.st_size <= self._offset:
+                return 0
+            if not self._bootstrapped:
+                self._bootstrap_scans += 1
+                self._bootstrapped = True
+            else:
+                self._incremental_reads += 1
+            accepted = 0
+            with self._path.open("rb") as stream:
+                stream.seek(self._offset)
+                while True:
+                    line_start = stream.tell()
+                    raw_line = stream.readline()
+                    if not raw_line:
+                        break
+                    self._bytes_read += len(raw_line)
+                    if not raw_line.endswith(b"\n"):
+                        stream.seek(line_start)
+                        break
+                    self._offset = stream.tell()
+                    self._line_number += 1
+                    if not raw_line.strip():
+                        continue
+                    try:
+                        record = deserialize_decision_record(
+                            raw_line.decode("utf-8")
+                        )
+                    except (UnicodeDecodeError, ValueError) as exc:
+                        self._malformed_lines += 1
+                        self._corrupted_line_numbers.append(self._line_number)
+                        self._warnings.append(
+                            "Decision journal line "
+                            f"{self._line_number} ignored: {exc}"
+                        )
+                        continue
+                    event_key = _event_key(record.event_id)
+                    if event_key in self._event_ids:
+                        continue
+                    self._event_ids.add(event_key)
+                    self._records_processed += 1
+                    accepted += 1
+                    if self._on_record is not None:
+                        self._on_record(record)
+            return accepted
+
+    def _reset_locked(self) -> None:
+        self._observed_size = 0
+        self._event_ids.clear()
+        self._offset = 0
+        self._line_number = 0
+        self._identity = None
+        self._bootstrapped = False
+        self._corrupted_line_numbers.clear()
+        self._warnings.clear()
+        self._resets_rotations += 1
+        if self._on_reset is not None:
+            self._on_reset()
+
+
+
+class ShadowDecisionJournal:
+    """Thread-safe append journal backed by a streaming exact-ID index."""
+
+    def __init__(
+        self,
+        path: Path = DEFAULT_DECISION_JOURNAL_PATH,
+        *,
+        index: DecisionJournalIndex | None = None,
+        retain_records: bool = True,
+    ) -> None:
         self._path = path.resolve()
         self._lock = Lock()
-        recovery = recover_decision_journal(self._path)
-        self._records = list(recovery.records)
-        self._event_ids = {record.event_id for record in recovery.records}
-        self._recovery = recovery
+        self._retain_records = retain_records
+        self._records: list[ShadowDecisionRecord] = []
+        if index is not None and index.path != self._path:
+            raise ValueError("Decision journal index path does not match journal path.")
+        if index is not None and retain_records:
+            raise ValueError("Shared decision journal index requires lean retention.")
+        self._index = index or DecisionJournalIndex(
+            self._path,
+            on_record=self._records.append if retain_records else None,
+            on_reset=self._records.clear if retain_records else None,
+        )
+        self._index.refresh()
 
     @property
     def path(self) -> Path:
@@ -105,25 +275,42 @@ class ShadowDecisionJournal:
 
     @property
     def recovery(self) -> DecisionJournalRecovery:
-        return self._recovery
+        state = self._index.recovery
+        return DecisionJournalRecovery(
+            records=self.records(),
+            corrupted_line_numbers=state.corrupted_line_numbers,
+            warnings=state.warnings,
+        )
+
+    @property
+    def record_count(self) -> int:
+        return self._index.record_count
+
+    @property
+    def index_metrics(self) -> DecisionJournalIndexMetrics:
+        return self._index.metrics()
 
     def append(self, record: ShadowDecisionRecord) -> bool:
         line = serialize_decision_record(record)
         with self._lock:
-            if record.event_id in self._event_ids:
+            self._index.refresh()
+            if self._index.contains(record.event_id):
                 return False
             self._path.parent.mkdir(parents=True, exist_ok=True)
+            needs_separator = self._needs_separator()
             with self._path.open("a", encoding="utf-8", newline="\n") as stream:
+                if needs_separator:
+                    stream.write("\n")
                 stream.write(line)
                 stream.write("\n")
                 stream.flush()
                 os.fsync(stream.fileno())
-            self._event_ids.add(record.event_id)
-            self._records.append(record)
-            return True
+            return self._index.refresh() > 0
 
     def records(self) -> tuple[ShadowDecisionRecord, ...]:
         with self._lock:
+            if not self._retain_records:
+                return ()
             return tuple(self._records)
 
     def flush(self) -> None:
@@ -133,6 +320,16 @@ class ShadowDecisionJournal:
             with self._path.open("a", encoding="utf-8", newline="\n") as stream:
                 stream.flush()
                 os.fsync(stream.fileno())
+
+    def refresh(self) -> int:
+        return self._index.refresh()
+
+    def _needs_separator(self) -> bool:
+        if not self._path.exists() or self._path.stat().st_size == 0:
+            return False
+        with self._path.open("rb") as stream:
+            stream.seek(-1, os.SEEK_END)
+            return stream.read(1) != b"\n"
 
 
 def serialize_decision_record(record: ShadowDecisionRecord) -> str:
@@ -181,23 +378,17 @@ def recover_decision_journal(path: Path) -> DecisionJournalRecovery:
     if not resolved.exists():
         return DecisionJournalRecovery((), (), ())
     records: list[ShadowDecisionRecord] = []
-    corrupted: list[int] = []
-    warnings: list[str] = []
-    for line_number, raw_line in enumerate(resolved.read_bytes().splitlines(), start=1):
-        if not raw_line.strip():
-            continue
-        try:
-            records.append(deserialize_decision_record(raw_line.decode("utf-8")))
-        except (UnicodeDecodeError, ValueError) as exc:
-            corrupted.append(line_number)
-            warnings.append(f"Decision journal line {line_number} ignored: {exc}")
-    unique: dict[str, ShadowDecisionRecord] = {}
-    for record in records:
-        unique.setdefault(record.event_id, record)
+    index = DecisionJournalIndex(
+        resolved,
+        on_record=records.append,
+        on_reset=records.clear,
+    )
+    index.refresh()
+    state = index.recovery
     return DecisionJournalRecovery(
-        records=tuple(unique.values()),
-        corrupted_line_numbers=tuple(corrupted),
-        warnings=tuple(warnings),
+        records=tuple(records),
+        corrupted_line_numbers=state.corrupted_line_numbers,
+        warnings=state.warnings,
     )
 
 
@@ -210,6 +401,15 @@ def _event_id(record: ShadowDecisionRecord) -> str:
     )
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     return f"shadow-decision-{digest}"
+
+def _event_key(event_id: str) -> bytes:
+    prefix = "shadow-decision-"
+    if event_id.startswith(prefix):
+        try:
+            return bytes.fromhex(event_id[len(prefix) :])
+        except ValueError:
+            pass
+    return hashlib.sha256(event_id.encode("utf-8")).digest()
 
 
 def _payload(
