@@ -253,3 +253,23 @@ def test_stop_discards_incomplete_bar_without_synthetic_flush() -> None:
 
     assert processor.bars == []
     assert not bridge.is_tracking("BTCUSDT")
+
+
+def test_tracked_symbols_cover_waiting_open_tp1_and_drop_terminal() -> None:
+    bridge, processor = live_bridge()
+    assert bridge.tracked_symbols() == ("BTCUSDT",)
+
+    bridge.process_event(observed_trade(0.1, 100.0, trade_id="entry"))
+    bridge.process_event(market_clock(1.1, update_id=1))
+    assert processor.trade.stage is ShadowTradeStage.OPEN
+    assert bridge.tracked_symbols() == ("BTCUSDT",)
+
+    bridge.process_event(observed_trade(1.2, 102.3, trade_id="tp1"))
+    bridge.process_event(market_clock(2.1, update_id=2))
+    assert processor.trade.stage.value == "TP1_HIT"
+    assert bridge.tracked_symbols() == ("BTCUSDT",)
+
+    bridge.process_event(observed_trade(2.2, 104.5, trade_id="tp2"))
+    bridge.process_event(market_clock(3.1, update_id=3))
+    assert processor.trade.terminal
+    assert bridge.tracked_symbols() == ()

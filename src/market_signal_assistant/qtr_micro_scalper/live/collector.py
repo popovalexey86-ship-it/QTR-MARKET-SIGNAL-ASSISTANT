@@ -27,6 +27,13 @@ class ManagedMarketStream(Protocol):
     async def stop(self) -> None: ...
 
 
+class DynamicMarketStream(ManagedMarketStream, Protocol):
+    async def update_symbols(self, symbols: Iterable[str]) -> None: ...
+
+    @property
+    def metrics(self) -> StreamMetrics: ...
+
+
 @dataclass(frozen=True, slots=True)
 class StreamMetrics:
     connections: int
@@ -35,6 +42,19 @@ class StreamMetrics:
     accepted_events: int
     malformed_events: int
     last_error: str | None
+    active_topics: int
+    subscribe_operations: int
+    unsubscribe_operations: int
+    subscription_errors: int
+
+
+@dataclass(frozen=True, slots=True)
+class UnifiedSubscriptionMetrics:
+    active_topics: int
+    subscribe_operations: int
+    unsubscribe_operations: int
+    subscription_errors: int
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,15 +87,16 @@ class BybitPublicStream:
         reconnect_seconds: float = 0.25,
     ) -> None:
         normalized = tuple(
-            dict.fromkeys(topic.strip() for topic in topics if topic.strip())
+            sorted(dict.fromkeys(topic.strip() for topic in topics if topic.strip()))
         )
-        if not normalized:
-            raise ValueError("At least one public WebSocket topic is required.")
+        _validate_topic_args(normalized)
         if heartbeat_seconds <= 0 or reconnect_seconds < 0:
             raise ValueError(
                 "Heartbeat must be positive and reconnect delay non-negative."
             )
         self._topics = normalized
+        self._topic_lock = asyncio.Lock()
+        self._send_lock = asyncio.Lock()
         self._factory = websocket_factory
         self._url = url
         self._heartbeat_seconds = heartbeat_seconds
@@ -89,6 +110,9 @@ class BybitPublicStream:
         self._accepted = 0
         self._malformed = 0
         self._last_error: str | None = None
+        self._subscribe_operations = 0
+        self._unsubscribe_operations = 0
+        self._subscription_errors = 0
 
     @property
     def metrics(self) -> StreamMetrics:
@@ -99,7 +123,52 @@ class BybitPublicStream:
             self._accepted,
             self._malformed,
             self._last_error,
+            len(self._topics),
+            self._subscribe_operations,
+            self._unsubscribe_operations,
+            self._subscription_errors,
         )
+
+    async def set_topics(self, topics: Iterable[str]) -> None:
+        normalized = tuple(
+            sorted(dict.fromkeys(topic.strip() for topic in topics if topic.strip()))
+        )
+        _validate_topic_args(normalized)
+        async with self._topic_lock:
+            previous = set(self._topics)
+            current = set(normalized)
+            added = tuple(sorted(current - previous))
+            removed = tuple(sorted(previous - current))
+            if not added and not removed:
+                return
+            socket = self._socket
+            if socket is not None:
+                try:
+                    if removed:
+                        await self._send_operation(socket, "unsubscribe", removed)
+                        self._unsubscribe_operations += 1
+                    if added:
+                        await self._send_operation(socket, "subscribe", added)
+                        self._subscribe_operations += 1
+                except Exception as exc:
+                    self._subscription_errors += 1
+                    self._last_error = f"{type(exc).__name__}: {exc}"
+                    raise LiveMarketDataError(
+                        "Dynamic Bybit subscription update failed."
+                    ) from exc
+            self._topics = normalized
+
+    async def _send_operation(
+        self,
+        socket: AsyncWebSocket,
+        operation: str,
+        topics: tuple[str, ...] = (),
+    ) -> None:
+        payload: dict[str, object] = {"op": operation}
+        if topics:
+            payload["args"] = topics
+        async with self._send_lock:
+            await socket.send(json.dumps(payload))
 
     async def start(self) -> None:
         if self._task is not None and not self._task.done():
@@ -127,12 +196,16 @@ class BybitPublicStream:
             socket: AsyncWebSocket | None = None
             try:
                 socket = await self._factory(self._url)
-                self._socket = socket
-                self._connections += 1
-                if not first_connection:
-                    self._reconnects += 1
-                first_connection = False
-                await socket.send(json.dumps({"op": "subscribe", "args": self._topics}))
+                async with self._topic_lock:
+                    self._socket = socket
+                    self._connections += 1
+                    if not first_connection:
+                        self._reconnects += 1
+                    first_connection = False
+                    topics = self._topics
+                    if topics:
+                        await self._send_operation(socket, "subscribe", topics)
+                        self._subscribe_operations += 1
                 heartbeat = asyncio.create_task(self._heartbeat(socket))
                 try:
                     while not self._stop.is_set():
@@ -161,15 +234,16 @@ class BybitPublicStream:
             finally:
                 if socket is not None:
                     await socket.close()
-                if self._socket is socket:
-                    self._socket = None
+                async with self._topic_lock:
+                    if self._socket is socket:
+                        self._socket = None
             if not self._stop.is_set():
                 await asyncio.sleep(self._reconnect_seconds)
 
     async def _heartbeat(self, socket: AsyncWebSocket) -> None:
         while not self._stop.is_set():
             await asyncio.sleep(self._heartbeat_seconds)
-            await socket.send(json.dumps({"op": "ping"}))
+            await self._send_operation(socket, "ping")
 
     def handle_payload(self, payload: dict[str, Any]) -> int:
         raise NotImplementedError
@@ -178,16 +252,57 @@ class BybitPublicStream:
 class UnifiedMarketDataCollector:
     """Lifecycle coordinator; every stream reconnects and fails independently."""
 
-    def __init__(self, streams: Iterable[ManagedMarketStream]) -> None:
+    def __init__(
+        self,
+        streams: Iterable[ManagedMarketStream],
+        *,
+        dynamic_streams: Iterable[DynamicMarketStream] = (),
+    ) -> None:
         self._streams = tuple(streams)
         if not self._streams:
             raise ValueError("Unified collector requires at least one stream.")
+        self._dynamic_streams = tuple(dynamic_streams)
         self._running = False
         self._errors: tuple[str, ...] = ()
+        self._subscription_errors = 0
 
     @property
     def status(self) -> UnifiedCollectorStatus:
         return UnifiedCollectorStatus(self._running, self._errors)
+    @property
+    def subscription_metrics(self) -> UnifiedSubscriptionMetrics:
+        metrics = tuple(stream.metrics for stream in self._dynamic_streams)
+        return UnifiedSubscriptionMetrics(
+            active_topics=sum(item.active_topics for item in metrics),
+            subscribe_operations=sum(item.subscribe_operations for item in metrics),
+            unsubscribe_operations=sum(
+                item.unsubscribe_operations for item in metrics
+            ),
+            subscription_errors=(
+                self._subscription_errors
+                + sum(item.subscription_errors for item in metrics)
+            ),
+        )
+
+    async def update_symbols(self, symbols: Iterable[str]) -> None:
+        normalized = tuple(
+            sorted(
+                dict.fromkeys(
+                    item.strip().upper() for item in symbols if item.strip()
+                )
+            )
+        )
+        results = await asyncio.gather(
+            *(stream.update_symbols(normalized) for stream in self._dynamic_streams),
+            return_exceptions=True,
+        )
+        errors = tuple(
+            result for result in results if isinstance(result, BaseException)
+        )
+        self._subscription_errors += len(errors)
+        if errors:
+            raise LiveMarketDataError(str(errors[0]))
+
 
     async def start(self) -> None:
         if self._running:
@@ -209,3 +324,7 @@ class UnifiedMarketDataCollector:
             *(stream.stop() for stream in self._streams), return_exceptions=True
         )
         self._running = False
+
+def _validate_topic_args(topics: tuple[str, ...]) -> None:
+    if sum(len(topic) for topic in topics) > 21_000:
+        raise ValueError("Bybit public WebSocket topic args exceed 21000 characters.")

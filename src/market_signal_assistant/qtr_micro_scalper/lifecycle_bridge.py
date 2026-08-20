@@ -168,6 +168,10 @@ class LiveShadowLifecycleBridge:
     def is_tracking(self, symbol: str) -> bool:
         return symbol.strip().upper() in self._tracked
 
+    def tracked_symbols(self) -> tuple[str, ...]:
+        return tuple(sorted(self._tracked))
+
+
     def _observe_trade(
         self,
         tracked: _TrackedTrade,

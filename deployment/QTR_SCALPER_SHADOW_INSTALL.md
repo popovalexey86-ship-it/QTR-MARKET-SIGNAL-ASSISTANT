@@ -82,3 +82,30 @@ Unit разрешает запись только в `/opt/qtr/scalper-shadow/da
 `/opt/qtr/scanner/data/qtr_setup_telegram_pilot_audit.jsonl` доступен Shadow
 только для чтения. API keys и торговые
 credentials для Shadow Observer не требуются и не должны добавляться в unit.
+
+
+## Dynamic Target Universe (Shadow only)
+
+Dynamic targets are opt-in and disabled by default:
+
+```text
+QTR_SCALPER_V2_DYNAMIC_TARGETS_ENABLED=false
+QTR_SCALPER_V2_MAX_ACTIVE_SYMBOLS=5
+QTR_SCALPER_V2_TARGET_REFRESH_SECONDS=30
+```
+
+When enabled, the Shadow service reads the existing verified Setup Pilot JSONL
+incrementally, ranks complete fresh records deterministically, and subscribes to
+the TOP-N symbols. Active WAITING_ENTRY, OPEN, or TP1_HIT shadow trades remain
+subscribed until their existing lifecycle reaches a terminal state.
+
+Recommended rollout:
+
+1. Start with `QTR_SCALPER_V2_MAX_ACTIVE_SYMBOLS=3`.
+2. Observe WebSocket subscription metrics, shadow journal growth, CPU, and RAM.
+3. Increase to 5 only after the TOP-3 shadow run remains stable.
+
+Rollback requires no code change. Set
+`QTR_SCALPER_V2_DYNAMIC_TARGETS_ENABLED=false` and use the existing
+`QTR_SCALPER_V2_SYMBOLS` fixed-symbol setting. Dynamic mode never places real
+or Demo orders and does not change scoring, risk, or lifecycle thresholds.

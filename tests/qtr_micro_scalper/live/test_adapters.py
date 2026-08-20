@@ -272,6 +272,177 @@ def test_socket_message_is_processed_offline() -> None:
     asyncio.run(scenario())
 
 
+class ControlledDisconnectSocket(FakeSocket):
+    def __init__(self) -> None:
+        super().__init__([])
+        self.disconnect = asyncio.Event()
+
+    async def recv(self) -> str:
+        await self.disconnect.wait()
+        raise ConnectionError("controlled disconnect")
+
+
+def test_dynamic_subscribe_unsubscribe_and_duplicate_suppression() -> None:
+    async def scenario() -> None:
+        socket = FakeSocket([])
+
+        async def factory(_url: str) -> FakeSocket:
+            return socket
+
+        collector = PublicTradeCollector(
+            ("BTCUSDT",),
+            TradeFlowAccumulator(clock=lambda: NOW),
+            websocket_factory=factory,
+        )
+        await collector.start()
+        await asyncio.sleep(0.01)
+        await collector.update_symbols(("BTCUSDT", "ETHUSDT"))
+        sent_after_add = len(socket.sent)
+        await collector.update_symbols(("ETHUSDT", "BTCUSDT", "ETHUSDT"))
+        assert len(socket.sent) == sent_after_add
+        await collector.update_symbols(("ETHUSDT",))
+        await collector.stop()
+
+        assert {"op": "subscribe", "args": ["publicTrade.ETHUSDT"]} in socket.sent
+        assert {
+            "op": "unsubscribe",
+            "args": ["publicTrade.BTCUSDT"],
+        } in socket.sent
+        assert collector.metrics.subscribe_operations == 2
+        assert collector.metrics.unsubscribe_operations == 1
+        assert collector.metrics.active_topics == 1
+
+    asyncio.run(scenario())
+
+
+def test_reconnect_restores_only_current_dynamic_subscriptions() -> None:
+    async def scenario() -> None:
+        first = ControlledDisconnectSocket()
+        second = FakeSocket([])
+        sockets: list[FakeSocket] = [first, second]
+
+        async def factory(_url: str) -> FakeSocket:
+            return sockets.pop(0)
+
+        collector = PublicTradeCollector(
+            ("BTCUSDT",),
+            TradeFlowAccumulator(clock=lambda: NOW),
+            websocket_factory=factory,
+            reconnect_seconds=0,
+        )
+        await collector.start()
+        await asyncio.sleep(0.01)
+        await collector.update_symbols(("ETHUSDT",))
+        first.disconnect.set()
+        for _ in range(50):
+            if collector.metrics.connections == 2:
+                break
+            await asyncio.sleep(0.002)
+        await collector.stop()
+
+        subscriptions = [
+            payload for payload in second.sent if payload.get("op") == "subscribe"
+        ]
+        assert subscriptions == [
+            {"op": "subscribe", "args": ["publicTrade.ETHUSDT"]}
+        ]
+        for payload in second.sent:
+            arguments = payload.get("args")
+            if isinstance(arguments, list):
+                assert "publicTrade.BTCUSDT" not in arguments
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_refresh_and_reconnect_converge_on_latest_symbols() -> None:
+    async def scenario() -> None:
+        first = ControlledDisconnectSocket()
+        second = FakeSocket([])
+        sockets: list[FakeSocket] = [first, second]
+
+        async def factory(_url: str) -> FakeSocket:
+            return sockets.pop(0)
+
+        collector = PublicTradeCollector(
+            ("BTCUSDT",),
+            TradeFlowAccumulator(clock=lambda: NOW),
+            websocket_factory=factory,
+            reconnect_seconds=0,
+        )
+        await collector.start()
+        await asyncio.sleep(0.01)
+
+        async def disconnect() -> None:
+            first.disconnect.set()
+
+        await asyncio.gather(
+            collector.update_symbols(("SOLUSDT",)),
+            disconnect(),
+        )
+        for _ in range(50):
+            if collector.metrics.connections == 2:
+                break
+            await asyncio.sleep(0.002)
+        await collector.stop()
+
+        assert collector.metrics.active_topics == 1
+        assert second.sent[0] == {
+            "op": "subscribe",
+            "args": ["publicTrade.SOLUSDT"],
+        }
+
+    asyncio.run(scenario())
+
+
+def test_orderbook_and_liquidation_streams_apply_dynamic_delta() -> None:
+    async def scenario() -> None:
+        book_socket = FakeSocket([])
+        liquidation_socket = FakeSocket([])
+
+        async def book_factory(_url: str) -> FakeSocket:
+            return book_socket
+
+        async def liquidation_factory(_url: str) -> FakeSocket:
+            return liquidation_socket
+
+        books = OrderBookCollector(
+            ("BTCUSDT",),
+            websocket_factory=book_factory,
+        )
+        liquidations = LiquidationCollector(
+            ("BTCUSDT",),
+            lambda _event: None,
+            websocket_factory=liquidation_factory,
+        )
+        await books.start()
+        await liquidations.start()
+        await asyncio.sleep(0.01)
+        await books.update_symbols(("ETHUSDT",))
+        await liquidations.update_symbols(("ETHUSDT",))
+        await books.stop()
+        await liquidations.stop()
+
+        assert books.state("ETHUSDT").symbol == "ETHUSDT"
+        assert {
+            "op": "unsubscribe",
+            "args": ["orderbook.50.BTCUSDT"],
+        } in book_socket.sent
+        assert {
+            "op": "subscribe",
+            "args": ["orderbook.50.ETHUSDT"],
+        } in book_socket.sent
+        assert {
+            "op": "unsubscribe",
+            "args": ["allLiquidation.BTCUSDT"],
+        } in liquidation_socket.sent
+        assert {
+            "op": "subscribe",
+            "args": ["allLiquidation.ETHUSDT"],
+        } in liquidation_socket.sent
+
+    asyncio.run(scenario())
+
+
 def test_disconnected_socket_reconnects_without_stopping_collector() -> None:
     async def scenario() -> None:
         sockets = [FailingSocket([]), FakeSocket([])]

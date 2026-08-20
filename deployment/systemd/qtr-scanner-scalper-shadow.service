@@ -21,6 +21,9 @@ Environment=QTR_SCALPER_V2_LIVE_ENABLED=false
 Environment=QTR_SCALPER_V2_SETUP_AUDIT_PATH=/opt/qtr/scanner/data/qtr_setup_telegram_pilot_audit.jsonl
 
 ExecStart=/opt/qtr/scalper-shadow/.venv/bin/python -m market_signal_assistant.qtr_micro_scalper.cli --refresh-seconds 30
+Environment=QTR_SCALPER_V2_DYNAMIC_TARGETS_ENABLED=false
+Environment=QTR_SCALPER_V2_MAX_ACTIVE_SYMBOLS=5
+Environment=QTR_SCALPER_V2_TARGET_REFRESH_SECONDS=30
 
 Restart=on-failure
 RestartSec=10s

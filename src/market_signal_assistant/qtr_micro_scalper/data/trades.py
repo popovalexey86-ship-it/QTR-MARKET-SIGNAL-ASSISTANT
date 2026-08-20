@@ -198,6 +198,21 @@ class TradeFlowAccumulator:
             self._prune_locked(self._now())
             return len(self._events.get(normalized_symbol, {}))
 
+    def remove_symbol(self, symbol: str) -> None:
+        """Release all rolling and cumulative state for an inactive symbol."""
+
+        normalized_symbol = _normalize_symbol(symbol)
+        with self._lock:
+            self._events.pop(normalized_symbol, None)
+            self._cvd_process.pop(normalized_symbol, None)
+            self._episode_started_at.pop(normalized_symbol, None)
+            self._cvd_episode.pop(normalized_symbol, None)
+            self._cvd_by_day = {
+                key: value
+                for key, value in self._cvd_by_day.items()
+                if key[0] != normalized_symbol
+            }
+
     def _now(self) -> datetime:
         return _normalize_timestamp("Trade collector clock", self._clock())
 

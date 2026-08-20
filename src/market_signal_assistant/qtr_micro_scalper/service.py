@@ -15,6 +15,10 @@ from market_signal_assistant.qtr_micro_scalper.decision_journal import (
     DEFAULT_DECISION_JOURNAL_PATH,
     ShadowDecisionJournal,
 )
+from market_signal_assistant.qtr_micro_scalper.dynamic_targets import (
+    DynamicTargetSettings,
+    DynamicVerifiedTargetManager,
+)
 from market_signal_assistant.qtr_micro_scalper.orchestrator import ShadowOrchestrator
 from market_signal_assistant.qtr_micro_scalper.pipeline import (
     LiveShadowPipeline,
@@ -258,7 +262,8 @@ def build_shadow_service_from_environment(
     """Build the safe systemd runtime; construction itself remains offline."""
 
     settings = QtrScalperV2LiveSettings.from_environment()
-    symbols = _environment_symbols()
+    dynamic_settings = DynamicTargetSettings.from_environment()
+    symbols = () if dynamic_settings.enabled else _environment_symbols()
     journal_path = Path(
         os.getenv("QTR_SCALPER_V2_JOURNAL_PATH", str(DEFAULT_SHADOW_JOURNAL_PATH))
     )
@@ -277,17 +282,21 @@ def build_shadow_service_from_environment(
         journal=resolved_journal,
         decision_journal=resolved_decisions,
     )
-    price_context = VerifiedPriceContextAdapter(
-        JsonlVerifiedSetupProvider(_setup_audit_path())
+    verified_provider = JsonlVerifiedSetupProvider(_setup_audit_path())
+    price_context = VerifiedPriceContextAdapter(verified_provider)
+    dynamic_manager = (
+        DynamicVerifiedTargetManager(verified_provider, dynamic_settings)
+        if dynamic_settings.enabled
+        else None
     )
     pipeline = LiveShadowPipeline.with_live_collectors(
         symbols=symbols,
         price_context_provider=price_context,
         target_provider=price_context.target,
         orchestrator=orchestrator,
+        dynamic_target_manager=dynamic_manager,
     )
     return ShadowService(pipeline, resolved_journal, settings)
-
 
 async def serve(service: ShadowService) -> int:
     shutdown = asyncio.Event()

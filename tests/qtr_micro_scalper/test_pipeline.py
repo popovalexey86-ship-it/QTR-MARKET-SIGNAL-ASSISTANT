@@ -5,6 +5,7 @@ import json
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -15,11 +16,21 @@ from market_signal_assistant.qtr_micro_scalper.data.models import (
     PublicTradeEvent,
     TradeSide,
 )
+from market_signal_assistant.qtr_micro_scalper.data.trades import TradeFlowAccumulator
+from market_signal_assistant.qtr_micro_scalper.dynamic_targets import (
+    DynamicTargetSettings,
+    DynamicVerifiedTargetManager,
+)
 from market_signal_assistant.qtr_micro_scalper.inplay_bridge import ScalperTarget
-from market_signal_assistant.qtr_micro_scalper.live.collector import AsyncWebSocket
+from market_signal_assistant.qtr_micro_scalper.live.collector import (
+    AsyncWebSocket,
+    UnifiedMarketDataCollector,
+    UnifiedSubscriptionMetrics,
+)
 from market_signal_assistant.qtr_micro_scalper.orchestrator import ShadowOrchestrator
 from market_signal_assistant.qtr_micro_scalper.pipeline import (
     LiveShadowPipeline,
+    LiveShadowPipelineConfig,
     LiveShadowPipelineEvent,
     PipelineEventType,
     PipelineProcessResult,
@@ -27,6 +38,7 @@ from market_signal_assistant.qtr_micro_scalper.pipeline import (
 from market_signal_assistant.qtr_micro_scalper.price_context_adapter import (
     JsonlVerifiedSetupProvider,
     VerifiedPriceContextAdapter,
+    VerifiedSetupRecord,
 )
 from market_signal_assistant.qtr_micro_scalper.setup_context import (
     PriceContext,
@@ -294,9 +306,9 @@ def test_live_waiting_entry_expires_without_synthetic_fill(tmp_path: Path) -> No
         assert expired.trade is not None
         assert expired.trade.stage is ShadowTradeStage.EXPIRED
         assert expired.trade.entry_at is None
-        final_record = ShadowTradeJournal(
-            tmp_path / "pipeline-shadow.jsonl"
-        ).records()[-1]
+        final_record = ShadowTradeJournal(tmp_path / "pipeline-shadow.jsonl").records()[
+            -1
+        ]
         assert final_record.outcome.value == "NOT_TRIGGERED"
         assert final_record.events[-1].event_type is ShadowRuntimeEventType.EXPIRED
 
@@ -540,3 +552,379 @@ def test_live_composition_is_lazy_and_does_not_open_websocket(tmp_path: Path) ->
         clock=lambda: NOW,
     )
     assert calls == 0
+
+
+class MutableVerifiedProvider:
+    def __init__(self, records: tuple[VerifiedSetupRecord, ...] = ()) -> None:
+        self.records = records
+        self.calls = 0
+
+    def latest_records(self) -> tuple[VerifiedSetupRecord, ...]:
+        self.calls += 1
+        return self.records
+
+
+class FakeSubscriptionController:
+    def __init__(self) -> None:
+        self.symbols: tuple[str, ...] = ()
+        self.calls: list[tuple[str, ...]] = []
+        self.subscribes = 0
+        self.unsubscribes = 0
+
+    async def update_symbols(self, symbols: tuple[str, ...]) -> None:
+        normalized = tuple(sorted(symbols))
+        if normalized == self.symbols:
+            return
+        previous = set(self.symbols)
+        current = set(normalized)
+        self.subscribes += int(bool(current - previous))
+        self.unsubscribes += int(bool(previous - current))
+        self.symbols = normalized
+        self.calls.append(normalized)
+
+    @property
+    def subscription_metrics(self) -> UnifiedSubscriptionMetrics:
+        return UnifiedSubscriptionMetrics(
+            active_topics=len(self.symbols) * 3,
+            subscribe_operations=self.subscribes,
+            unsubscribe_operations=self.unsubscribes,
+            subscription_errors=0,
+        )
+
+
+def verified_record(
+    symbol: str,
+    *,
+    state: str = "READY_TO_CONSIDER",
+    confidence: float = 90.0,
+    observed_at: datetime = NOW,
+) -> VerifiedSetupRecord:
+    return VerifiedSetupRecord(
+        symbol=symbol,
+        observed_at=observed_at,
+        source_direction="UP",
+        setup_direction="UP",
+        market_price=100.0,
+        atr=1.0,
+        trigger_price=100.0,
+        invalidation_price=98.0,
+        local_range_low=99.0,
+        local_range_high=101.0,
+        setup_state=state,
+        setup_confidence=confidence,
+        volume_confirmation=True,
+        volatility_confirmation=True,
+        liquidity_ok=True,
+    )
+
+
+def dynamic_pipeline(
+    tmp_path: Path,
+    provider: MutableVerifiedProvider,
+    controller: FakeSubscriptionController,
+    *,
+    maximum: int = 5,
+    trade_flow: TradeFlowAccumulator | None = None,
+    config: LiveShadowPipelineConfig | None = None,
+) -> LiveShadowPipeline:
+    manager = DynamicVerifiedTargetManager(
+        provider,
+        DynamicTargetSettings(max_active_symbols=maximum),
+    )
+    return LiveShadowPipeline(
+        symbols=(),
+        price_context_provider=price_context,
+        orchestrator=ShadowOrchestrator(
+            journal=ShadowTradeJournal(tmp_path / "dynamic-shadow.jsonl")
+        ),
+        dynamic_target_manager=manager,
+        subscription_controller=cast(UnifiedMarketDataCollector, controller),
+        clock=lambda: NOW,
+        trade_flow=trade_flow,
+        config=config,
+    )
+
+
+def test_dynamic_pipeline_adds_processes_and_removes_symbol(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        accumulator = TradeFlowAccumulator(clock=lambda: NOW)
+        provider = MutableVerifiedProvider((verified_record("BTCUSDT"),))
+        controller = FakeSubscriptionController()
+        service = dynamic_pipeline(
+            tmp_path,
+            provider,
+            controller,
+            trade_flow=accumulator,
+        )
+
+        first = await service.refresh_targets()
+        assert first is not None
+        assert service.active_symbols() == ("BTCUSDT",)
+        assert (await service.process_event(trade())).accepted
+        assert accumulator.event_count("BTCUSDT") == 1
+
+        provider.records = ()
+        removed = await service.refresh_targets()
+        assert removed is not None and removed.removed == ("BTCUSDT",)
+        assert service.active_symbols() == ()
+        assert accumulator.event_count("BTCUSDT") == 0
+        late = await service.process_event(trade(trade_id="late"))
+        assert not late.accepted
+        assert late.error is None
+
+        provider.records = (verified_record("ETHUSDT"),)
+        await service.refresh_targets()
+        eth = await service.process_event(trade("ETHUSDT", trade_id="eth"))
+        assert eth.accepted
+        assert service.active_symbols() == ("ETHUSDT",)
+        assert service.metrics().errors == 0
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("producer_state", ("CANCELLED", "LATE"))
+def test_waiting_entry_is_protected_from_producer_state_change(
+    tmp_path: Path,
+    producer_state: str,
+) -> None:
+    async def scenario() -> None:
+        provider = MutableVerifiedProvider((verified_record("BTCUSDT"),))
+        controller = FakeSubscriptionController()
+        service = dynamic_pipeline(tmp_path, provider, controller)
+        await service.refresh_targets()
+        assert service.register_target(target(), observed_at=NOW)
+        created = await ready_result(service)
+        assert created.trade is not None
+        assert created.trade.stage is ShadowTradeStage.WAITING_ENTRY
+
+        provider.records = (verified_record("BTCUSDT", state=producer_state),)
+        refreshed = await service.refresh_targets()
+        assert refreshed is not None
+        assert refreshed.desired_symbols == ()
+        assert refreshed.protected_trade_symbols == ("BTCUSDT",)
+        assert service.active_symbols() == ("BTCUSDT",)
+        assert controller.unsubscribes == 0
+
+    asyncio.run(scenario())
+
+
+def test_open_trade_stays_subscribed_until_terminal_state(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        provider = MutableVerifiedProvider((verified_record("BTCUSDT"),))
+        controller = FakeSubscriptionController()
+        service = dynamic_pipeline(tmp_path, provider, controller)
+        await service.refresh_targets()
+        assert service.register_target(target(), observed_at=NOW)
+        created = await ready_result(service)
+        assert created.trade is not None
+
+        await service.process_event(
+            trade(
+                trade_id="dynamic-entry",
+                at=NOW + timedelta(milliseconds=300),
+                price=created.trade.entry_price,
+            )
+        )
+        opened = await service.process_event(
+            book(
+                OrderBookEventType.SNAPSHOT,
+                3,
+                at=NOW + timedelta(seconds=1, milliseconds=300),
+            )
+        )
+        assert opened.trade is not None
+        assert opened.trade.stage is ShadowTradeStage.OPEN
+
+        provider.records = ()
+        protected = await service.refresh_targets()
+        assert protected is not None
+        assert protected.protected_trade_symbols == ("BTCUSDT",)
+        assert service.active_symbols() == ("BTCUSDT",)
+
+    asyncio.run(scenario())
+
+
+def test_terminal_trade_allows_dynamic_unsubscribe(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        provider = MutableVerifiedProvider((verified_record("BTCUSDT"),))
+        controller = FakeSubscriptionController()
+        service = dynamic_pipeline(tmp_path, provider, controller)
+        await service.refresh_targets()
+        assert service.register_target(target(), observed_at=NOW)
+        created = await ready_result(service)
+        assert created.trade is not None
+
+        provider.records = ()
+        await service.process_event(
+            trade(
+                trade_id="dynamic-expire",
+                at=NOW + timedelta(seconds=60, milliseconds=300),
+                price=99.0,
+            )
+        )
+        expired = await service.process_event(
+            book(
+                OrderBookEventType.SNAPSHOT,
+                3,
+                at=NOW + timedelta(seconds=61, milliseconds=300),
+            )
+        )
+        assert expired.trade is not None
+        assert expired.trade.stage is ShadowTradeStage.EXPIRED
+
+        refreshed = await service.refresh_targets()
+        assert refreshed is not None
+        assert refreshed.protected_trade_symbols == ()
+        assert refreshed.removed == ("BTCUSDT",)
+        assert service.active_symbols() == ()
+
+    asyncio.run(scenario())
+
+
+def test_incremental_audit_to_top_n_to_shadow_decision(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        audit_path = tmp_path / "setup-audit.jsonl"
+        records = [
+            {
+                "symbol": f"S{index:03d}USDT",
+                "price_context": {
+                    "observed_at": NOW.isoformat(),
+                    "source_direction": "UP",
+                    "setup_direction": "UP",
+                    "market_price": 100.0,
+                    "atr": 1.0,
+                    "trigger_price": 100.0,
+                    "invalidation_price": 98.0,
+                    "local_range_low": 99.0,
+                    "local_range_high": 101.0,
+                    "setup_state": "READY_TO_CONSIDER",
+                    "setup_confidence": 100.0 - index,
+                    "volume_confirmation": True,
+                    "volatility_confirmation": True,
+                    "liquidity_ok": True,
+                    "confirmations": ["Verified breakout."],
+                    "warnings": [],
+                },
+            }
+            for index in range(105)
+        ]
+        audit_path.write_text(
+            "".join(json.dumps(item) + "\n" for item in records),
+            encoding="utf-8",
+        )
+        verified = JsonlVerifiedSetupProvider(audit_path)
+        adapter = VerifiedPriceContextAdapter(verified)
+        manager = DynamicVerifiedTargetManager(
+            verified,
+            DynamicTargetSettings(max_active_symbols=5),
+        )
+        controller = FakeSubscriptionController()
+        service = LiveShadowPipeline(
+            symbols=(),
+            price_context_provider=adapter,
+            target_provider=adapter.target,
+            orchestrator=ShadowOrchestrator(
+                journal=ShadowTradeJournal(tmp_path / "integration-shadow.jsonl")
+            ),
+            dynamic_target_manager=manager,
+            subscription_controller=cast(UnifiedMarketDataCollector, controller),
+            clock=lambda: NOW,
+        )
+
+        first = await service.refresh_targets()
+        assert first is not None
+        assert first.desired_symbols == tuple(f"S{index:03d}USDT" for index in range(5))
+        for _ in range(100):
+            unchanged = await service.refresh_targets()
+            assert unchanged is not None
+            assert unchanged.added == unchanged.removed == ()
+        assert verified.metrics.bootstrap_scans == 1
+        assert verified.metrics.incremental_reads == 0
+        assert controller.calls == [first.active_symbols]
+
+        appended = {
+            "symbol": "A000USDT",
+            "price_context": {
+                "observed_at": NOW.isoformat(),
+                "source_direction": "UP",
+                "setup_direction": "UP",
+                "market_price": 100.0,
+                "atr": 1.0,
+                "trigger_price": 100.0,
+                "invalidation_price": 98.0,
+                "local_range_low": 99.0,
+                "local_range_high": 101.0,
+                "setup_state": "READY_TO_CONSIDER",
+                "setup_confidence": 100.0,
+                "volume_confirmation": True,
+                "volatility_confirmation": True,
+                "liquidity_ok": True,
+                "confirmations": ["Verified breakout."],
+                "warnings": [],
+            },
+        }
+        with audit_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(appended) + "\n")
+        changed = await service.refresh_targets()
+        assert changed is not None
+        assert changed.added == ("A000USDT",)
+        assert changed.removed == ("S004USDT",)
+        assert verified.metrics.bootstrap_scans == 1
+        assert verified.metrics.incremental_reads == 1
+        assert controller.calls == [first.active_symbols, changed.active_symbols]
+
+        result = await ready_result(service, symbol="A000USDT")
+        assert result.snapshot is not None
+        assert result.score is not None
+        assert result.trade is not None
+        assert service.metrics().active_symbols == 5
+        assert service.metrics().active_topics == 15
+
+    asyncio.run(scenario())
+
+
+def test_static_pipeline_keeps_fixed_symbols_without_dynamic_manager(
+    tmp_path: Path,
+) -> None:
+    service = pipeline(tmp_path, "BTCUSDT", "ETHUSDT")
+    assert service.active_symbols() == ("BTCUSDT", "ETHUSDT")
+    assert service.dynamic_universe_snapshot() is None
+    assert service.metrics().target_refreshes == 0
+
+
+def test_repeated_dynamic_add_remove_cycles_keep_runtime_state_bounded(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        provider = MutableVerifiedProvider()
+        controller = FakeSubscriptionController()
+        service = dynamic_pipeline(
+            tmp_path,
+            provider,
+            controller,
+            maximum=1,
+            config=LiveShadowPipelineConfig(retired_symbol_capacity=3),
+        )
+
+        for index in range(100):
+            symbol = f"S{index:03d}USDT"
+            provider.records = (verified_record(symbol),)
+            refreshed = await service.refresh_targets()
+            assert refreshed is not None
+            assert service.active_symbols() == (symbol,)
+            assert len(controller.symbols) == 1
+
+        metrics = service.metrics()
+        assert metrics.active_symbols == 1
+        assert metrics.desired_symbols == 1
+        assert metrics.target_refreshes == 100
+        assert metrics.symbols_added == 100
+        assert metrics.symbols_removed == 99
+
+        assert metrics.retired_symbol_tombstones == 3
+
+    asyncio.run(scenario())

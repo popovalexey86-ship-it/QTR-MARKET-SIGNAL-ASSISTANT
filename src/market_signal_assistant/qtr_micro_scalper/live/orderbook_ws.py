@@ -29,6 +29,7 @@ class OrderBookCollector(BybitPublicStream):
         reconnect_seconds: float = 0.25,
     ) -> None:
         normalized = _symbols(symbols)
+        self._depth = depth
         self._states = {
             symbol: OrderBookState(
                 symbol, depth=depth, require_contiguous_update_ids=False
@@ -43,7 +44,28 @@ class OrderBookCollector(BybitPublicStream):
             reconnect_seconds=reconnect_seconds,
         )
 
+    async def update_symbols(self, symbols: Iterable[str]) -> None:
+        normalized = _symbols(symbols)
+        current = set(self._states)
+        desired = set(normalized)
+        for symbol in sorted(desired - current):
+            self._states[symbol] = OrderBookState(
+                symbol,
+                depth=self._depth,
+                require_contiguous_update_ids=False,
+            )
+        try:
+            await self.set_topics(
+                f"orderbook.{self._depth}.{symbol}" for symbol in normalized
+            )
+        except Exception:
+            for symbol in desired - current:
+                self._states.pop(symbol, None)
+            raise
+        for symbol in current - desired:
+            self._states.pop(symbol, None)
     def state(self, symbol: str) -> OrderBookState:
+
         return self._states[symbol.strip().upper()]
 
     def handle_payload(self, payload: dict[str, Any]) -> int:
@@ -91,8 +113,6 @@ def _levels(value: object) -> tuple[OrderBookLevel, ...]:
 
 def _symbols(values: Iterable[str]) -> tuple[str, ...]:
     result = tuple(dict.fromkeys(v.strip().upper() for v in values if v.strip()))
-    if not result:
-        raise ValueError("At least one order book symbol is required.")
     return result
 
 

@@ -37,6 +37,12 @@ class PublicTradeCollector(BybitPublicStream):
             reconnect_seconds=reconnect_seconds,
         )
 
+    async def update_symbols(self, symbols: Iterable[str]) -> None:
+        normalized = _symbols(symbols)
+        await self.set_topics(
+            f"publicTrade.{symbol}" for symbol in normalized
+        )
+
     def handle_payload(self, payload: dict[str, Any]) -> int:
         accepted = 0
         for event in parse_public_trade_message(payload):
@@ -84,8 +90,6 @@ def parse_public_trade_message(
 
 def _symbols(values: Iterable[str]) -> tuple[str, ...]:
     result = tuple(dict.fromkeys(v.strip().upper() for v in values if v.strip()))
-    if not result:
-        raise ValueError("At least one trade symbol is required.")
     return result
 
 

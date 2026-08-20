@@ -103,8 +103,18 @@ class JsonlVerifiedSetupProvider:
             return None
         with self._lock:
             self._refresh_locked()
-            return self._latest_by_symbol.get(normalized)
 
+            return self._latest_by_symbol.get(normalized)
+    def latest_records(self) -> tuple[VerifiedSetupRecord, ...]:
+        """Return one latest verified record per cached symbol."""
+
+        with self._lock:
+            self._refresh_locked()
+            return tuple(
+                self._latest_by_symbol[symbol]
+                for symbol in sorted(self._latest_by_symbol)
+
+            )
     def _refresh_locked(self) -> None:
         try:
             metadata = self._path.stat()

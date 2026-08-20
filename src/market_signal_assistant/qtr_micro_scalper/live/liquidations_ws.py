@@ -36,6 +36,12 @@ class LiquidationCollector(BybitPublicStream):
             reconnect_seconds=reconnect_seconds,
         )
 
+    async def update_symbols(self, symbols: Iterable[str]) -> None:
+        normalized = _symbols(symbols)
+        await self.set_topics(
+            f"allLiquidation.{symbol}" for symbol in normalized
+        )
+
     def handle_payload(self, payload: dict[str, Any]) -> int:
         events = parse_liquidation_message(payload)
         for event in events:
@@ -81,8 +87,6 @@ def parse_liquidation_message(
 
 def _symbols(values: Iterable[str]) -> tuple[str, ...]:
     result = tuple(dict.fromkeys(v.strip().upper() for v in values if v.strip()))
-    if not result:
-        raise ValueError("At least one liquidation symbol is required.")
     return result
 
 

@@ -25,6 +25,10 @@ from market_signal_assistant.qtr_micro_scalper.data.trades import (
     IngestStatus,
     TradeFlowAccumulator,
 )
+from market_signal_assistant.qtr_micro_scalper.dynamic_targets import (
+    DynamicUniverseSnapshot,
+    DynamicVerifiedTargetManager,
+)
 from market_signal_assistant.qtr_micro_scalper.inplay_bridge import ScalperTarget
 from market_signal_assistant.qtr_micro_scalper.lifecycle_bridge import (
     LiveShadowLifecycleBridge,
@@ -32,6 +36,7 @@ from market_signal_assistant.qtr_micro_scalper.lifecycle_bridge import (
 from market_signal_assistant.qtr_micro_scalper.live.collector import (
     ManagedMarketStream,
     UnifiedMarketDataCollector,
+    UnifiedSubscriptionMetrics,
     WebSocketFactory,
     default_websocket_factory,
 )
@@ -85,6 +90,8 @@ class LiveShadowPipelineConfig:
     liquidation_retention_count: int = 500
     event_deduplication_capacity: int = 100_000
 
+    retired_symbol_capacity: int = 1_000
+
     def __post_init__(self) -> None:
         for name, value in (
             ("aggressive notional baseline", self.aggressive_notional_baseline),
@@ -96,6 +103,7 @@ class LiveShadowPipelineConfig:
         for name, value in (
             ("liquidation retention", self.liquidation_retention_count),
             ("event deduplication capacity", self.event_deduplication_capacity),
+            ("retired symbol capacity", self.retired_symbol_capacity),
         ):
             if isinstance(value, bool) or value < 1:
                 raise ValueError(f"Pipeline {name} must be positive.")
@@ -135,6 +143,19 @@ class LiveShadowPipelineMetrics:
     errors: int
     active_symbols: int
 
+    target_refreshes: int = 0
+    eligible_verified_symbols: int = 0
+    desired_symbols: int = 0
+    protected_trade_symbols: int = 0
+    symbols_added: int = 0
+    symbols_removed: int = 0
+    subscribe_operations: int = 0
+    unsubscribe_operations: int = 0
+    subscription_errors: int = 0
+    active_topics: int = 0
+    last_target_refresh_at: datetime | None = None
+    retired_symbol_tombstones: int = 0
+
 
 @dataclass(frozen=True, slots=True)
 class _QueuedEvent:
@@ -162,6 +183,8 @@ class LiveShadowPipeline:
         orchestrator: ShadowOrchestrator | None = None,
         lifecycle_bridge: LiveShadowLifecycleBridge | None = None,
         market_collector: ManagedMarketStream | None = None,
+        dynamic_target_manager: DynamicVerifiedTargetManager | None = None,
+        subscription_controller: UnifiedMarketDataCollector | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         normalized = tuple(
@@ -169,9 +192,9 @@ class LiveShadowPipeline:
                 symbol.strip().upper() for symbol in symbols if symbol.strip()
             )
         )
-        if not normalized:
+        if not normalized and dynamic_target_manager is None:
             raise ValueError("Live shadow pipeline requires at least one symbol.")
-        self._symbols = normalized
+        self._symbols = set(normalized)
         self._price_context = price_context_provider
         self._target_provider = target_provider
         self._config = config or LiveShadowPipelineConfig()
@@ -196,12 +219,15 @@ class LiveShadowPipeline:
             self._orchestrator
         )
         self._market_collector = market_collector
+        self._dynamic_targets = dynamic_target_manager
+        self._subscription_controller = subscription_controller
         self._previous_frames: dict[str, LiquidityBookFrame] = {}
         self._current_frames: dict[str, LiquidityBookFrame] = {}
         self._liquidations: dict[str, list[LiquidationEvent]] = {}
         self._seen_events: dict[str, None] = {}
         self._registered_provider_targets: set[str] = set()
         self._symbol_locks = {symbol: asyncio.Lock() for symbol in normalized}
+        self._retired_symbols: dict[str, None] = {}
         self._events: list[LiveShadowPipelineEvent] = []
         self._sequence = 0
         self._received = 0
@@ -214,6 +240,9 @@ class LiveShadowPipeline:
         self._errors = 0
         self._queue: asyncio.Queue[_QueuedEvent] | None = None
         self._worker: asyncio.Task[None] | None = None
+        self._target_refresh_task: asyncio.Task[None] | None = None
+        self._target_refresh_stop = asyncio.Event()
+        self._universe_lock = asyncio.Lock()
 
     @classmethod
     def with_live_collectors(
@@ -226,6 +255,7 @@ class LiveShadowPipeline:
         orchestrator: ShadowOrchestrator | None = None,
         config: LiveShadowPipelineConfig | None = None,
         clock: Callable[[], datetime] | None = None,
+        dynamic_target_manager: DynamicVerifiedTargetManager | None = None,
     ) -> LiveShadowPipeline:
         """Compose lazy Bybit public streams without opening a connection."""
 
@@ -260,7 +290,10 @@ class LiveShadowPipeline:
             liquidation_sink,
             websocket_factory=websocket_factory,
         )
-        unified = UnifiedMarketDataCollector((trades, books, liquidations))
+        unified = UnifiedMarketDataCollector(
+            (trades, books, liquidations),
+            dynamic_streams=(trades, books, liquidations),
+        )
         pipeline = cls(
             symbols=normalized,
             price_context_provider=price_context_provider,
@@ -271,6 +304,8 @@ class LiveShadowPipeline:
             orchestrator=orchestrator,
             market_collector=unified,
             clock=selected_clock,
+            dynamic_target_manager=dynamic_target_manager,
+            subscription_controller=unified,
         )
         holder.append(pipeline)
         return pipeline
@@ -287,15 +322,110 @@ class LiveShadowPipeline:
             activated_at=observed_at,
         ).accepted
 
+    async def refresh_targets(self) -> DynamicUniverseSnapshot | None:
+        manager = self._dynamic_targets
+        if manager is None:
+            return None
+        snapshot = manager.refresh(
+            at=self._clock(),
+            protected_symbols=self._lifecycle.tracked_symbols(),
+        )
+        await self.update_symbols(snapshot.active_symbols)
+        return snapshot
+
+    async def update_symbols(self, symbols: Iterable[str]) -> None:
+        normalized = set(item.strip().upper() for item in symbols if item.strip())
+        async with self._universe_lock:
+            current = set(self._symbols)
+            added = tuple(sorted(normalized - current))
+            removed = tuple(sorted(current - normalized))
+            if not added and not removed:
+                return
+            for symbol in added:
+                self._owned_books[symbol] = OrderBookState(
+                    symbol,
+                    depth=50,
+                    require_contiguous_update_ids=False,
+                )
+                self._symbol_locks[symbol] = asyncio.Lock()
+                self._retired_symbols.pop(symbol, None)
+            try:
+                if self._subscription_controller is not None:
+                    await self._subscription_controller.update_symbols(
+                        tuple(sorted(normalized))
+                    )
+            except Exception:
+                for symbol in added:
+                    self._owned_books.pop(symbol, None)
+                    self._symbol_locks.pop(symbol, None)
+                raise
+            for symbol in removed:
+                lock = self._symbol_locks.get(symbol)
+                if lock is not None:
+                    async with lock:
+                        self._cleanup_symbol(symbol)
+                else:
+                    self._cleanup_symbol(symbol)
+            self._symbols = normalized
+
+    def active_symbols(self) -> tuple[str, ...]:
+        return tuple(sorted(self._symbols))
+
+    def dynamic_universe_snapshot(self) -> DynamicUniverseSnapshot | None:
+        manager = self._dynamic_targets
+        return manager.snapshot() if manager is not None else None
+
+    def _cleanup_symbol(self, symbol: str) -> None:
+        self._symbol_locks.pop(symbol, None)
+        self._owned_books.pop(symbol, None)
+        self._previous_frames.pop(symbol, None)
+        self._current_frames.pop(symbol, None)
+        self._liquidations.pop(symbol, None)
+        self._registered_provider_targets.discard(symbol)
+        self._trade_flow.remove_symbol(symbol)
+        self._retired_symbols.pop(symbol, None)
+        self._retired_symbols[symbol] = None
+        while len(self._retired_symbols) > self._config.retired_symbol_capacity:
+            self._retired_symbols.pop(next(iter(self._retired_symbols)))
+
+    async def _target_refresh_loop(self) -> None:
+        manager = self._dynamic_targets
+        if manager is None:
+            return
+        while not self._target_refresh_stop.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._target_refresh_stop.wait(),
+                    timeout=manager.settings.refresh_seconds,
+                )
+            except TimeoutError:
+                try:
+                    await self.refresh_targets()
+                except (OSError, RuntimeError, TypeError, ValueError):
+                    self._errors += 1
+            else:
+                return
+
     async def start(self) -> None:
         if self._worker is not None and not self._worker.done():
             return
         self._queue = asyncio.Queue()
+        if self._dynamic_targets is not None:
+            self._target_refresh_stop.clear()
+            await self.refresh_targets()
         self._worker = asyncio.create_task(self._consume())
         if self._market_collector is not None:
             await self._market_collector.start()
+        if self._dynamic_targets is not None:
+            self._target_refresh_task = asyncio.create_task(self._target_refresh_loop())
 
     async def stop(self) -> None:
+        self._target_refresh_stop.set()
+        refresh_task = self._target_refresh_task
+        self._target_refresh_task = None
+        if refresh_task is not None:
+            refresh_task.cancel()
+            await asyncio.gather(refresh_task, return_exceptions=True)
         if self._market_collector is not None:
             await self._market_collector.stop()
         queue = self._queue
@@ -328,19 +458,27 @@ class LiveShadowPipeline:
         already_applied: bool = False,
     ) -> PipelineProcessResult:
         symbol = event.symbol
-        if symbol not in self._symbol_locks:
-            self._errors += 1
-            return PipelineProcessResult(
-                symbol=symbol,
-                accepted=False,
-                snapshot=None,
-                score=None,
-                trade=None,
-                events=(),
-                reason="Symbol is not subscribed by the pipeline.",
-                error="unsupported_symbol",
-            )
-        async with self._symbol_locks[symbol]:
+        async with self._universe_lock:
+            symbol_lock = self._symbol_locks.get(symbol)
+            if symbol_lock is None:
+                retired = symbol in self._retired_symbols
+                self._errors += int(not retired)
+                return PipelineProcessResult(
+                    symbol=symbol,
+                    accepted=False,
+                    snapshot=None,
+                    score=None,
+                    trade=None,
+                    events=(),
+                    reason=(
+                        "Late event ignored after unsubscribe."
+                        if retired
+                        else "Symbol is not subscribed by the pipeline."
+                    ),
+                    error=None if retired else "unsupported_symbol",
+                )
+            await symbol_lock.acquire()
+        try:
             try:
                 return self._process_locked(event, already_applied=already_applied)
             except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
@@ -355,8 +493,20 @@ class LiveShadowPipeline:
                     reason="Market-data event failed in isolated symbol processing.",
                     error=str(exc),
                 )
+        finally:
+            symbol_lock.release()
 
     def metrics(self) -> LiveShadowPipelineMetrics:
+        subscriptions = (
+            self._subscription_controller.subscription_metrics
+            if self._subscription_controller is not None
+            else UnifiedSubscriptionMetrics(0, 0, 0, 0)
+        )
+        targets = (
+            self._dynamic_targets.metrics()
+            if self._dynamic_targets is not None
+            else None
+        )
         return LiveShadowPipelineMetrics(
             market_events_received=self._received,
             duplicate_events_suppressed=self._duplicates,
@@ -366,7 +516,23 @@ class LiveShadowPipeline:
             journal_updates=self._journal_updates,
             stale_data_suppressed=self._stale,
             errors=self._errors,
-            active_symbols=len(self._current_frames),
+            active_symbols=len(self._symbols),
+            target_refreshes=targets.target_refreshes if targets else 0,
+            eligible_verified_symbols=(
+                targets.eligible_verified_symbols if targets else 0
+            ),
+            desired_symbols=targets.desired_symbols if targets else len(self._symbols),
+            protected_trade_symbols=(targets.protected_trade_symbols if targets else 0),
+            symbols_added=targets.symbols_added if targets else 0,
+            symbols_removed=targets.symbols_removed if targets else 0,
+            subscribe_operations=subscriptions.subscribe_operations,
+            unsubscribe_operations=subscriptions.unsubscribe_operations,
+            subscription_errors=subscriptions.subscription_errors,
+            retired_symbol_tombstones=len(self._retired_symbols),
+            active_topics=subscriptions.active_topics,
+            last_target_refresh_at=(
+                targets.last_target_refresh_at if targets else None
+            ),
         )
 
     def events(self) -> tuple[LiveShadowPipelineEvent, ...]:
