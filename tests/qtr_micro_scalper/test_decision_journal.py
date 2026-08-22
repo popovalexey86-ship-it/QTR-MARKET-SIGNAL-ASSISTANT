@@ -50,18 +50,31 @@ def record(
     microseconds: int = 0,
     score: float | None = 75.0,
     score_components: ScalperComponentScores | None = None,
+    symbol: str = "btcusdt",
+    market_state: str | None = None,
+    setup_context: str | None = None,
+    reasons: tuple[str, ...] | None = None,
+    warnings: tuple[str, ...] | None = None,
 ) -> ShadowDecisionRecord:
     return ShadowDecisionRecord(
         timestamp=NOW + timedelta(seconds=seconds, microseconds=microseconds),
-        symbol="btcusdt",
+        symbol=symbol,
         event_type=event_type,
         score=score,
         score_components=score_components
         or (components() if score is not None else None),
-        market_state="buy_pressure" if score is not None else None,
-        setup_context="shadow_candidate" if score is not None else None,
-        reasons=(f"Reason for {event_type.value}.",),
-        warnings=("Offline shadow warning.",),
+        market_state=(
+            market_state
+            if market_state is not None
+            else ("buy_pressure" if score is not None else None)
+        ),
+        setup_context=(
+            setup_context
+            if setup_context is not None
+            else ("shadow_candidate" if score is not None else None)
+        ),
+        reasons=reasons or (f"Reason for {event_type.value}.",),
+        warnings=warnings or ("Offline shadow warning.",),
     )
 
 
@@ -411,16 +424,84 @@ def test_repeated_watch_diagnostics_are_rate_limited(tmp_path: Path) -> None:
     assert journal.record_count == 1
 
 
+def test_changing_diagnostic_semantics_cannot_bypass_hard_interval(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "decisions.jsonl"
+    journal = ShadowDecisionJournal(path, retain_records=False)
+
+    for value in range(1_000):
+        assert journal.append(
+            record(
+                ShadowDecisionEventType.DECISION_BLOCKED,
+                microseconds=value,
+                score=float(value % 101),
+                market_state=f"state_{value}",
+                setup_context=f"context_{value}",
+                reasons=(f"Reason {value} with value {value / 10}.",),
+                warnings=(f"Warning {value}.",),
+            )
+        ) is (value == 0)
+
+    assert journal.record_count == 1
+    assert sum(1 for _ in path.open("r", encoding="utf-8")) == 1
+
+
+def test_diagnostic_event_at_hard_interval_is_persisted(tmp_path: Path) -> None:
+    journal = ShadowDecisionJournal(tmp_path / "decisions.jsonl")
+
+    assert journal.append(record(seconds=0))
+    assert not journal.append(record(seconds=59, score=99.0))
+    assert journal.append(record(seconds=60, score=99.0))
+    assert journal.record_count == 2
+
+
+def test_diagnostic_cooldown_is_independent_by_event_type(tmp_path: Path) -> None:
+    journal = ShadowDecisionJournal(tmp_path / "decisions.jsonl")
+
+    assert journal.append(record(ShadowDecisionEventType.SNAPSHOT_READY))
+    assert journal.append(record(ShadowDecisionEventType.SCORE_CREATED))
+    assert journal.append(record(ShadowDecisionEventType.DECISION_BLOCKED))
+    assert journal.record_count == 3
+
+
+def test_diagnostic_cooldown_is_independent_by_symbol(tmp_path: Path) -> None:
+    journal = ShadowDecisionJournal(tmp_path / "decisions.jsonl")
+
+    assert journal.append(record(symbol="BTCUSDT"))
+    assert journal.append(record(symbol="ETHUSDT"))
+    assert journal.record_count == 2
+
+
+def test_rotating_diagnostic_symbols_do_not_accumulate_stale_state(
+    tmp_path: Path,
+) -> None:
+    journal = ShadowDecisionJournal(
+        tmp_path / "decisions.jsonl",
+        retain_records=False,
+    )
+
+    for value in range(1_000):
+        assert journal.append(
+            record(seconds=value, symbol=f"ASSET{value}USDT")
+        )
+
+    assert journal.diagnostic_state_size <= 60
+
+
 def test_critical_lifecycle_events_are_never_rate_limited(tmp_path: Path) -> None:
     journal = ShadowDecisionJournal(tmp_path / "decisions.jsonl")
 
-    assert journal.append(
-        record(ShadowDecisionEventType.SHADOW_ENTRY_CREATED, microseconds=1)
-    )
-    assert journal.append(
-        record(ShadowDecisionEventType.SHADOW_ENTRY_CREATED, microseconds=2)
-    )
-    assert journal.record_count == 2
+    for event_type in (
+        ShadowDecisionEventType.TARGET_FOUND,
+        ShadowDecisionEventType.ANALYSIS_STARTED,
+        ShadowDecisionEventType.SHADOW_ENTRY_CREATED,
+        ShadowDecisionEventType.TRADE_UPDATED,
+        ShadowDecisionEventType.TRADE_FINISHED,
+    ):
+        assert journal.append(record(event_type, microseconds=1))
+        assert journal.append(record(event_type, microseconds=2))
+    assert journal.record_count == 10
 
 
 def test_explicit_recovery_streams_without_path_read_bytes(

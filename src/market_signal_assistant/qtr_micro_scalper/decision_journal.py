@@ -4,7 +4,6 @@ import hashlib
 import json
 import math
 import os
-import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -289,7 +288,7 @@ class ShadowDecisionJournal:
         self._records: list[ShadowDecisionRecord] = []
         self._diagnostic_interval = diagnostic_interval
         self._diagnostic_state: dict[
-            tuple[str, ShadowDecisionEventType], tuple[str, datetime]
+            tuple[str, ShadowDecisionEventType], datetime
         ] = {}
         if index is not None and index.path != self._path:
             raise ValueError("Decision journal index path does not match journal path.")
@@ -323,6 +322,11 @@ class ShadowDecisionJournal:
     def index_metrics(self) -> DecisionJournalIndexMetrics:
         return self._index.metrics()
 
+    @property
+    def diagnostic_state_size(self) -> int:
+        with self._lock:
+            return len(self._diagnostic_state)
+
     def append(self, record: ShadowDecisionRecord) -> bool:
         with self._lock:
             self._index.refresh()
@@ -346,17 +350,30 @@ class ShadowDecisionJournal:
         if record.event_type not in _DIAGNOSTIC_EVENTS:
             return True
         key = (record.symbol, record.event_type)
-        fingerprint = _diagnostic_fingerprint(record)
-        previous = self._diagnostic_state.get(key)
-        if previous is not None:
-            previous_fingerprint, previous_at = previous
-            if (
-                fingerprint == previous_fingerprint
-                and record.timestamp - previous_at < self._diagnostic_interval
-            ):
-                return False
-        self._diagnostic_state[key] = (fingerprint, record.timestamp)
+        previous_at = self._diagnostic_state.get(key)
+        if (
+            previous_at is not None
+            and record.timestamp - previous_at < self._diagnostic_interval
+        ):
+            return False
+        self._diagnostic_state[key] = record.timestamp
+        self._prune_diagnostic_state(record.timestamp, preserve=key)
         return True
+
+    def _prune_diagnostic_state(
+        self,
+        current_at: datetime,
+        *,
+        preserve: tuple[str, ShadowDecisionEventType],
+    ) -> None:
+        expired = tuple(
+            key
+            for key, persisted_at in self._diagnostic_state.items()
+            if key != preserve
+            and current_at - persisted_at >= self._diagnostic_interval
+        )
+        for key in expired:
+            del self._diagnostic_state[key]
 
     def records(self) -> tuple[ShadowDecisionRecord, ...]:
         with self._lock:
@@ -461,27 +478,6 @@ def _event_key(event_id: str) -> bytes:
         except ValueError:
             pass
     return hashlib.sha256(event_id.encode("utf-8")).digest()
-
-
-def _diagnostic_fingerprint(record: ShadowDecisionRecord) -> str:
-    normalized_text = tuple(
-        _normalize_diagnostic_text(value)
-        for value in (*record.reasons, *record.warnings)
-    )
-    score_bucket = None if record.score is None else int(record.score // 5)
-    payload = (
-        record.event_type.value,
-        record.symbol,
-        record.market_state,
-        record.setup_context,
-        score_bucket,
-        normalized_text,
-    )
-    return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
-
-
-def _normalize_diagnostic_text(value: str) -> str:
-    return re.sub(r"[-+]?\d+(?:[.,]\d+)?", "#", value.casefold()).strip()
 
 
 def _payload(
