@@ -4,9 +4,10 @@ import hashlib
 import json
 import math
 import os
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from threading import Lock
@@ -31,6 +32,18 @@ class ShadowDecisionEventType(StrEnum):
     SHADOW_ENTRY_CREATED = "SHADOW_ENTRY_CREATED"
     TRADE_UPDATED = "TRADE_UPDATED"
     TRADE_FINISHED = "TRADE_FINISHED"
+
+
+_DEFAULT_EVENT_ID_CAPACITY = 100_000
+_DEFAULT_DIAGNOSTIC_INTERVAL = timedelta(minutes=1)
+_MAXIMUM_RECOVERY_WARNINGS = 1_000
+_DIAGNOSTIC_EVENTS = frozenset(
+    {
+        ShadowDecisionEventType.SNAPSHOT_READY,
+        ShadowDecisionEventType.SCORE_CREATED,
+        ShadowDecisionEventType.DECISION_BLOCKED,
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,7 +115,7 @@ class DecisionJournalIndexMetrics:
 
 
 class DecisionJournalIndex:
-    """Streaming, exact-ID index over an append-only decision JSONL file."""
+    """Streaming JSONL index with bounded recent-ID duplicate protection."""
 
     def __init__(
         self,
@@ -110,11 +123,16 @@ class DecisionJournalIndex:
         *,
         on_record: Callable[[ShadowDecisionRecord], None] | None = None,
         on_reset: Callable[[], None] | None = None,
+        maximum_cached_event_ids: int = _DEFAULT_EVENT_ID_CAPACITY,
     ) -> None:
+        if isinstance(maximum_cached_event_ids, bool) or maximum_cached_event_ids < 1:
+            raise ValueError("Decision journal event ID capacity must be positive.")
         self._path = path.resolve()
         self._on_record = on_record
         self._on_reset = on_reset
-        self._event_ids: set[bytes] = set()
+        self._maximum_cached_event_ids = maximum_cached_event_ids
+        self._event_ids: dict[bytes, None] = {}
+        self._record_count = 0
         self._offset = 0
         self._line_number = 0
         self._observed_size = 0
@@ -137,7 +155,7 @@ class DecisionJournalIndex:
     @property
     def record_count(self) -> int:
         with self._lock:
-            return len(self._event_ids)
+            return self._record_count
 
     @property
     def recovery(self) -> DecisionJournalRecovery:
@@ -213,25 +231,33 @@ class DecisionJournalIndex:
                         )
                     except (UnicodeDecodeError, ValueError) as exc:
                         self._malformed_lines += 1
-                        self._corrupted_line_numbers.append(self._line_number)
-                        self._warnings.append(
-                            "Decision journal line "
-                            f"{self._line_number} ignored: {exc}"
-                        )
+                        if len(self._warnings) < _MAXIMUM_RECOVERY_WARNINGS:
+                            self._corrupted_line_numbers.append(self._line_number)
+                            self._warnings.append(
+                                "Decision journal line "
+                                f"{self._line_number} ignored: {exc}"
+                            )
                         continue
                     event_key = _event_key(record.event_id)
                     if event_key in self._event_ids:
                         continue
-                    self._event_ids.add(event_key)
+                    self._remember_event_key_locked(event_key)
+                    self._record_count += 1
                     self._records_processed += 1
                     accepted += 1
                     if self._on_record is not None:
                         self._on_record(record)
             return accepted
 
+    def _remember_event_key_locked(self, event_key: bytes) -> None:
+        self._event_ids[event_key] = None
+        if len(self._event_ids) > self._maximum_cached_event_ids:
+            del self._event_ids[next(iter(self._event_ids))]
+
     def _reset_locked(self) -> None:
         self._observed_size = 0
         self._event_ids.clear()
+        self._record_count = 0
         self._offset = 0
         self._line_number = 0
         self._identity = None
@@ -245,7 +271,7 @@ class DecisionJournalIndex:
 
 
 class ShadowDecisionJournal:
-    """Thread-safe append journal backed by a streaming exact-ID index."""
+    """Thread-safe append journal with bounded diagnostic write amplification."""
 
     def __init__(
         self,
@@ -253,11 +279,18 @@ class ShadowDecisionJournal:
         *,
         index: DecisionJournalIndex | None = None,
         retain_records: bool = True,
+        diagnostic_interval: timedelta = _DEFAULT_DIAGNOSTIC_INTERVAL,
     ) -> None:
+        if diagnostic_interval.total_seconds() <= 0:
+            raise ValueError("Decision journal diagnostic interval must be positive.")
         self._path = path.resolve()
         self._lock = Lock()
         self._retain_records = retain_records
         self._records: list[ShadowDecisionRecord] = []
+        self._diagnostic_interval = diagnostic_interval
+        self._diagnostic_state: dict[
+            tuple[str, ShadowDecisionEventType], tuple[str, datetime]
+        ] = {}
         if index is not None and index.path != self._path:
             raise ValueError("Decision journal index path does not match journal path.")
         if index is not None and retain_records:
@@ -291,11 +324,13 @@ class ShadowDecisionJournal:
         return self._index.metrics()
 
     def append(self, record: ShadowDecisionRecord) -> bool:
-        line = serialize_decision_record(record)
         with self._lock:
             self._index.refresh()
             if self._index.contains(record.event_id):
                 return False
+            if not self._should_persist_diagnostic(record):
+                return False
+            line = serialize_decision_record(record)
             self._path.parent.mkdir(parents=True, exist_ok=True)
             needs_separator = self._needs_separator()
             with self._path.open("a", encoding="utf-8", newline="\n") as stream:
@@ -306,6 +341,22 @@ class ShadowDecisionJournal:
                 stream.flush()
                 os.fsync(stream.fileno())
             return self._index.refresh() > 0
+
+    def _should_persist_diagnostic(self, record: ShadowDecisionRecord) -> bool:
+        if record.event_type not in _DIAGNOSTIC_EVENTS:
+            return True
+        key = (record.symbol, record.event_type)
+        fingerprint = _diagnostic_fingerprint(record)
+        previous = self._diagnostic_state.get(key)
+        if previous is not None:
+            previous_fingerprint, previous_at = previous
+            if (
+                fingerprint == previous_fingerprint
+                and record.timestamp - previous_at < self._diagnostic_interval
+            ):
+                return False
+        self._diagnostic_state[key] = (fingerprint, record.timestamp)
+        return True
 
     def records(self) -> tuple[ShadowDecisionRecord, ...]:
         with self._lock:
@@ -410,6 +461,27 @@ def _event_key(event_id: str) -> bytes:
         except ValueError:
             pass
     return hashlib.sha256(event_id.encode("utf-8")).digest()
+
+
+def _diagnostic_fingerprint(record: ShadowDecisionRecord) -> str:
+    normalized_text = tuple(
+        _normalize_diagnostic_text(value)
+        for value in (*record.reasons, *record.warnings)
+    )
+    score_bucket = None if record.score is None else int(record.score // 5)
+    payload = (
+        record.event_type.value,
+        record.symbol,
+        record.market_state,
+        record.setup_context,
+        score_bucket,
+        normalized_text,
+    )
+    return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
+
+
+def _normalize_diagnostic_text(value: str) -> str:
+    return re.sub(r"[-+]?\d+(?:[.,]\d+)?", "#", value.casefold()).strip()
 
 
 def _payload(

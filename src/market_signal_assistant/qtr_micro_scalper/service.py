@@ -49,10 +49,13 @@ class ShadowServiceStatus(StrEnum):
 @dataclass(frozen=True, slots=True)
 class ShadowServiceConfig:
     reconnect_delay_seconds: float = 5.0
+    health_check_seconds: float = 1.0
 
     def __post_init__(self) -> None:
         if self.reconnect_delay_seconds <= 0:
             raise ValueError("Shadow service reconnect delay must be positive.")
+        if self.health_check_seconds <= 0:
+            raise ValueError("Shadow service health check must be positive.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +89,8 @@ class ShadowPipeline(Protocol):
     async def stop(self) -> None: ...
 
     def metrics(self) -> LiveShadowPipelineMetrics: ...
+
+    def background_error(self) -> str | None: ...
 
 
 class JournalFlusher(Protocol):
@@ -163,14 +168,21 @@ class ShadowService:
         if self._started_at is not None:
             uptime = max(0.0, (now - self._started_at).total_seconds())
         pipeline_metrics = self._pipeline.metrics()
+        background_error = self._pipeline.background_error()
+        status = (
+            ShadowServiceStatus.DEGRADED
+            if background_error is not None
+            and self._status is ShadowServiceStatus.RUNNING
+            else self._status
+        )
         return ShadowServiceHealth(
-            ready=self._status is ShadowServiceStatus.RUNNING,
-            status=self._status,
+            ready=status is ShadowServiceStatus.RUNNING,
+            status=status,
             shadow_mode=self._settings.shadow_mode,
             started_at=self._started_at,
             checked_at=now,
             uptime_seconds=uptime,
-            last_error=self._last_error,
+            last_error=background_error or self._last_error,
             reconnect_attempts=self._reconnect_attempts,
             pipeline_errors=pipeline_metrics.errors,
         )
@@ -209,7 +221,16 @@ class ShadowService:
                     self._status = ShadowServiceStatus.RUNNING
                     self._last_error = None
                     first_attempt.set()
-                    await stop_requested.wait()
+                    while not stop_requested.is_set():
+                        try:
+                            await asyncio.wait_for(
+                                stop_requested.wait(),
+                                timeout=self._config.health_check_seconds,
+                            )
+                        except TimeoutError:
+                            background_error = self._pipeline.background_error()
+                            if background_error is not None:
+                                raise RuntimeError(background_error) from None
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:

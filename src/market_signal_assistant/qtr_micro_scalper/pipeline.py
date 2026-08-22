@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -89,7 +90,8 @@ class LiveShadowPipelineConfig:
     maximum_trade_age_ms: float = 750.0
     liquidation_retention_count: int = 500
     event_deduplication_capacity: int = 100_000
-
+    event_retention_capacity: int = 10_000
+    queue_capacity: int = 10_000
     retired_symbol_capacity: int = 1_000
 
     def __post_init__(self) -> None:
@@ -103,6 +105,8 @@ class LiveShadowPipelineConfig:
         for name, value in (
             ("liquidation retention", self.liquidation_retention_count),
             ("event deduplication capacity", self.event_deduplication_capacity),
+            ("event retention capacity", self.event_retention_capacity),
+            ("queue capacity", self.queue_capacity),
             ("retired symbol capacity", self.retired_symbol_capacity),
         ):
             if isinstance(value, bool) or value < 1:
@@ -155,6 +159,9 @@ class LiveShadowPipelineMetrics:
     active_topics: int = 0
     last_target_refresh_at: datetime | None = None
     retired_symbol_tombstones: int = 0
+    queue_depth: int = 0
+    retained_events: int = 0
+    background_error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,7 +235,9 @@ class LiveShadowPipeline:
         self._registered_provider_targets: set[str] = set()
         self._symbol_locks = {symbol: asyncio.Lock() for symbol in normalized}
         self._retired_symbols: dict[str, None] = {}
-        self._events: list[LiveShadowPipelineEvent] = []
+        self._events: deque[LiveShadowPipelineEvent] = deque(
+            maxlen=self._config.event_retention_capacity
+        )
         self._sequence = 0
         self._received = 0
         self._duplicates = 0
@@ -243,6 +252,7 @@ class LiveShadowPipeline:
         self._target_refresh_task: asyncio.Task[None] | None = None
         self._target_refresh_stop = asyncio.Event()
         self._universe_lock = asyncio.Lock()
+        self._background_error: str | None = None
 
     @classmethod
     def with_live_collectors(
@@ -409,15 +419,22 @@ class LiveShadowPipeline:
     async def start(self) -> None:
         if self._worker is not None and not self._worker.done():
             return
-        self._queue = asyncio.Queue()
+        self._background_error = None
+        self._queue = asyncio.Queue(maxsize=self._config.queue_capacity)
         if self._dynamic_targets is not None:
             self._target_refresh_stop.clear()
             await self.refresh_targets()
         self._worker = asyncio.create_task(self._consume())
+        self._worker.add_done_callback(
+            lambda task: self._capture_task_failure("pipeline worker", task)
+        )
         if self._market_collector is not None:
             await self._market_collector.start()
         if self._dynamic_targets is not None:
             self._target_refresh_task = asyncio.create_task(self._target_refresh_loop())
+            self._target_refresh_task.add_done_callback(
+                lambda task: self._capture_task_failure("target refresh", task)
+            )
 
     async def stop(self) -> None:
         self._target_refresh_stop.set()
@@ -429,8 +446,19 @@ class LiveShadowPipeline:
         if self._market_collector is not None:
             await self._market_collector.stop()
         queue = self._queue
-        if queue is not None:
-            await queue.join()
+        worker = self._worker
+        if queue is not None and worker is not None:
+            if worker.done():
+                self._discard_queued_events(queue)
+            else:
+                joined = asyncio.create_task(queue.join())
+                done, _ = await asyncio.wait(
+                    (joined, worker), return_when=asyncio.FIRST_COMPLETED
+                )
+                if worker in done and not joined.done():
+                    joined.cancel()
+                    await asyncio.gather(joined, return_exceptions=True)
+                    self._discard_queued_events(queue)
         worker = self._worker
         self._worker = None
         self._queue = None
@@ -449,7 +477,14 @@ class LiveShadowPipeline:
         if queue is None:
             self._errors += 1
             return
-        queue.put_nowait(_QueuedEvent(event, already_applied))
+        if self._background_error is not None:
+            raise RuntimeError(self._background_error)
+        try:
+            queue.put_nowait(_QueuedEvent(event, already_applied))
+        except asyncio.QueueFull as exc:
+            self._errors += 1
+            self._background_error = "Live shadow market-data queue is full."
+            raise RuntimeError(self._background_error) from exc
 
     async def process_event(
         self,
@@ -481,7 +516,23 @@ class LiveShadowPipeline:
         try:
             try:
                 return self._process_locked(event, already_applied=already_applied)
-            except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            except OSError as exc:
+                self._errors += 1
+                self._background_error = (
+                    "Critical shadow persistence failure: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                return PipelineProcessResult(
+                    symbol=symbol,
+                    accepted=False,
+                    snapshot=None,
+                    score=None,
+                    trade=None,
+                    events=(),
+                    reason="Critical shadow persistence failed closed.",
+                    error=str(exc),
+                )
+            except (KeyError, RuntimeError, TypeError, ValueError) as exc:
                 self._errors += 1
                 return PipelineProcessResult(
                     symbol=symbol,
@@ -533,6 +584,9 @@ class LiveShadowPipeline:
             last_target_refresh_at=(
                 targets.last_target_refresh_at if targets else None
             ),
+            queue_depth=self._queue.qsize() if self._queue is not None else 0,
+            retained_events=len(self._events),
+            background_error=self._background_error,
         )
 
     def events(self) -> tuple[LiveShadowPipelineEvent, ...]:
@@ -551,6 +605,35 @@ class LiveShadowPipeline:
                 )
             finally:
                 queue.task_done()
+
+    def background_error(self) -> str | None:
+        return self._background_error
+
+    def _capture_task_failure(
+        self,
+        name: str,
+        task: asyncio.Task[None],
+    ) -> None:
+        if task.cancelled():
+            return
+        exception = task.exception()
+        if exception is None:
+            if name == "target refresh" and self._target_refresh_stop.is_set():
+                return
+            message = f"Critical {name} stopped unexpectedly."
+        else:
+            message = f"Critical {name} failed: {type(exception).__name__}: {exception}"
+        self._errors += 1
+        self._background_error = message
+
+    @staticmethod
+    def _discard_queued_events(queue: asyncio.Queue[_QueuedEvent]) -> None:
+        while True:
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            queue.task_done()
 
     def _process_locked(
         self,

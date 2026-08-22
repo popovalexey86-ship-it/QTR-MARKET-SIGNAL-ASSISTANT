@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -166,7 +167,10 @@ class ShadowOrchestrator:
         journal: ShadowTradeJournal | None = None,
         decision_journal: ShadowDecisionJournal | None = None,
         journal_path: Path = DEFAULT_SHADOW_JOURNAL_PATH,
+        event_retention_capacity: int = 10_000,
     ) -> None:
+        if isinstance(event_retention_capacity, bool) or event_retention_capacity < 1:
+            raise ValueError("Shadow orchestrator event retention must be positive.")
         self._bridge = bridge or InPlayTargetBridge()
         self._snapshots = snapshot_builder or MicrostructureSnapshotBuilder()
         self._scoring = scoring_engine or ScalperScoringEngine()
@@ -179,7 +183,9 @@ class ShadowOrchestrator:
         self._decision_journal = decision_journal
         self._scores_by_trade: dict[str, ScalperScore] = {}
         self._context_by_trade: dict[str, tuple[str, str]] = {}
-        self._events: list[ShadowOrchestratorEvent] = []
+        self._event_retention_capacity = event_retention_capacity
+        self._events: deque[ShadowOrchestratorEvent] = deque()
+        self._event_fingerprint_order: deque[str] = deque()
         self._event_fingerprints: set[str] = set()
         self._sequence = 0
         self._targets_discovered = 0
@@ -190,6 +196,7 @@ class ShadowOrchestrator:
         self._trades_closed = 0
         self._duplicates_suppressed = 0
         self._errors = 0
+        self._events_emitted = 0
         self._lock = Lock()
 
     def discover_target(
@@ -341,7 +348,7 @@ class ShadowOrchestrator:
                 trades_closed=self._trades_closed,
                 active_shadow_trades=len(self._runtime.active_trades()),
                 journal_records=len(self._journal.records()),
-                events_emitted=len(self._events),
+                events_emitted=self._events_emitted,
                 duplicates_suppressed=self._duplicates_suppressed,
                 errors=self._errors,
             )
@@ -488,7 +495,7 @@ class ShadowOrchestrator:
                 events=tuple(events),
                 error=None,
             )
-        except (KeyError, OSError, RuntimeError, ValueError) as exc:
+        except (KeyError, RuntimeError, ValueError) as exc:
             self._errors += 1
             return ShadowAnalysisResult(
                 symbol=analysis.symbol,
@@ -572,7 +579,7 @@ class ShadowOrchestrator:
                 events=(event,) if event is not None else (),
                 error=None,
             )
-        except (KeyError, OSError, RuntimeError, ValueError) as exc:
+        except (KeyError, RuntimeError, ValueError) as exc:
             self._errors += 1
             return ShadowBarResult(
                 symbol=bar.symbol,
@@ -657,6 +664,12 @@ class ShadowOrchestrator:
         )
         self._event_fingerprints.add(fingerprint)
         self._events.append(event)
+        self._event_fingerprint_order.append(fingerprint)
+        self._events_emitted += 1
+        if len(self._events) > self._event_retention_capacity:
+            self._events.popleft()
+            expired = self._event_fingerprint_order.popleft()
+            self._event_fingerprints.discard(expired)
         return event
 
 

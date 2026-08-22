@@ -198,6 +198,99 @@ def test_ready_market_data_reaches_shadow_journal(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_pipeline_retains_only_bounded_recent_runtime_events(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        coordinator = ShadowOrchestrator(
+            journal=ShadowTradeJournal(tmp_path / "bounded-events.jsonl")
+        )
+        service = LiveShadowPipeline(
+            symbols=("BTCUSDT",),
+            price_context_provider=price_context,
+            orchestrator=coordinator,
+            config=LiveShadowPipelineConfig(event_retention_capacity=5),
+            clock=lambda: NOW + timedelta(seconds=5),
+        )
+        assert service.register_target(target(), observed_at=NOW)
+
+        for value in range(20):
+            await service.process_event(
+                trade(
+                    trade_id=f"bounded-{value}",
+                    at=NOW + timedelta(milliseconds=value),
+                )
+            )
+
+        assert len(service.events()) == 5
+        assert service.metrics().retained_events == 5
+        assert service.metrics().market_events_received == 20
+
+    asyncio.run(scenario())
+
+
+def test_pipeline_worker_exception_is_exposed_and_stop_does_not_hang(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        service = pipeline(tmp_path)
+
+        async def fail_processing(
+            event: PublicTradeEvent,
+            *,
+            already_applied: bool = False,
+        ) -> PipelineProcessResult:
+            del event, already_applied
+            raise MemoryError("synthetic critical worker failure")
+
+        monkeypatch.setattr(service, "process_event", fail_processing)
+        await service.start()
+        service.enqueue_event(trade())
+        for _ in range(100):
+            if service.background_error() is not None:
+                break
+            await asyncio.sleep(0)
+
+        assert "synthetic critical worker failure" in (
+            service.background_error() or ""
+        )
+        await asyncio.wait_for(service.stop(), timeout=1.0)
+
+    asyncio.run(scenario())
+
+
+def test_persistence_oserror_is_exposed_as_critical_background_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        coordinator = ShadowOrchestrator(
+            journal=ShadowTradeJournal(tmp_path / "persistence-error.jsonl")
+        )
+
+        def fail_persistence(analysis: object) -> object:
+            del analysis
+            raise OSError("synthetic disk full")
+
+        monkeypatch.setattr(coordinator, "analyze", fail_persistence)
+        service = LiveShadowPipeline(
+            symbols=("BTCUSDT",),
+            price_context_provider=price_context,
+            orchestrator=coordinator,
+            clock=lambda: NOW + timedelta(seconds=5),
+        )
+        assert service.register_target(target(), observed_at=NOW)
+
+        result = await ready_result(service)
+
+        assert not result.accepted
+        assert "synthetic disk full" in (result.error or "")
+        assert "Critical shadow persistence failure" in (
+            service.background_error() or ""
+        )
+
+    asyncio.run(scenario())
+
+
 def test_live_trade_bar_opens_trade_and_persists_journal(tmp_path: Path) -> None:
     async def scenario() -> None:
         service = pipeline(tmp_path)

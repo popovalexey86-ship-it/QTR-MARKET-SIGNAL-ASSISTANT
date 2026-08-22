@@ -47,11 +47,12 @@ def record(
     event_type: ShadowDecisionEventType = ShadowDecisionEventType.SCORE_CREATED,
     *,
     seconds: int = 0,
+    microseconds: int = 0,
     score: float | None = 75.0,
     score_components: ScalperComponentScores | None = None,
 ) -> ShadowDecisionRecord:
     return ShadowDecisionRecord(
-        timestamp=NOW + timedelta(seconds=seconds),
+        timestamp=NOW + timedelta(seconds=seconds, microseconds=microseconds),
         symbol="btcusdt",
         event_type=event_type,
         score=score,
@@ -368,14 +369,58 @@ def test_lean_runtime_journal_does_not_retain_full_records(tmp_path: Path) -> No
         encoding="utf-8",
     )
 
-    journal = ShadowDecisionJournal(path, retain_records=False)
+    index = DecisionJournalIndex(path, maximum_cached_event_ids=64)
+    journal = ShadowDecisionJournal(path, index=index, retain_records=False)
 
     assert journal.record_count == len(values)
     assert journal.records() == ()
-    assert journal.index_metrics.cached_event_ids == len(values)
+    assert journal.index_metrics.cached_event_ids == 64
     assert not journal.append(values[-1])
     assert journal.append(record(seconds=501))
     assert journal.records() == ()
+
+
+def test_million_historical_ids_keep_only_bounded_recent_keys(
+    tmp_path: Path,
+) -> None:
+    index = DecisionJournalIndex(
+        tmp_path / "decisions.jsonl",
+        maximum_cached_event_ids=512,
+    )
+
+    for value in range(1_000_000):
+        index._remember_event_key_locked(value.to_bytes(32, "big"))
+
+    assert index.metrics().cached_event_ids == 512
+
+
+def test_repeated_watch_diagnostics_are_rate_limited(tmp_path: Path) -> None:
+    path = tmp_path / "decisions.jsonl"
+    journal = ShadowDecisionJournal(path, retain_records=False)
+
+    for value in range(100_000):
+        assert journal.append(
+            record(
+                ShadowDecisionEventType.DECISION_BLOCKED,
+                microseconds=value,
+                score=75.0 + (value % 1_000) / 100_000,
+            )
+        ) is (value == 0)
+
+    assert sum(1 for _ in path.open("r", encoding="utf-8")) == 1
+    assert journal.record_count == 1
+
+
+def test_critical_lifecycle_events_are_never_rate_limited(tmp_path: Path) -> None:
+    journal = ShadowDecisionJournal(tmp_path / "decisions.jsonl")
+
+    assert journal.append(
+        record(ShadowDecisionEventType.SHADOW_ENTRY_CREATED, microseconds=1)
+    )
+    assert journal.append(
+        record(ShadowDecisionEventType.SHADOW_ENTRY_CREATED, microseconds=2)
+    )
+    assert journal.record_count == 2
 
 
 def test_explicit_recovery_streams_without_path_read_bytes(

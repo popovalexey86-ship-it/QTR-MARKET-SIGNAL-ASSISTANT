@@ -269,31 +269,34 @@ class JsonlInPlayTimingAuditStore:
         if not self._path.exists():
             return
         cutoff = now - self._retention
-        retained: list[str] = []
         removed = False
-        for line in self._path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                raw = json.loads(line)
-                scanned_at = _datetime(raw["scanned_at"])
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                _LOGGER.warning(
-                    "Повреждённая строка IN PLAY timing audit сохранена "
-                    "при retention-проверке."
-                )
-                retained.append(line)
-                continue
-            if scanned_at < cutoff:
-                removed = True
-            else:
-                retained.append(line)
-        if not removed:
-            return
         temporary = self._path.with_suffix(f"{self._path.suffix}.tmp")
-        content = "".join(f"{line}\n" for line in retained)
-        temporary.write_text(content, encoding="utf-8")
-        temporary.replace(self._path)
+        with (
+            self._path.open("r", encoding="utf-8") as source,
+            temporary.open("w", encoding="utf-8", newline="\n") as destination,
+        ):
+            for raw_line in source:
+                line = raw_line.rstrip("\r\n")
+                if not line.strip():
+                    continue
+                try:
+                    raw = json.loads(line)
+                    scanned_at = _datetime(raw["scanned_at"])
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    _LOGGER.warning(
+                        "Повреждённая строка IN PLAY timing audit сохранена "
+                        "при retention-проверке."
+                    )
+                    destination.write(f"{line}\n")
+                    continue
+                if scanned_at < cutoff:
+                    removed = True
+                else:
+                    destination.write(f"{line}\n")
+        if removed:
+            temporary.replace(self._path)
+        else:
+            temporary.unlink(missing_ok=True)
 
 
 class InPlayTimingAuditor:

@@ -50,6 +50,7 @@ class FakePipeline:
         self.starts = 0
         self.stops = 0
         self._metrics = pipeline_metrics(errors=errors)
+        self.background_failure: str | None = None
 
     async def start(self) -> None:
         self.starts += 1
@@ -63,6 +64,9 @@ class FakePipeline:
 
     def metrics(self) -> LiveShadowPipelineMetrics:
         return self._metrics
+
+    def background_error(self) -> str | None:
+        return self.background_failure
 
 
 class FakeJournal:
@@ -90,6 +94,42 @@ def service(
         config=ShadowServiceConfig(reconnect_delay_seconds=reconnect_delay),
         clock=lambda: NOW,
     )
+
+
+def test_background_pipeline_failure_makes_health_unready_and_restarts() -> None:
+    async def scenario() -> None:
+        pipeline = FakePipeline()
+        runtime = ShadowService(
+            pipeline,
+            FakeJournal(),
+            QtrScalperV2LiveSettings(enabled=True, shadow_mode=True),
+            config=ShadowServiceConfig(
+                reconnect_delay_seconds=0.001,
+                health_check_seconds=0.001,
+            ),
+            clock=lambda: NOW,
+        )
+        await runtime.start()
+        pipeline.background_failure = "Critical pipeline worker failed."
+        assert not runtime.health().ready
+        assert runtime.health().status is ShadowServiceStatus.DEGRADED
+
+        for _ in range(100):
+            if runtime.metrics_snapshot().pipeline_failures:
+                break
+            await asyncio.sleep(0.002)
+        assert runtime.metrics_snapshot().pipeline_failures >= 1
+        assert pipeline.stops >= 1
+
+        pipeline.background_failure = None
+        for _ in range(100):
+            if runtime.health().ready:
+                break
+            await asyncio.sleep(0.002)
+        assert runtime.health().ready
+        await runtime.stop()
+
+    asyncio.run(scenario())
 
 
 def test_start_health_and_graceful_stop_flush_journal() -> None:

@@ -14,6 +14,12 @@ from market_signal_assistant.inplay.audit import (
     JsonInPlayDetectionStore,
     JsonlInPlayTimingAuditStore,
 )
+from market_signal_assistant.inplay.early_discovery import (
+    JsonlEarlyDiscoveryAuditStore,
+)
+from market_signal_assistant.inplay.early_discovery_v2 import (
+    JsonlEarlyDiscoveryV2AuditStore,
+)
 from market_signal_assistant.inplay.models import (
     CatalogInstrument,
     InPlayDirection,
@@ -547,6 +553,39 @@ def test_retention_removes_only_rows_older_than_seven_days(tmp_path: Path) -> No
         for line in path.read_text(encoding="utf-8").splitlines()
     )
     assert tuple(row["symbol"] for row in rows) == ("RECENT", "BTCUSDT")
+
+
+def test_large_telegram_audit_retention_streams_without_full_text_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recent = json.dumps(
+        {"scanned_at": (NOW - timedelta(days=1)).isoformat(), "symbol": "RECENT"}
+    )
+    old = json.dumps(
+        {"scanned_at": (NOW - timedelta(days=8)).isoformat(), "symbol": "OLD"}
+    )
+    stores = (
+        JsonlEarlyDiscoveryAuditStore(tmp_path / "v1.jsonl"),
+        JsonlEarlyDiscoveryV2AuditStore(tmp_path / "v2.jsonl"),
+        JsonlInPlayTimingAuditStore(tmp_path / "timing.jsonl"),
+    )
+    for store in stores:
+        store.path.write_text(
+            "".join(f"{old if value == 0 else recent}\n" for value in range(20_000)),
+            encoding="utf-8",
+        )
+
+    def forbidden_read_text(self: Path, *args: object, **kwargs: object) -> str:
+        del self, args, kwargs
+        raise AssertionError("full-file read_text retention is forbidden")
+
+    monkeypatch.setattr(Path, "read_text", forbidden_read_text)
+    for store in stores:
+        store._prune_if_due(NOW)
+        store._prune_if_due(NOW)
+        with store.path.open("r", encoding="utf-8") as stream:
+            assert sum(1 for _ in stream) == 19_999
 
 
 def test_restart_after_partial_jsonl_line_starts_a_new_record(tmp_path: Path) -> None:
