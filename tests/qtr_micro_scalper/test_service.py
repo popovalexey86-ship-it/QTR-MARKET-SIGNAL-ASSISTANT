@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -145,6 +145,26 @@ def test_start_health_and_graceful_stop_flush_journal() -> None:
         assert pipeline.starts == 1
         assert pipeline.stops == 1
         assert journal.flushes == 1
+
+    asyncio.run(scenario())
+
+
+def test_holding_capacity_warning_is_visible_without_blocking_baseline() -> None:
+    async def scenario() -> None:
+        pipeline = FakePipeline()
+        pipeline._metrics = replace(
+            pipeline_metrics(),
+            holding_experiment_capacity_rejections=1,
+            holding_experiment_warning="Holding experiment capacity reached.",
+        )
+        runtime = service(pipeline, FakeJournal())
+
+        await runtime.start()
+
+        assert runtime.health().ready
+        assert runtime.health().status is ShadowServiceStatus.RUNNING
+        assert runtime.health().last_error == "Holding experiment capacity reached."
+        await runtime.stop()
 
     asyncio.run(scenario())
 
@@ -297,6 +317,31 @@ def test_environment_composition_is_lazy_without_websocket(
     )
     runtime = build_shadow_service_from_environment()
     assert runtime.health().status is ShadowServiceStatus.STOPPED
+
+
+def test_holding_experiment_composition_is_opt_in_and_lazy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    experiment_path = tmp_path / "holding-experiment.jsonl"
+    monkeypatch.setenv("QTR_SCALPER_V2_ENABLED", "false")
+    monkeypatch.setenv("QTR_SCALPER_V2_SHADOW_MODE", "true")
+    monkeypatch.setenv("QTR_SCALPER_V2_HOLDING_EXPERIMENT_ENABLED", "true")
+    monkeypatch.setenv(
+        "QTR_SCALPER_V2_HOLDING_EXPERIMENT_JOURNAL_PATH",
+        str(experiment_path),
+    )
+    monkeypatch.setenv("QTR_SCALPER_V2_JOURNAL_PATH", str(tmp_path / "shadow.jsonl"))
+    monkeypatch.setenv(
+        "QTR_SCALPER_V2_DECISION_JOURNAL_PATH",
+        str(tmp_path / "decisions.jsonl"),
+    )
+
+    runtime = build_shadow_service_from_environment()
+
+    assert runtime.health().status is ShadowServiceStatus.STOPPED
+    assert runtime.metrics_snapshot().pipeline.holding_experiment_active_groups == 0
+    assert not experiment_path.exists()
 
 
 def test_setup_audit_path_uses_explicit_external_configuration(

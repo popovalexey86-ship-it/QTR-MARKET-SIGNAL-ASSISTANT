@@ -24,6 +24,9 @@ ExecStart=/opt/qtr/scalper-shadow/.venv/bin/python -m market_signal_assistant.qt
 Environment=QTR_SCALPER_V2_DYNAMIC_TARGETS_ENABLED=false
 Environment=QTR_SCALPER_V2_MAX_ACTIVE_SYMBOLS=5
 Environment=QTR_SCALPER_V2_TARGET_REFRESH_SECONDS=30
+Environment=QTR_SCALPER_V2_HOLDING_EXPERIMENT_ENABLED=false
+Environment=QTR_SCALPER_V2_HOLDING_EXPERIMENT_MAX_ACTIVE_GROUPS=1000
+Environment=QTR_SCALPER_V2_HOLDING_EXPERIMENT_JOURNAL_PATH=/opt/qtr/scalper-shadow/data/qtr_micro_scalper_holding_experiment.jsonl
 
 Restart=on-failure
 RestartSec=10s

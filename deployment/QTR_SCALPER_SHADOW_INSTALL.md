@@ -12,6 +12,7 @@ QTR_SCALPER_V2_ENABLED=false
 QTR_SCALPER_V2_SHADOW_MODE=true
 QTR_SCALPER_V2_LIVE_ENABLED=false
 QTR_SCALPER_V2_SETUP_AUDIT_PATH=/opt/qtr/scanner/data/qtr_setup_telegram_pilot_audit.jsonl
+QTR_SCALPER_V2_HOLDING_EXPERIMENT_ENABLED=false
 ```
 
 Поэтому установка, `daemon-reload` и даже случайный ручной запуск не открывают
@@ -109,3 +110,26 @@ Rollback requires no code change. Set
 `QTR_SCALPER_V2_DYNAMIC_TARGETS_ENABLED=false` and use the existing
 `QTR_SCALPER_V2_SYMBOLS` fixed-symbol setting. Dynamic mode never places real
 or Demo orders and does not change scoring, risk, or lifecycle thresholds.
+
+## Parallel Holding Horizon Experiment (Shadow only)
+
+The controlled A30/B60/C120/D300 experiment is independently opt-in:
+
+```text
+QTR_SCALPER_V2_HOLDING_EXPERIMENT_ENABLED=false
+QTR_SCALPER_V2_HOLDING_EXPERIMENT_MAX_ACTIVE_GROUPS=1000
+QTR_SCALPER_V2_HOLDING_EXPERIMENT_JOURNAL_PATH=/opt/qtr/scalper-shadow/data/qtr_micro_scalper_holding_experiment.jsonl
+```
+
+When enabled, one accepted baseline shadow entry is mirrored into four virtual
+variants. Entry, stop, TP1, TP2, score, setup metadata and observed public-trade
+stream are identical; only `maximum_holding_bars` differs. A30 remains a mirror:
+the authoritative production baseline is still
+`qtr_micro_scalper_shadow_journal.jsonl`.
+
+The experiment writes only lifecycle transitions to its separate append-only
+JSONL. It never creates another score, setup decision, signal or order. Active
+experimental variants protect their symbol subscription after baseline A30 has
+finished, without changing Dynamic Target ranking. On shutdown or restart,
+unfinished variants are recorded as `INTERRUPTED/INCOMPLETE` and are excluded
+from performance analytics.

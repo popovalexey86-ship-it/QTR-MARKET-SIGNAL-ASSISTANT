@@ -30,6 +30,9 @@ from market_signal_assistant.qtr_micro_scalper.dynamic_targets import (
     DynamicUniverseSnapshot,
     DynamicVerifiedTargetManager,
 )
+from market_signal_assistant.qtr_micro_scalper.holding_experiment import (
+    HoldingExperimentRuntime,
+)
 from market_signal_assistant.qtr_micro_scalper.inplay_bridge import ScalperTarget
 from market_signal_assistant.qtr_micro_scalper.lifecycle_bridge import (
     LiveShadowLifecycleBridge,
@@ -162,6 +165,12 @@ class LiveShadowPipelineMetrics:
     queue_depth: int = 0
     retained_events: int = 0
     background_error: str | None = None
+    holding_experiment_active_groups: int = 0
+    holding_experiment_active_variants: int = 0
+    holding_experiment_protected_symbols: int = 0
+    holding_experiment_capacity_rejections: int = 0
+    holding_experiment_errors: int = 0
+    holding_experiment_warning: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +201,7 @@ class LiveShadowPipeline:
         market_collector: ManagedMarketStream | None = None,
         dynamic_target_manager: DynamicVerifiedTargetManager | None = None,
         subscription_controller: UnifiedMarketDataCollector | None = None,
+        holding_experiment: HoldingExperimentRuntime | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         normalized = tuple(
@@ -228,6 +238,7 @@ class LiveShadowPipeline:
         self._market_collector = market_collector
         self._dynamic_targets = dynamic_target_manager
         self._subscription_controller = subscription_controller
+        self._holding_experiment = holding_experiment
         self._previous_frames: dict[str, LiquidityBookFrame] = {}
         self._current_frames: dict[str, LiquidityBookFrame] = {}
         self._liquidations: dict[str, list[LiquidationEvent]] = {}
@@ -253,6 +264,8 @@ class LiveShadowPipeline:
         self._target_refresh_stop = asyncio.Event()
         self._universe_lock = asyncio.Lock()
         self._background_error: str | None = None
+        self._holding_experiment_errors = 0
+        self._holding_experiment_warning: str | None = None
 
     @classmethod
     def with_live_collectors(
@@ -266,6 +279,7 @@ class LiveShadowPipeline:
         config: LiveShadowPipelineConfig | None = None,
         clock: Callable[[], datetime] | None = None,
         dynamic_target_manager: DynamicVerifiedTargetManager | None = None,
+        holding_experiment: HoldingExperimentRuntime | None = None,
     ) -> LiveShadowPipeline:
         """Compose lazy Bybit public streams without opening a connection."""
 
@@ -316,6 +330,7 @@ class LiveShadowPipeline:
             clock=selected_clock,
             dynamic_target_manager=dynamic_target_manager,
             subscription_controller=unified,
+            holding_experiment=holding_experiment,
         )
         holder.append(pipeline)
         return pipeline
@@ -336,9 +351,12 @@ class LiveShadowPipeline:
         manager = self._dynamic_targets
         if manager is None:
             return None
+        protected = set(self._lifecycle.tracked_symbols())
+        if self._holding_experiment is not None:
+            protected.update(self._holding_experiment.protected_symbols())
         snapshot = manager.refresh(
             at=self._clock(),
-            protected_symbols=self._lifecycle.tracked_symbols(),
+            protected_symbols=protected,
         )
         await self.update_symbols(snapshot.active_symbols)
         return snapshot
@@ -424,6 +442,11 @@ class LiveShadowPipeline:
         if self._dynamic_targets is not None:
             self._target_refresh_stop.clear()
             await self.refresh_targets()
+        if self._holding_experiment is not None:
+            try:
+                self._holding_experiment.start(at=self._clock())
+            except (OSError, RuntimeError, ValueError) as exc:
+                self._record_holding_experiment_error(exc)
         self._worker = asyncio.create_task(self._consume())
         self._worker.add_done_callback(
             lambda task: self._capture_task_failure("pipeline worker", task)
@@ -466,6 +489,11 @@ class LiveShadowPipeline:
             worker.cancel()
             await asyncio.gather(worker, return_exceptions=True)
         self._lifecycle.stop()
+        if self._holding_experiment is not None:
+            try:
+                self._holding_experiment.stop(at=self._clock())
+            except (OSError, RuntimeError, ValueError) as exc:
+                self._record_holding_experiment_error(exc)
 
     def enqueue_event(
         self,
@@ -558,6 +586,11 @@ class LiveShadowPipeline:
             if self._dynamic_targets is not None
             else None
         )
+        experiment = (
+            self._holding_experiment.metrics()
+            if self._holding_experiment is not None
+            else None
+        )
         return LiveShadowPipelineMetrics(
             market_events_received=self._received,
             duplicate_events_suppressed=self._duplicates,
@@ -587,6 +620,23 @@ class LiveShadowPipeline:
             queue_depth=self._queue.qsize() if self._queue is not None else 0,
             retained_events=len(self._events),
             background_error=self._background_error,
+            holding_experiment_active_groups=(
+                experiment.active_groups if experiment else 0
+            ),
+            holding_experiment_active_variants=(
+                experiment.active_variants if experiment else 0
+            ),
+            holding_experiment_protected_symbols=(
+                experiment.protected_symbols if experiment else 0
+            ),
+            holding_experiment_capacity_rejections=(
+                experiment.capacity_rejections if experiment else 0
+            ),
+            holding_experiment_errors=self._holding_experiment_errors,
+            holding_experiment_warning=(
+                self._holding_experiment_warning
+                or (experiment.last_warning if experiment else None)
+            ),
         )
 
     def events(self) -> tuple[LiveShadowPipelineEvent, ...]:
@@ -674,6 +724,11 @@ class LiveShadowPipeline:
         self._received += 1
         journal_before = self._orchestrator.metrics().journal_records
         lifecycle_results = self._lifecycle.process_event(event)
+        if self._holding_experiment is not None:
+            try:
+                self._holding_experiment.process_event(event)
+            except (OSError, RuntimeError, ValueError) as exc:
+                self._record_holding_experiment_error(exc)
         lifecycle_error = next(
             (item.error for item in lifecycle_results if item.error is not None),
             None,
@@ -753,6 +808,21 @@ class LiveShadowPipeline:
         after_journal = self._orchestrator.metrics().journal_records
         if decision.trade is not None:
             self._lifecycle.activate(decision.trade)
+            if self._holding_experiment is not None:
+                try:
+                    activation = self._holding_experiment.activate(
+                        decision.trade,
+                        score=(decision.score or score).total_score,
+                        market_state=analysis.market_state.state.value,
+                        setup_context=analysis.setup_context.decision.value,
+                    )
+                    if (
+                        not activation.accepted
+                        and "capacity" in activation.reason.casefold()
+                    ):
+                        self._holding_experiment_warning = activation.reason
+                except (OSError, RuntimeError, ValueError) as exc:
+                    self._record_holding_experiment_error(exc)
         self._append_journal_update(
             emitted,
             journal_before=journal_before,
@@ -942,6 +1012,13 @@ class LiveShadowPipeline:
         )
         self._events.append(event)
         return event
+
+    def _record_holding_experiment_error(self, exc: Exception) -> None:
+        self._holding_experiment_errors += 1
+        self._holding_experiment_warning = (
+            "Holding experiment isolated failure: "
+            f"{type(exc).__name__}: {exc}"
+        )
 
 
 def _event_fingerprint(event: MarketDataEvent) -> str:

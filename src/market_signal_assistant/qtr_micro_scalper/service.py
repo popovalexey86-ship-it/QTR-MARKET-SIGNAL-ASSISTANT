@@ -19,6 +19,12 @@ from market_signal_assistant.qtr_micro_scalper.dynamic_targets import (
     DynamicTargetSettings,
     DynamicVerifiedTargetManager,
 )
+from market_signal_assistant.qtr_micro_scalper.holding_experiment import (
+    DEFAULT_HOLDING_EXPERIMENT_JOURNAL_PATH,
+    HoldingExperimentConfig,
+    HoldingExperimentJournal,
+    HoldingExperimentRuntime,
+)
 from market_signal_assistant.qtr_micro_scalper.orchestrator import ShadowOrchestrator
 from market_signal_assistant.qtr_micro_scalper.pipeline import (
     LiveShadowPipeline,
@@ -182,7 +188,11 @@ class ShadowService:
             started_at=self._started_at,
             checked_at=now,
             uptime_seconds=uptime,
-            last_error=background_error or self._last_error,
+            last_error=(
+                background_error
+                or self._last_error
+                or pipeline_metrics.holding_experiment_warning
+            ),
             reconnect_attempts=self._reconnect_attempts,
             pipeline_errors=pipeline_metrics.errors,
         )
@@ -284,6 +294,7 @@ def build_shadow_service_from_environment(
 
     settings = QtrScalperV2LiveSettings.from_environment()
     dynamic_settings = DynamicTargetSettings.from_environment()
+    experiment_settings = HoldingExperimentConfig.from_environment()
     symbols = () if dynamic_settings.enabled else _environment_symbols()
     journal_path = Path(
         os.getenv("QTR_SCALPER_V2_JOURNAL_PATH", str(DEFAULT_SHADOW_JOURNAL_PATH))
@@ -310,12 +321,25 @@ def build_shadow_service_from_environment(
         if dynamic_settings.enabled
         else None
     )
+    holding_experiment = None
+    if experiment_settings.enabled:
+        experiment_path = Path(
+            os.getenv(
+                "QTR_SCALPER_V2_HOLDING_EXPERIMENT_JOURNAL_PATH",
+                str(DEFAULT_HOLDING_EXPERIMENT_JOURNAL_PATH),
+            )
+        )
+        holding_experiment = HoldingExperimentRuntime(
+            HoldingExperimentJournal(experiment_path),
+            experiment_settings,
+        )
     pipeline = LiveShadowPipeline.with_live_collectors(
         symbols=symbols,
         price_context_provider=price_context,
         target_provider=price_context.target,
         orchestrator=orchestrator,
         dynamic_target_manager=dynamic_manager,
+        holding_experiment=holding_experiment,
     )
     return ShadowService(pipeline, resolved_journal, settings)
 

@@ -21,6 +21,14 @@ from market_signal_assistant.qtr_micro_scalper.dynamic_targets import (
     DynamicTargetSettings,
     DynamicVerifiedTargetManager,
 )
+from market_signal_assistant.qtr_micro_scalper.holding_experiment import (
+    HoldingExperimentConfig,
+    HoldingExperimentJournal,
+    HoldingExperimentRecordType,
+    HoldingExperimentRuntime,
+    HoldingVariant,
+    iter_holding_experiment_records,
+)
 from market_signal_assistant.qtr_micro_scalper.inplay_bridge import ScalperTarget
 from market_signal_assistant.qtr_micro_scalper.live.collector import (
     AsyncWebSocket,
@@ -194,6 +202,98 @@ def test_ready_market_data_reaches_shadow_journal(tmp_path: Path) -> None:
         ]
         assert service.metrics().journal_updates == 1
         assert (tmp_path / "pipeline-shadow.jsonl").exists()
+
+    asyncio.run(scenario())
+
+
+def test_ready_baseline_entry_creates_parallel_holding_group(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        experiment_journal = HoldingExperimentJournal(
+            tmp_path / "pipeline-holding.jsonl"
+        )
+        experiment = HoldingExperimentRuntime(
+            experiment_journal,
+            HoldingExperimentConfig(enabled=True),
+        )
+        baseline_journal = ShadowTradeJournal(tmp_path / "pipeline-baseline.jsonl")
+        service = LiveShadowPipeline(
+            symbols=("BTCUSDT",),
+            price_context_provider=price_context,
+            orchestrator=ShadowOrchestrator(journal=baseline_journal),
+            holding_experiment=experiment,
+            clock=lambda: NOW + timedelta(seconds=5),
+        )
+        assert service.register_target(target(), observed_at=NOW)
+
+        result = await ready_result(service)
+
+        assert result.trade is not None
+        assert experiment.metrics().active_groups == 1
+        assert experiment.metrics().active_variants == 4
+        created = [
+            record
+            for record in iter_holding_experiment_records(
+                experiment_journal.path
+            )
+            if record.record_type is HoldingExperimentRecordType.CREATED
+        ]
+        assert [record.variant for record in created] == list(HoldingVariant)
+        assert len(baseline_journal.records()) == 1
+        assert baseline_journal.records()[0].trade_id == result.trade.trade_id
+
+    asyncio.run(scenario())
+
+
+def test_holding_experiment_does_not_change_baseline_trade_result(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        control_journal = ShadowTradeJournal(tmp_path / "control.jsonl")
+        control = LiveShadowPipeline(
+            symbols=("BTCUSDT",),
+            price_context_provider=price_context,
+            orchestrator=ShadowOrchestrator(journal=control_journal),
+            clock=lambda: NOW + timedelta(seconds=5),
+        )
+        assert control.register_target(target(), observed_at=NOW)
+        experiment_journal = HoldingExperimentJournal(tmp_path / "experiment.jsonl")
+        experiment = HoldingExperimentRuntime(
+            experiment_journal,
+            HoldingExperimentConfig(enabled=True),
+        )
+        observed_journal = ShadowTradeJournal(tmp_path / "observed.jsonl")
+        observed = LiveShadowPipeline(
+            symbols=("BTCUSDT",),
+            price_context_provider=price_context,
+            orchestrator=ShadowOrchestrator(journal=observed_journal),
+            holding_experiment=experiment,
+            clock=lambda: NOW + timedelta(seconds=5),
+        )
+        assert observed.register_target(target(), observed_at=NOW)
+
+        control_created = await ready_result(control)
+        observed_created = await ready_result(observed)
+        assert control_created.trade == observed_created.trade
+        assert control_created.trade is not None
+        for service in (control, observed):
+            await service.process_event(
+                trade(
+                    trade_id="same-entry",
+                    at=NOW + timedelta(milliseconds=300),
+                    price=control_created.trade.entry_price,
+                )
+            )
+            await service.process_event(
+                book(
+                    OrderBookEventType.SNAPSHOT,
+                    3,
+                    at=NOW + timedelta(seconds=1, milliseconds=300),
+                )
+            )
+
+        assert control_journal.records() == observed_journal.records()
 
     asyncio.run(scenario())
 
@@ -719,6 +819,7 @@ def dynamic_pipeline(
     maximum: int = 5,
     trade_flow: TradeFlowAccumulator | None = None,
     config: LiveShadowPipelineConfig | None = None,
+    holding_experiment: HoldingExperimentRuntime | None = None,
 ) -> LiveShadowPipeline:
     manager = DynamicVerifiedTargetManager(
         provider,
@@ -735,6 +836,7 @@ def dynamic_pipeline(
         clock=lambda: NOW,
         trade_flow=trade_flow,
         config=config,
+        holding_experiment=holding_experiment,
     )
 
 
@@ -871,6 +973,63 @@ def test_terminal_trade_allows_dynamic_unsubscribe(tmp_path: Path) -> None:
         assert refreshed is not None
         assert refreshed.protected_trade_symbols == ()
         assert refreshed.removed == ("BTCUSDT",)
+        assert service.active_symbols() == ()
+
+    asyncio.run(scenario())
+
+
+def test_experiment_protects_subscription_after_baseline_a30_terminal(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        provider = MutableVerifiedProvider((verified_record("BTCUSDT"),))
+        controller = FakeSubscriptionController()
+        experiment = HoldingExperimentRuntime(
+            HoldingExperimentJournal(tmp_path / "dynamic-holding.jsonl"),
+            HoldingExperimentConfig(enabled=True),
+        )
+        service = dynamic_pipeline(
+            tmp_path,
+            provider,
+            controller,
+            holding_experiment=experiment,
+        )
+        await service.refresh_targets()
+        assert service.register_target(target(), observed_at=NOW)
+        created = await ready_result(service)
+        assert created.trade is not None
+
+        for index in range(31):
+            await service.process_event(
+                trade(
+                    trade_id=f"experiment-{index}",
+                    at=NOW
+                    + timedelta(seconds=index, milliseconds=300),
+                    price=created.trade.entry_price,
+                )
+            )
+        assert experiment.metrics().active_variants == 3
+        provider.records = ()
+        protected = await service.refresh_targets()
+        assert protected is not None
+        assert protected.desired_symbols == ()
+        assert protected.protected_trade_symbols == ("BTCUSDT",)
+        assert service.active_symbols() == ("BTCUSDT",)
+
+        for index in range(31, 301):
+            await service.process_event(
+                trade(
+                    trade_id=f"experiment-{index}",
+                    at=NOW
+                    + timedelta(seconds=index, milliseconds=300),
+                    price=created.trade.entry_price,
+                )
+            )
+        assert experiment.metrics().active_groups == 0
+        released = await service.refresh_targets()
+        assert released is not None
+        assert released.protected_trade_symbols == ()
+        assert released.removed == ("BTCUSDT",)
         assert service.active_symbols() == ()
 
     asyncio.run(scenario())
