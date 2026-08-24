@@ -35,6 +35,13 @@ from market_signal_assistant.qtr_micro_scalper.live.collector import (
     UnifiedMarketDataCollector,
     UnifiedSubscriptionMetrics,
 )
+from market_signal_assistant.qtr_micro_scalper.micro_profit_experiment import (
+    MicroExperimentRecordType,
+    MicroProfitExperimentConfig,
+    MicroProfitExperimentRuntime,
+    MicroProfitJournal,
+    iter_micro_profit_records,
+)
 from market_signal_assistant.qtr_micro_scalper.orchestrator import ShadowOrchestrator
 from market_signal_assistant.qtr_micro_scalper.pipeline import (
     LiveShadowPipeline,
@@ -294,6 +301,75 @@ def test_holding_experiment_does_not_change_baseline_trade_result(
             )
 
         assert control_journal.records() == observed_journal.records()
+
+    asyncio.run(scenario())
+
+
+def test_ready_entry_drives_micro_profit_lifecycle_without_baseline_change(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        experiment_journal = MicroProfitJournal(tmp_path / "micro-profit.jsonl")
+        experiment = MicroProfitExperimentRuntime(
+            experiment_journal,
+            MicroProfitExperimentConfig(enabled=True),
+        )
+        baseline_journal = ShadowTradeJournal(tmp_path / "micro-baseline.jsonl")
+        service = LiveShadowPipeline(
+            symbols=("BTCUSDT",),
+            price_context_provider=price_context,
+            orchestrator=ShadowOrchestrator(journal=baseline_journal),
+            micro_profit_experiment=experiment,
+            clock=lambda: NOW + timedelta(seconds=5),
+        )
+        assert service.register_target(target(), observed_at=NOW)
+
+        created = await ready_result(service)
+        assert created.trade is not None
+        original_trade = created.trade
+        await service.process_event(
+            trade(
+                trade_id="micro-entry-bucket",
+                at=NOW + timedelta(milliseconds=300),
+                price=original_trade.entry_price,
+            )
+        )
+        await service.process_event(
+            trade(
+                trade_id="micro-entry-close",
+                at=NOW + timedelta(seconds=1, milliseconds=300),
+                price=original_trade.entry_price,
+            )
+        )
+        await service.process_event(
+            trade(
+                trade_id="micro-target",
+                at=NOW + timedelta(seconds=2, milliseconds=300),
+                price=(
+                    original_trade.entry_price
+                    + original_trade.risk_per_unit * 0.05
+                ),
+            )
+        )
+
+        experiment_records = tuple(
+            iter_micro_profit_records(experiment_journal.path)
+        )
+        assert sum(
+            item.record_type is MicroExperimentRecordType.CREATED
+            for item in experiment_records
+        ) == 5
+        assert any(
+            item.record_type is MicroExperimentRecordType.ENTRY_OPENED
+            for item in experiment_records
+        )
+        assert any(
+            item.record_type is MicroExperimentRecordType.TARGET_REACHED
+            for item in experiment_records
+        )
+        assert baseline_journal.records()[0].trade_id == original_trade.trade_id
+        assert baseline_journal.records()[0].tp1 == original_trade.tp1_price
+        assert baseline_journal.records()[0].tp2 == original_trade.tp2_price
 
     asyncio.run(scenario())
 
@@ -820,6 +896,7 @@ def dynamic_pipeline(
     trade_flow: TradeFlowAccumulator | None = None,
     config: LiveShadowPipelineConfig | None = None,
     holding_experiment: HoldingExperimentRuntime | None = None,
+    micro_profit_experiment: MicroProfitExperimentRuntime | None = None,
 ) -> LiveShadowPipeline:
     manager = DynamicVerifiedTargetManager(
         provider,
@@ -837,6 +914,7 @@ def dynamic_pipeline(
         trade_flow=trade_flow,
         config=config,
         holding_experiment=holding_experiment,
+        micro_profit_experiment=micro_profit_experiment,
     )
 
 
@@ -1031,6 +1109,55 @@ def test_experiment_protects_subscription_after_baseline_a30_terminal(
         assert released.protected_trade_symbols == ()
         assert released.removed == ("BTCUSDT",)
         assert service.active_symbols() == ()
+
+    asyncio.run(scenario())
+
+
+def test_micro_experiment_protects_only_active_variant_symbols(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        provider = MutableVerifiedProvider((verified_record("BTCUSDT"),))
+        controller = FakeSubscriptionController()
+        experiment = MicroProfitExperimentRuntime(
+            MicroProfitJournal(tmp_path / "micro-dynamic.jsonl"),
+            MicroProfitExperimentConfig(enabled=True, maximum_safety_bars=40),
+        )
+        service = dynamic_pipeline(
+            tmp_path,
+            provider,
+            controller,
+            micro_profit_experiment=experiment,
+        )
+        await service.refresh_targets()
+        assert service.register_target(target(), observed_at=NOW)
+        created = await ready_result(service)
+        assert created.trade is not None
+        for index in range(32):
+            await service.process_event(
+                trade(
+                    trade_id=f"micro-protect-{index}",
+                    at=NOW + timedelta(seconds=index, milliseconds=300),
+                    price=created.trade.entry_price,
+                )
+            )
+        provider.records = ()
+        protected = await service.refresh_targets()
+        assert protected is not None
+        assert protected.protected_trade_symbols == ("BTCUSDT",)
+
+        for index in range(32, 42):
+            await service.process_event(
+                trade(
+                    trade_id=f"micro-terminal-{index}",
+                    at=NOW + timedelta(seconds=index, milliseconds=300),
+                    price=created.trade.entry_price,
+                )
+            )
+        released = await service.refresh_targets()
+        assert released is not None
+        assert experiment.metrics().active_groups == 0
+        assert released.protected_trade_symbols == ()
 
     asyncio.run(scenario())
 

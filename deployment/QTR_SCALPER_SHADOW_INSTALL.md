@@ -133,3 +133,42 @@ experimental variants protect their symbol subscription after baseline A30 has
 finished, without changing Dynamic Target ranking. On shutdown or restart,
 unfinished variants are recorded as `INTERRUPTED/INCOMPLETE` and are excluded
 from performance analytics.
+
+## Micro Profit + Continuation Experiment (Shadow only)
+
+The micro-profit experiment is independently opt-in and remains disabled in the
+deployment unit:
+
+```text
+QTR_SCALPER_V2_MICRO_PROFIT_EXPERIMENT_ENABLED=false
+QTR_SCALPER_V2_MICRO_PROFIT_MAX_ACTIVE_GROUPS=1000
+QTR_SCALPER_V2_MICRO_PROFIT_EXPERIMENT_JOURNAL_PATH=/opt/qtr/scalper-shadow/data/qtr_micro_scalper_micro_profit_experiment.jsonl
+QTR_SCALPER_V2_COST_MODEL_ENABLED=true
+QTR_SCALPER_V2_COST_SCENARIO=taker_taker
+QTR_SCALPER_V2_COST_TAKER_FEE_RATE=0.00055
+QTR_SCALPER_V2_COST_MAKER_FEE_RATE=0.00020
+QTR_SCALPER_V2_COST_SLIPPAGE_BPS=0
+QTR_SCALPER_V2_COST_FUNDING_RATE_8H=0
+QTR_SCALPER_V2_RUNNER_TRAILING_R=0.10
+QTR_SCALPER_V2_RUNNER_MAXIMUM_SAFETY_BARS=300
+```
+
+The default fee values are the Bybit VIP0 derivatives reference used for
+validation, not a permanent account assumption. Select `taker_taker`,
+`maker_taker`, `maker_maker`, or `custom`; custom entry/exit rates use
+`QTR_SCALPER_V2_COST_ENTRY_FEE_RATE` and
+`QTR_SCALPER_V2_COST_EXIT_FEE_RATE`.
+
+Each accepted baseline entry is mirrored into M05/M10/M15/M20/M25 targets. The
+baseline entry, initial stop, score and observed public market stream remain
+unchanged. A virtual runner starts only after its micro target is observed and
+continues while Setup Context, Market State, trade flow and liquidity do not
+contradict the original direction. It exits on structural invalidation,
+opposite/conflicted evidence, configured trailing excursion, or the 300-bar
+safety horizon.
+
+The experiment writes lifecycle transitions only to the separate
+`qtr_micro_scalper_micro_profit_experiment.jsonl`. It never writes B/C/D or
+micro records to either authoritative `qtr_micro_scalper_shadow_journal.jsonl`
+or `qtr_micro_scalper_holding_experiment.jsonl`, and it has no execution or
+order-placement authority.

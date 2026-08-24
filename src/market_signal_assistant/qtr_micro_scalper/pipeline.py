@@ -53,6 +53,10 @@ from market_signal_assistant.qtr_micro_scalper.live.orderbook_ws import (
 from market_signal_assistant.qtr_micro_scalper.live.trades_ws import (
     PublicTradeCollector,
 )
+from market_signal_assistant.qtr_micro_scalper.micro_profit_experiment import (
+    ContinuationEvidence,
+    MicroProfitExperimentRuntime,
+)
 from market_signal_assistant.qtr_micro_scalper.orchestrator import (
     ShadowAnalysisInput,
     ShadowOrchestrator,
@@ -171,6 +175,12 @@ class LiveShadowPipelineMetrics:
     holding_experiment_capacity_rejections: int = 0
     holding_experiment_errors: int = 0
     holding_experiment_warning: str | None = None
+    micro_profit_active_groups: int = 0
+    micro_profit_active_variants: int = 0
+    micro_profit_protected_symbols: int = 0
+    micro_profit_capacity_rejections: int = 0
+    micro_profit_errors: int = 0
+    micro_profit_warning: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,6 +212,7 @@ class LiveShadowPipeline:
         dynamic_target_manager: DynamicVerifiedTargetManager | None = None,
         subscription_controller: UnifiedMarketDataCollector | None = None,
         holding_experiment: HoldingExperimentRuntime | None = None,
+        micro_profit_experiment: MicroProfitExperimentRuntime | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         normalized = tuple(
@@ -239,6 +250,7 @@ class LiveShadowPipeline:
         self._dynamic_targets = dynamic_target_manager
         self._subscription_controller = subscription_controller
         self._holding_experiment = holding_experiment
+        self._micro_profit_experiment = micro_profit_experiment
         self._previous_frames: dict[str, LiquidityBookFrame] = {}
         self._current_frames: dict[str, LiquidityBookFrame] = {}
         self._liquidations: dict[str, list[LiquidationEvent]] = {}
@@ -266,6 +278,8 @@ class LiveShadowPipeline:
         self._background_error: str | None = None
         self._holding_experiment_errors = 0
         self._holding_experiment_warning: str | None = None
+        self._micro_profit_errors = 0
+        self._micro_profit_warning: str | None = None
 
     @classmethod
     def with_live_collectors(
@@ -280,6 +294,7 @@ class LiveShadowPipeline:
         clock: Callable[[], datetime] | None = None,
         dynamic_target_manager: DynamicVerifiedTargetManager | None = None,
         holding_experiment: HoldingExperimentRuntime | None = None,
+        micro_profit_experiment: MicroProfitExperimentRuntime | None = None,
     ) -> LiveShadowPipeline:
         """Compose lazy Bybit public streams without opening a connection."""
 
@@ -331,6 +346,7 @@ class LiveShadowPipeline:
             dynamic_target_manager=dynamic_target_manager,
             subscription_controller=unified,
             holding_experiment=holding_experiment,
+            micro_profit_experiment=micro_profit_experiment,
         )
         holder.append(pipeline)
         return pipeline
@@ -354,6 +370,8 @@ class LiveShadowPipeline:
         protected = set(self._lifecycle.tracked_symbols())
         if self._holding_experiment is not None:
             protected.update(self._holding_experiment.protected_symbols())
+        if self._micro_profit_experiment is not None:
+            protected.update(self._micro_profit_experiment.protected_symbols())
         snapshot = manager.refresh(
             at=self._clock(),
             protected_symbols=protected,
@@ -447,6 +465,11 @@ class LiveShadowPipeline:
                 self._holding_experiment.start(at=self._clock())
             except (OSError, RuntimeError, ValueError) as exc:
                 self._record_holding_experiment_error(exc)
+        if self._micro_profit_experiment is not None:
+            try:
+                self._micro_profit_experiment.start(at=self._clock())
+            except (OSError, RuntimeError, ValueError) as exc:
+                self._record_micro_profit_error(exc)
         self._worker = asyncio.create_task(self._consume())
         self._worker.add_done_callback(
             lambda task: self._capture_task_failure("pipeline worker", task)
@@ -494,6 +517,11 @@ class LiveShadowPipeline:
                 self._holding_experiment.stop(at=self._clock())
             except (OSError, RuntimeError, ValueError) as exc:
                 self._record_holding_experiment_error(exc)
+        if self._micro_profit_experiment is not None:
+            try:
+                self._micro_profit_experiment.stop(at=self._clock())
+            except (OSError, RuntimeError, ValueError) as exc:
+                self._record_micro_profit_error(exc)
 
     def enqueue_event(
         self,
@@ -591,6 +619,11 @@ class LiveShadowPipeline:
             if self._holding_experiment is not None
             else None
         )
+        micro_profit = (
+            self._micro_profit_experiment.metrics()
+            if self._micro_profit_experiment is not None
+            else None
+        )
         return LiveShadowPipelineMetrics(
             market_events_received=self._received,
             duplicate_events_suppressed=self._duplicates,
@@ -636,6 +669,23 @@ class LiveShadowPipeline:
             holding_experiment_warning=(
                 self._holding_experiment_warning
                 or (experiment.last_warning if experiment else None)
+            ),
+            micro_profit_active_groups=(
+                micro_profit.active_groups if micro_profit else 0
+            ),
+            micro_profit_active_variants=(
+                micro_profit.active_variants if micro_profit else 0
+            ),
+            micro_profit_protected_symbols=(
+                micro_profit.protected_symbols if micro_profit else 0
+            ),
+            micro_profit_capacity_rejections=(
+                micro_profit.capacity_rejections if micro_profit else 0
+            ),
+            micro_profit_errors=self._micro_profit_errors,
+            micro_profit_warning=(
+                self._micro_profit_warning
+                or (micro_profit.last_warning if micro_profit else None)
             ),
         )
 
@@ -743,6 +793,14 @@ class LiveShadowPipeline:
             ),
             None,
         )
+        if self._micro_profit_experiment is not None:
+            try:
+                if lifecycle_trade is not None:
+                    self._micro_profit_experiment.sync_baseline(lifecycle_trade)
+                if isinstance(event, PublicTradeEvent):
+                    self._micro_profit_experiment.process_event(event)
+            except (OSError, RuntimeError, ValueError) as exc:
+                self._record_micro_profit_error(exc)
         emitted = [
             self._emit(
                 PipelineEventType.MARKET_DATA_RECEIVED,
@@ -771,6 +829,15 @@ class LiveShadowPipeline:
                 reason="Market data accepted; analysis inputs are not ready.",
             )
         analysis, snapshot, score = prepared
+        continuation_evidence: ContinuationEvidence | None = None
+        if self._micro_profit_experiment is not None:
+            try:
+                continuation_evidence = ContinuationEvidence.from_analysis(analysis)
+                self._micro_profit_experiment.update_evidence(
+                    continuation_evidence
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                self._record_micro_profit_error(exc)
         emitted.extend(
             (
                 self._emit(
@@ -810,19 +877,36 @@ class LiveShadowPipeline:
             self._lifecycle.activate(decision.trade)
             if self._holding_experiment is not None:
                 try:
-                    activation = self._holding_experiment.activate(
+                    holding_activation = self._holding_experiment.activate(
                         decision.trade,
                         score=(decision.score or score).total_score,
                         market_state=analysis.market_state.state.value,
                         setup_context=analysis.setup_context.decision.value,
                     )
                     if (
-                        not activation.accepted
-                        and "capacity" in activation.reason.casefold()
+                        not holding_activation.accepted
+                        and "capacity" in holding_activation.reason.casefold()
                     ):
-                        self._holding_experiment_warning = activation.reason
+                        self._holding_experiment_warning = holding_activation.reason
                 except (OSError, RuntimeError, ValueError) as exc:
                     self._record_holding_experiment_error(exc)
+            if (
+                self._micro_profit_experiment is not None
+                and continuation_evidence is not None
+            ):
+                try:
+                    micro_activation = self._micro_profit_experiment.activate(
+                        decision.trade,
+                        continuation_evidence,
+                        score=(decision.score or score).total_score,
+                    )
+                    if (
+                        not micro_activation.accepted
+                        and "capacity" in micro_activation.reason.casefold()
+                    ):
+                        self._micro_profit_warning = micro_activation.reason
+                except (OSError, RuntimeError, ValueError) as exc:
+                    self._record_micro_profit_error(exc)
         self._append_journal_update(
             emitted,
             journal_before=journal_before,
@@ -1017,6 +1101,13 @@ class LiveShadowPipeline:
         self._holding_experiment_errors += 1
         self._holding_experiment_warning = (
             "Holding experiment isolated failure: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    def _record_micro_profit_error(self, exc: Exception) -> None:
+        self._micro_profit_errors += 1
+        self._micro_profit_warning = (
+            "Micro profit experiment isolated failure: "
             f"{type(exc).__name__}: {exc}"
         )
 

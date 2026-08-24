@@ -25,6 +25,12 @@ from market_signal_assistant.qtr_micro_scalper.holding_experiment import (
     HoldingExperimentJournal,
     HoldingExperimentRuntime,
 )
+from market_signal_assistant.qtr_micro_scalper.micro_profit_experiment import (
+    DEFAULT_MICRO_PROFIT_EXPERIMENT_JOURNAL_PATH,
+    MicroProfitExperimentConfig,
+    MicroProfitExperimentRuntime,
+    MicroProfitJournal,
+)
 from market_signal_assistant.qtr_micro_scalper.orchestrator import ShadowOrchestrator
 from market_signal_assistant.qtr_micro_scalper.pipeline import (
     LiveShadowPipeline,
@@ -192,6 +198,7 @@ class ShadowService:
                 background_error
                 or self._last_error
                 or pipeline_metrics.holding_experiment_warning
+                or pipeline_metrics.micro_profit_warning
             ),
             reconnect_attempts=self._reconnect_attempts,
             pipeline_errors=pipeline_metrics.errors,
@@ -295,6 +302,7 @@ def build_shadow_service_from_environment(
     settings = QtrScalperV2LiveSettings.from_environment()
     dynamic_settings = DynamicTargetSettings.from_environment()
     experiment_settings = HoldingExperimentConfig.from_environment()
+    micro_profit_settings = MicroProfitExperimentConfig.from_environment()
     symbols = () if dynamic_settings.enabled else _environment_symbols()
     journal_path = Path(
         os.getenv("QTR_SCALPER_V2_JOURNAL_PATH", str(DEFAULT_SHADOW_JOURNAL_PATH))
@@ -333,6 +341,18 @@ def build_shadow_service_from_environment(
             HoldingExperimentJournal(experiment_path),
             experiment_settings,
         )
+    micro_profit_experiment = None
+    if micro_profit_settings.enabled:
+        micro_profit_path = Path(
+            os.getenv(
+                "QTR_SCALPER_V2_MICRO_PROFIT_EXPERIMENT_JOURNAL_PATH",
+                str(DEFAULT_MICRO_PROFIT_EXPERIMENT_JOURNAL_PATH),
+            )
+        )
+        micro_profit_experiment = MicroProfitExperimentRuntime(
+            MicroProfitJournal(micro_profit_path),
+            micro_profit_settings,
+        )
     pipeline = LiveShadowPipeline.with_live_collectors(
         symbols=symbols,
         price_context_provider=price_context,
@@ -340,6 +360,7 @@ def build_shadow_service_from_environment(
         orchestrator=orchestrator,
         dynamic_target_manager=dynamic_manager,
         holding_experiment=holding_experiment,
+        micro_profit_experiment=micro_profit_experiment,
     )
     return ShadowService(pipeline, resolved_journal, settings)
 

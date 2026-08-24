@@ -344,6 +344,61 @@ def test_holding_experiment_composition_is_opt_in_and_lazy(
     assert not experiment_path.exists()
 
 
+def test_micro_profit_composition_is_default_off_and_lazy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    experiment_path = tmp_path / "micro-profit.jsonl"
+    monkeypatch.setenv("QTR_SCALPER_V2_ENABLED", "false")
+    monkeypatch.setenv("QTR_SCALPER_V2_SHADOW_MODE", "true")
+    monkeypatch.delenv(
+        "QTR_SCALPER_V2_MICRO_PROFIT_EXPERIMENT_ENABLED",
+        raising=False,
+    )
+    monkeypatch.setenv(
+        "QTR_SCALPER_V2_MICRO_PROFIT_EXPERIMENT_JOURNAL_PATH",
+        str(experiment_path),
+    )
+    monkeypatch.setenv("QTR_SCALPER_V2_JOURNAL_PATH", str(tmp_path / "shadow.jsonl"))
+    monkeypatch.setenv(
+        "QTR_SCALPER_V2_DECISION_JOURNAL_PATH",
+        str(tmp_path / "decisions.jsonl"),
+    )
+
+    runtime = build_shadow_service_from_environment()
+
+    assert runtime.health().status is ShadowServiceStatus.STOPPED
+    assert runtime.metrics_snapshot().pipeline.micro_profit_active_groups == 0
+    assert not experiment_path.exists()
+
+
+def test_micro_profit_composition_can_be_enabled_without_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    experiment_path = tmp_path / "micro-profit-enabled.jsonl"
+    monkeypatch.setenv("QTR_SCALPER_V2_ENABLED", "false")
+    monkeypatch.setenv("QTR_SCALPER_V2_SHADOW_MODE", "true")
+    monkeypatch.setenv(
+        "QTR_SCALPER_V2_MICRO_PROFIT_EXPERIMENT_ENABLED",
+        "true",
+    )
+    monkeypatch.setenv(
+        "QTR_SCALPER_V2_MICRO_PROFIT_EXPERIMENT_JOURNAL_PATH",
+        str(experiment_path),
+    )
+    monkeypatch.setenv("QTR_SCALPER_V2_JOURNAL_PATH", str(tmp_path / "shadow.jsonl"))
+    monkeypatch.setenv(
+        "QTR_SCALPER_V2_DECISION_JOURNAL_PATH",
+        str(tmp_path / "decisions.jsonl"),
+    )
+
+    runtime = build_shadow_service_from_environment()
+
+    assert runtime.health().status is ShadowServiceStatus.STOPPED
+    assert not experiment_path.exists()
+
+
 def test_setup_audit_path_uses_explicit_external_configuration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
