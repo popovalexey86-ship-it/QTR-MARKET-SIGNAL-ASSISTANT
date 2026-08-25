@@ -30,6 +30,9 @@ class ProfitFactor:
 
 @dataclass(frozen=True, slots=True)
 class MicroTargetPerformance:
+    plans: int
+    triggered: int
+    trigger_rate: float
     total: int
     hits: int
     hit_rate: float
@@ -45,6 +48,7 @@ class MicroTargetPerformance:
     net_average_r: float
     net_profit_factor: ProfitFactor
     net_expectancy_r: float
+    signal_net_expectancy_r: float
     economically_viable: int
     economically_viable_pct: float
 
@@ -99,6 +103,8 @@ class MicroProfitAnalytics:
 
 @dataclass(slots=True)
 class _PerformanceAccumulator:
+    plans: int = 0
+    triggered: int = 0
     total: int = 0
     hits: int = 0
     gross_total_r: float = 0.0
@@ -114,6 +120,13 @@ class _PerformanceAccumulator:
     net_loss: float = 0.0
     viability_observations: int = 0
     economically_viable: int = 0
+
+    def observe_plan(self, record: MicroProfitRecord) -> None:
+        self.plans += 1
+        self.observe_viability(record)
+
+    def observe_trigger(self) -> None:
+        self.triggered += 1
 
     def observe_result(self, record: MicroProfitRecord) -> None:
         self.total += 1
@@ -144,6 +157,11 @@ class _PerformanceAccumulator:
 
     def freeze(self) -> MicroTargetPerformance:
         return MicroTargetPerformance(
+            plans=self.plans,
+            triggered=self.triggered,
+            trigger_rate=(
+                self.triggered / self.plans * 100 if self.plans else 0.0
+            ),
             total=self.total,
             hits=self.hits,
             hit_rate=self.hits / self.total * 100 if self.total else 0.0,
@@ -164,6 +182,9 @@ class _PerformanceAccumulator:
             net_average_r=self.net_total_r / self.total if self.total else 0.0,
             net_profit_factor=_profit_factor(self.net_profit, self.net_loss),
             net_expectancy_r=self.net_total_r / self.total if self.total else 0.0,
+            signal_net_expectancy_r=(
+                self.net_total_r / self.plans if self.plans else 0.0
+            ),
             economically_viable=self.economically_viable,
             economically_viable_pct=(
                 self.economically_viable / self.viability_observations * 100
@@ -322,7 +343,7 @@ class MicroProfitAnalyticsEngine:
             if len(group_outcomes) > self._maximum_group_tracking:
                 group_outcomes.pop(next(iter(group_outcomes)))
             if (
-                record.record_type is MicroExperimentRecordType.ENTRY_OPENED
+                record.record_type is MicroExperimentRecordType.CREATED
                 and record.target is MicroTarget.M05
             ):
                 cost_floor.add(record.costs.cost_floor_r)
@@ -339,8 +360,10 @@ class MicroProfitAnalyticsEngine:
                     (*key, record.target),
                     _PerformanceAccumulator(),
                 )
-                if record.record_type is MicroExperimentRecordType.ENTRY_OPENED:
-                    accumulator.observe_viability(record)
+                if record.record_type is MicroExperimentRecordType.CREATED:
+                    accumulator.observe_plan(record)
+                elif record.record_type is MicroExperimentRecordType.ENTRY_OPENED:
+                    accumulator.observe_trigger()
                 if record.record_type in {
                     MicroExperimentRecordType.TARGET_REACHED,
                     MicroExperimentRecordType.TARGET_CLOSED,
@@ -441,7 +464,10 @@ class _BoundedSamples:
 def format_micro_profit_report(analytics: MicroProfitAnalytics) -> str:
     lines = [
         "QTR MICRO SCALPER V2 — MICRO PROFIT SHADOW",
-        "Target | N | Hit% | Gross ΣR | Net ΣR | Net PF | Viable%",
+        (
+            "Target | Plans | Trigger% | Opened N | Hit% | Gross ΣR | "
+            "Net ΣR | Net PF | Viable%"
+        ),
     ]
     for row in analytics.rows:
         if row.scope != "ALL":
@@ -453,9 +479,10 @@ def format_micro_profit_report(analytics: MicroProfitAnalytics) -> str:
             else f"{item.net_profit_factor.value:.2f}"
         )
         lines.append(
-            f"{row.target.value} | {item.total} | {item.hit_rate:.1f} | "
-            f"{item.gross_total_r:+.3f} | {item.net_total_r:+.3f} | "
-            f"{net_pf} | {item.economically_viable_pct:.1f}"
+            f"{row.target.value} | {item.plans} | {item.trigger_rate:.1f} | "
+            f"{item.total} | {item.hit_rate:.1f} | {item.gross_total_r:+.3f} | "
+            f"{item.net_total_r:+.3f} | {net_pf} | "
+            f"{item.economically_viable_pct:.1f}"
         )
     floor = analytics.cost_floor
     lines.append(

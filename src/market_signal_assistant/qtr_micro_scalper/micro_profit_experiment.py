@@ -62,6 +62,14 @@ class CostScenario(StrEnum):
     CUSTOM = "custom"
 
 
+class CostAccrual(StrEnum):
+    """Which observed virtual executions may contribute incurred costs."""
+
+    PROJECTED_ONLY = "PROJECTED_ONLY"
+    ENTRY_OPENED = "ENTRY_OPENED"
+    ROUND_TRIP = "ROUND_TRIP"
+
+
 class MicroExperimentStage(StrEnum):
     WAITING_ENTRY = "WAITING_ENTRY"
     OPEN = "OPEN"
@@ -273,6 +281,8 @@ class MicroProfitExperimentConfig:
 
 @dataclass(frozen=True, slots=True)
 class CostBreakdown:
+    """Actual accrued costs plus a separate projected ``cost_floor_r``."""
+
     gross_r: float
     entry_fee: float
     exit_fee: float
@@ -283,6 +293,24 @@ class CostBreakdown:
     total_cost_r: float
     cost_floor_r: float
     net_r: float
+
+    @property
+    def projected_cost_floor_r(self) -> float:
+        """Projected round-trip floor if the plan opens and later exits."""
+
+        return self.cost_floor_r
+
+    @property
+    def actual_total_cost_r(self) -> float:
+        """Costs incurred by virtual executions observed so far."""
+
+        return self.total_cost_r
+
+    @property
+    def actual_net_r(self) -> float:
+        """Gross R less costs incurred by observed virtual executions."""
+
+        return self.net_r
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -1197,6 +1225,7 @@ class MicroProfitExperimentRuntime:
             duration_seconds=duration,
             entry_spread_bps=group.evidence.spread_bps,
             exit_spread_bps=group.evidence.spread_bps,
+            accrual=_cost_accrual(record_type, variant.entry_at),
         )
         return MicroProfitRecord(
             recorded_at=at,
@@ -1257,8 +1286,9 @@ def calculate_cost_breakdown(
     duration_seconds: float,
     entry_spread_bps: float,
     exit_spread_bps: float,
+    accrual: CostAccrual = CostAccrual.ROUND_TRIP,
 ) -> CostBreakdown:
-    """Convert observed/configured round-trip costs to each trade's actual R."""
+    """Separate projected round-trip economics from actually incurred costs."""
 
     for name, value in (
         ("entry price", entry_price),
@@ -1289,8 +1319,8 @@ def calculate_cost_breakdown(
             cost_floor_r=0.0,
             net_r=gross_r,
         )
-    entry_fee = entry_price * config.entry_fee_rate
-    exit_fee = exit_price * config.exit_fee_rate
+    projected_entry_fee = entry_price * config.entry_fee_rate
+    projected_exit_fee = exit_price * config.exit_fee_rate
     entry_spread = (
         entry_price * entry_spread_bps / 20_000
         if config.entry_is_taker
@@ -1301,16 +1331,32 @@ def calculate_cost_breakdown(
         if config.exit_is_taker
         else 0.0
     )
-    spread_cost = entry_spread + exit_spread
-    slippage_cost = (
-        (entry_price + exit_price) * config.slippage_bps / 10_000
-    )
-    funding_cost = (
+    entry_slippage = entry_price * config.slippage_bps / 10_000
+    exit_slippage = exit_price * config.slippage_bps / 10_000
+    projected_funding = (
         entry_price
         * config.funding_rate_8h
         * duration_seconds
         / _SECONDS_PER_FUNDING_INTERVAL
     )
+    if accrual is CostAccrual.PROJECTED_ONLY:
+        entry_fee = 0.0
+        exit_fee = 0.0
+        spread_cost = 0.0
+        slippage_cost = 0.0
+        funding_cost = 0.0
+    elif accrual is CostAccrual.ENTRY_OPENED:
+        entry_fee = projected_entry_fee
+        exit_fee = 0.0
+        spread_cost = entry_spread
+        slippage_cost = entry_slippage
+        funding_cost = 0.0
+    else:
+        entry_fee = projected_entry_fee
+        exit_fee = projected_exit_fee
+        spread_cost = entry_spread + exit_spread
+        slippage_cost = entry_slippage + exit_slippage
+        funding_cost = projected_funding
     total = entry_fee + exit_fee + spread_cost + slippage_cost + funding_cost
     total_r = total / risk_per_unit
     floor_total = (
@@ -1339,6 +1385,24 @@ def calculate_cost_breakdown(
         cost_floor_r=floor_total / risk_per_unit,
         net_r=gross_r - total_r,
     )
+
+
+def _cost_accrual(
+    record_type: MicroExperimentRecordType,
+    entry_at: datetime | None,
+) -> CostAccrual:
+    if record_type is MicroExperimentRecordType.ENTRY_OPENED:
+        return CostAccrual.ENTRY_OPENED
+    if record_type in {
+        MicroExperimentRecordType.TARGET_REACHED,
+        MicroExperimentRecordType.TARGET_CLOSED,
+        MicroExperimentRecordType.RUNNER_EXITED,
+        MicroExperimentRecordType.BASELINE_CLOSED,
+    }:
+        return CostAccrual.ROUND_TRIP
+    if record_type is MicroExperimentRecordType.INTERRUPTED and entry_at is not None:
+        return CostAccrual.ENTRY_OPENED
+    return CostAccrual.PROJECTED_ONLY
 
 
 def iter_micro_profit_records(path: Path) -> Iterator[MicroProfitRecord]:

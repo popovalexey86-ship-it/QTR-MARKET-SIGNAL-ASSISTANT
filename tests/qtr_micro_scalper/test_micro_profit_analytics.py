@@ -14,7 +14,14 @@ from market_signal_assistant.qtr_micro_scalper.micro_profit_analytics import (
 from market_signal_assistant.qtr_micro_scalper.micro_profit_experiment import (
     CostScenario,
     MicroCostModelConfig,
+    MicroExperimentRecordType,
+    MicroProfitExperimentConfig,
+    MicroProfitExperimentRuntime,
+    MicroProfitJournal,
     MicroTarget,
+    calculate_cost_breakdown,
+    iter_micro_profit_records,
+    serialize_micro_profit_record,
 )
 from market_signal_assistant.qtr_micro_scalper.shadow_decision import (
     ShadowTrade,
@@ -80,6 +87,139 @@ def test_analytics_reports_gross_net_costs_and_viability(tmp_path: Path) -> None
     assert m05.performance.economically_viable == 0
     assert result.cost_floor.median is not None
     assert result.cost_floor.median > 0.05
+
+
+def test_five_not_triggered_variants_are_plans_not_monetary_losses(
+    tmp_path: Path,
+) -> None:
+    journal = MicroProfitJournal(tmp_path / "not-triggered.jsonl")
+    experiment = MicroProfitExperimentRuntime(
+        journal,
+        MicroProfitExperimentConfig(enabled=True),
+    )
+    source = baseline()
+    assert experiment.activate(source, evidence(), score=82).accepted
+    experiment.sync_baseline(
+        replace(
+            source,
+            stage=ShadowTradeStage.EXPIRED,
+            closed_at=source.entry_expires_at,
+            last_processed_at=source.entry_expires_at,
+        )
+    )
+
+    result = MicroProfitAnalyticsEngine().analyze(journal.path)
+    all_rows = tuple(row for row in result.rows if row.scope == "ALL")
+
+    assert len(all_rows) == 5
+    assert all(row.performance.plans == 1 for row in all_rows)
+    assert all(row.performance.triggered == 0 for row in all_rows)
+    assert all(row.performance.trigger_rate == 0 for row in all_rows)
+    assert all(row.performance.total == 0 for row in all_rows)
+    assert sum(row.performance.net_total_r for row in all_rows) == 0
+    assert sum(row.performance.total_cost_r for row in all_rows) == 0
+    assert sum(row.performance.fees for row in all_rows) == 0
+    assert sum(row.performance.spread_cost for row in all_rows) == 0
+    assert sum(row.performance.slippage_cost for row in all_rows) == 0
+    assert sum(row.performance.funding_cost for row in all_rows) == 0
+    assert all(
+        row.performance.signal_net_expectancy_r == 0 for row in all_rows
+    )
+    assert result.cost_floor.count == 1
+    assert result.cost_floor.median is not None
+    assert result.cost_floor.median > 0
+
+
+def test_signal_expectancy_includes_not_triggered_plan_as_zero_r(
+    tmp_path: Path,
+) -> None:
+    journal = MicroProfitJournal(tmp_path / "signal-expectancy.jsonl")
+    experiment = MicroProfitExperimentRuntime(
+        journal,
+        MicroProfitExperimentConfig(enabled=True),
+    )
+    expired_source = baseline(trade_id="expired")
+    assert experiment.activate(expired_source, evidence(), score=82).accepted
+    experiment.sync_baseline(
+        replace(
+            expired_source,
+            stage=ShadowTradeStage.EXPIRED,
+            closed_at=expired_source.entry_expires_at,
+        )
+    )
+    opened_source = baseline(trade_id="opened")
+    assert experiment.activate(opened_source, evidence(), score=82).accepted
+    experiment.sync_baseline(opened(opened_source))
+    experiment.process_event(trade(2, 100.5))
+
+    result = MicroProfitAnalyticsEngine().analyze(journal.path)
+    m05 = next(
+        row
+        for row in result.rows
+        if row.scope == "ALL" and row.target is MicroTarget.M05
+    )
+
+    assert m05.performance.plans == 2
+    assert m05.performance.triggered == 1
+    assert m05.performance.total == 1
+    assert m05.performance.net_expectancy_r == pytest.approx(
+        m05.performance.net_total_r
+    )
+    assert m05.performance.signal_net_expectancy_r == pytest.approx(
+        m05.performance.net_total_r / 2
+    )
+
+
+def test_legacy_not_triggered_costs_do_not_enter_opened_trade_analytics(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "source.jsonl"
+    journal = MicroProfitJournal(source_path)
+    experiment = MicroProfitExperimentRuntime(
+        journal,
+        MicroProfitExperimentConfig(enabled=True),
+    )
+    source = baseline()
+    assert experiment.activate(source, evidence(), score=82).accepted
+    experiment.sync_baseline(
+        replace(
+            source,
+            stage=ShadowTradeStage.EXPIRED,
+            closed_at=source.entry_expires_at,
+        )
+    )
+    expired = next(
+        item
+        for item in iter_micro_profit_records(source_path)
+        if item.target is MicroTarget.M05
+        and item.record_type is MicroExperimentRecordType.EXPIRED
+    )
+    legacy = replace(
+        expired,
+        costs=calculate_cost_breakdown(
+            MicroCostModelConfig(),
+            entry_price=expired.entry_price,
+            exit_price=expired.current_price,
+            risk_per_unit=expired.risk_per_unit,
+            gross_r=0,
+            duration_seconds=0,
+            entry_spread_bps=2,
+            exit_spread_bps=2,
+        ),
+    )
+    legacy_path = tmp_path / "legacy.jsonl"
+    legacy_path.write_text(
+        serialize_micro_profit_record(legacy) + "\n",
+        encoding="utf-8",
+    )
+
+    result = MicroProfitAnalyticsEngine().analyze(legacy_path)
+    row = next(item for item in result.rows if item.scope == "ALL")
+
+    assert result.records_processed == 1
+    assert row.performance.total == 0
+    assert row.performance.net_total_r == 0
+    assert row.performance.total_cost_r == 0
 
 
 def test_analytics_has_direction_score_and_symbol_breakdowns(tmp_path: Path) -> None:

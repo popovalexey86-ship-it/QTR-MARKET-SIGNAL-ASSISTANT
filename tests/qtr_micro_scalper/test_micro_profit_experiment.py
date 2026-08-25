@@ -17,6 +17,7 @@ from market_signal_assistant.qtr_micro_scalper.data.models import (
 from market_signal_assistant.qtr_micro_scalper.micro_profit_experiment import (
     ContinuationEvidence,
     ContinuationExitReason,
+    CostAccrual,
     CostScenario,
     MicroCostModelConfig,
     MicroExperimentRecordType,
@@ -200,6 +201,9 @@ def test_m05_reached_then_reversal_closes_runner(tmp_path: Path) -> None:
     assert reached.costs.gross_r == pytest.approx(0.05)
     assert exited.runner_exit_reason == ContinuationExitReason.TRAILING_EXCURSION
     assert exited.costs.gross_r == pytest.approx(-0.06)
+    assert exited.costs.entry_fee > 0
+    assert exited.costs.exit_fee > 0
+    assert exited.costs.net_r < exited.costs.gross_r
 
 
 def test_m10_reached_then_reversal(tmp_path: Path) -> None:
@@ -380,6 +384,130 @@ def test_gross_m05_can_be_net_loss_after_round_trip_costs() -> None:
     assert costs.net_r < 0
 
 
+@pytest.mark.parametrize("target", list(MicroTarget))
+def test_not_triggered_variant_has_projected_floor_but_no_actual_costs(
+    tmp_path: Path,
+    target: MicroTarget,
+) -> None:
+    journal = MicroProfitJournal(tmp_path / "micro.jsonl")
+    experiment = MicroProfitExperimentRuntime(
+        journal,
+        MicroProfitExperimentConfig(enabled=True),
+    )
+    source = baseline()
+    assert experiment.activate(source, evidence(), score=82).accepted
+
+    experiment.sync_baseline(
+        replace(
+            source,
+            stage=ShadowTradeStage.EXPIRED,
+            closed_at=source.entry_expires_at,
+            last_processed_at=source.entry_expires_at,
+        )
+    )
+
+    expired = next(
+        item
+        for item in iter_micro_profit_records(journal.path)
+        if item.target is target
+        and item.record_type is MicroExperimentRecordType.EXPIRED
+    )
+    assert expired.outcome.value == "NOT_TRIGGERED"
+    assert expired.entry_at is None
+    assert expired.costs.projected_cost_floor_r > 0
+    assert expired.costs.entry_fee == 0
+    assert expired.costs.exit_fee == 0
+    assert expired.costs.spread_cost == 0
+    assert expired.costs.slippage_cost == 0
+    assert expired.costs.funding_cost == 0
+    assert expired.costs.total_cost == 0
+    assert expired.costs.actual_total_cost_r == 0
+    assert expired.costs.actual_net_r == 0
+
+
+def test_entry_opened_accrues_entry_side_only(tmp_path: Path) -> None:
+    _, journal, _ = runtime(
+        tmp_path,
+        cost=MicroCostModelConfig(slippage_bps=1.0),
+    )
+
+    entry = next(
+        item
+        for item in iter_micro_profit_records(journal.path)
+        if item.target is MicroTarget.M05
+        and item.record_type is MicroExperimentRecordType.ENTRY_OPENED
+    )
+    assert entry.costs.entry_fee > 0
+    assert entry.costs.spread_cost > 0
+    assert entry.costs.slippage_cost > 0
+    assert entry.costs.exit_fee == 0
+    assert entry.costs.funding_cost == 0
+    assert entry.costs.total_cost_r > 0
+    assert entry.costs.net_r < 0
+
+
+def test_terminal_virtual_exit_accrues_entry_and_exit_costs(tmp_path: Path) -> None:
+    experiment, journal, _ = runtime(
+        tmp_path,
+        cost=MicroCostModelConfig(slippage_bps=1.0),
+    )
+
+    experiment.process_event(trade(2, 100.5))
+
+    reached = next(
+        item
+        for item in iter_micro_profit_records(journal.path)
+        if item.target is MicroTarget.M05
+        and item.record_type is MicroExperimentRecordType.TARGET_REACHED
+    )
+    assert reached.costs.entry_fee > 0
+    assert reached.costs.exit_fee > 0
+    assert reached.costs.spread_cost > 0
+    assert reached.costs.slippage_cost > 0
+
+
+def test_time_exit_of_open_variant_accrues_actual_round_trip_costs(
+    tmp_path: Path,
+) -> None:
+    experiment, journal, _ = runtime(
+        tmp_path,
+        maximum_bars=1,
+        cost=MicroCostModelConfig(slippage_bps=1.0),
+    )
+
+    experiment.process_event(trade(2, 100.1))
+
+    closed = next(
+        item
+        for item in iter_micro_profit_records(journal.path)
+        if item.target is MicroTarget.M05
+        and item.record_type is MicroExperimentRecordType.TARGET_CLOSED
+    )
+    assert closed.outcome.value == "TARGET_MISSED"
+    assert closed.costs.entry_fee > 0
+    assert closed.costs.exit_fee > 0
+    assert closed.costs.total_cost_r > 0
+    assert closed.costs.net_r < closed.costs.gross_r
+
+
+def test_projected_cost_calculation_does_not_accrue_execution_costs() -> None:
+    costs = calculate_cost_breakdown(
+        MicroCostModelConfig(slippage_bps=1.0),
+        entry_price=100,
+        exit_price=100,
+        risk_per_unit=1,
+        gross_r=0,
+        duration_seconds=60,
+        entry_spread_bps=2,
+        exit_spread_bps=2,
+        accrual=CostAccrual.PROJECTED_ONLY,
+    )
+
+    assert costs.projected_cost_floor_r > 0
+    assert costs.actual_total_cost_r == 0
+    assert costs.actual_net_r == 0
+
+
 @pytest.mark.parametrize(
     ("scenario", "entry_rate", "exit_rate"),
     [
@@ -516,6 +644,49 @@ def test_serialization_is_deterministic(tmp_path: Path) -> None:
 
     assert deserialize_micro_profit_record(encoded) == item
     assert serialize_micro_profit_record(item) == encoded
+
+
+def test_existing_schema_with_legacy_phantom_costs_is_readable(
+    tmp_path: Path,
+) -> None:
+    journal = MicroProfitJournal(tmp_path / "source.jsonl")
+    experiment = MicroProfitExperimentRuntime(
+        journal,
+        MicroProfitExperimentConfig(enabled=True),
+    )
+    source = baseline()
+    assert experiment.activate(source, evidence(), score=82).accepted
+    experiment.sync_baseline(
+        replace(
+            source,
+            stage=ShadowTradeStage.EXPIRED,
+            closed_at=source.entry_expires_at,
+        )
+    )
+    expired = next(
+        item
+        for item in iter_micro_profit_records(journal.path)
+        if item.record_type is MicroExperimentRecordType.EXPIRED
+    )
+    legacy_costs = calculate_cost_breakdown(
+        MicroCostModelConfig(),
+        entry_price=expired.entry_price,
+        exit_price=expired.current_price,
+        risk_per_unit=expired.risk_per_unit,
+        gross_r=0,
+        duration_seconds=0,
+        entry_spread_bps=2,
+        exit_spread_bps=2,
+    )
+    legacy = replace(expired, costs=legacy_costs)
+
+    decoded = deserialize_micro_profit_record(
+        serialize_micro_profit_record(legacy)
+    )
+
+    assert decoded.schema_version == 1
+    assert decoded.outcome.value == "NOT_TRIGGERED"
+    assert decoded.costs.total_cost_r > 0
 
 
 def test_experiment_is_disabled_by_default(
