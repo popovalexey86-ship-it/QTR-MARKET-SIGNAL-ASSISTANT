@@ -172,3 +172,29 @@ The experiment writes lifecycle transitions only to the separate
 micro records to either authoritative `qtr_micro_scalper_shadow_journal.jsonl`
 or `qtr_micro_scalper_holding_experiment.jsonl`, and it has no execution or
 order-placement authority.
+
+## Protected Net Runner A/B Experiment (Shadow only)
+
+The protected branch is independently opt-in and requires the Micro Profit
+experiment because it starts only from an observed `TARGET_REACHED` transition:
+
+```text
+QTR_SCALPER_V2_PROTECTED_RUNNER_ENABLED=false
+QTR_SCALPER_V2_PROTECTED_RUNNER_MIN_NET_R=0.0
+QTR_SCALPER_V2_PROTECTED_RUNNER_MAX_ACTIVE_BRANCHES=1000
+QTR_SCALPER_V2_PROTECTED_RUNNER_JOURNAL_PATH=/opt/qtr/scalper-shadow/data/qtr_micro_scalper_protected_runner_experiment.jsonl
+```
+
+CONTROL remains the existing M05/M10/M15/M20/M25 runner without changes.
+PROTECTED_NET receives the same observed public trades, cost model, continuation
+conditions, `0.10R` trailing and safety horizon. Its only extra rule arms after
+estimated exit-now Net R is strictly greater than the configured floor and exits
+at the next observed public-trade price whose estimated Net R is at or below the
+floor. No exact break-even fill is synthesized.
+
+The dedicated JSONL contains transitions only: protected branch creation, floor
+arming, exit and interruption. Active state and deduplication are bounded. A
+restart never fabricates the missing market interval; recovered active branches
+are closed as `INTERRUPTED/INCOMPLETE` and excluded from paired PnL analytics.
+Keep the floor at exactly `0.0R` through the pre-registered 3/20/50-pair research
+checkpoints. This Shadow-only experiment has no execution or order authority.

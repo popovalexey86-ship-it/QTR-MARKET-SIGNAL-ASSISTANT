@@ -399,6 +399,60 @@ def test_micro_profit_composition_can_be_enabled_without_network(
     assert not experiment_path.exists()
 
 
+def test_protected_runner_composition_is_default_off_and_lazy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    protected_path = tmp_path / "protected-default-off.jsonl"
+    monkeypatch.setenv("QTR_SCALPER_V2_ENABLED", "false")
+    monkeypatch.setenv("QTR_SCALPER_V2_SHADOW_MODE", "true")
+    monkeypatch.delenv(
+        "QTR_SCALPER_V2_PROTECTED_RUNNER_ENABLED",
+        raising=False,
+    )
+    monkeypatch.setenv(
+        "QTR_SCALPER_V2_PROTECTED_RUNNER_JOURNAL_PATH",
+        str(protected_path),
+    )
+    monkeypatch.setenv("QTR_SCALPER_V2_JOURNAL_PATH", str(tmp_path / "shadow.jsonl"))
+    monkeypatch.setenv(
+        "QTR_SCALPER_V2_DECISION_JOURNAL_PATH",
+        str(tmp_path / "decisions.jsonl"),
+    )
+
+    runtime = build_shadow_service_from_environment()
+
+    assert runtime.health().status is ShadowServiceStatus.STOPPED
+    assert runtime.metrics_snapshot().pipeline.protected_runner_active_branches == 0
+    assert not protected_path.exists()
+
+
+def test_protected_runner_composition_is_shadow_only_and_opens_no_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    protected_path = tmp_path / "protected-enabled.jsonl"
+    monkeypatch.setenv("QTR_SCALPER_V2_ENABLED", "false")
+    monkeypatch.setenv("QTR_SCALPER_V2_SHADOW_MODE", "true")
+    monkeypatch.setenv("QTR_SCALPER_V2_MICRO_PROFIT_EXPERIMENT_ENABLED", "true")
+    monkeypatch.setenv("QTR_SCALPER_V2_PROTECTED_RUNNER_ENABLED", "true")
+    monkeypatch.setenv(
+        "QTR_SCALPER_V2_PROTECTED_RUNNER_JOURNAL_PATH",
+        str(protected_path),
+    )
+    monkeypatch.setenv("QTR_SCALPER_V2_JOURNAL_PATH", str(tmp_path / "shadow.jsonl"))
+    monkeypatch.setenv(
+        "QTR_SCALPER_V2_DECISION_JOURNAL_PATH",
+        str(tmp_path / "decisions.jsonl"),
+    )
+
+    runtime = build_shadow_service_from_environment()
+
+    assert runtime.health().status is ShadowServiceStatus.STOPPED
+    assert runtime.metrics_snapshot().pipeline.protected_runner_active_branches == 0
+    assert not protected_path.exists()
+
+
 def test_setup_audit_path_uses_explicit_external_configuration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

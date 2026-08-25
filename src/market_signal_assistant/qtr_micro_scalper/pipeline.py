@@ -56,10 +56,14 @@ from market_signal_assistant.qtr_micro_scalper.live.trades_ws import (
 from market_signal_assistant.qtr_micro_scalper.micro_profit_experiment import (
     ContinuationEvidence,
     MicroProfitExperimentRuntime,
+    MicroProfitRecord,
 )
 from market_signal_assistant.qtr_micro_scalper.orchestrator import (
     ShadowAnalysisInput,
     ShadowOrchestrator,
+)
+from market_signal_assistant.qtr_micro_scalper.protected_runner_experiment import (
+    ProtectedRunnerRuntime,
 )
 from market_signal_assistant.qtr_micro_scalper.scoring import (
     ScalperScore,
@@ -181,6 +185,11 @@ class LiveShadowPipelineMetrics:
     micro_profit_capacity_rejections: int = 0
     micro_profit_errors: int = 0
     micro_profit_warning: str | None = None
+    protected_runner_active_branches: int = 0
+    protected_runner_protected_symbols: int = 0
+    protected_runner_capacity_rejections: int = 0
+    protected_runner_errors: int = 0
+    protected_runner_warning: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,6 +222,7 @@ class LiveShadowPipeline:
         subscription_controller: UnifiedMarketDataCollector | None = None,
         holding_experiment: HoldingExperimentRuntime | None = None,
         micro_profit_experiment: MicroProfitExperimentRuntime | None = None,
+        protected_runner: ProtectedRunnerRuntime | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         normalized = tuple(
@@ -251,6 +261,8 @@ class LiveShadowPipeline:
         self._subscription_controller = subscription_controller
         self._holding_experiment = holding_experiment
         self._micro_profit_experiment = micro_profit_experiment
+        self._protected_runner = protected_runner
+        self._micro_evidence: dict[str, ContinuationEvidence] = {}
         self._previous_frames: dict[str, LiquidityBookFrame] = {}
         self._current_frames: dict[str, LiquidityBookFrame] = {}
         self._liquidations: dict[str, list[LiquidationEvent]] = {}
@@ -280,6 +292,8 @@ class LiveShadowPipeline:
         self._holding_experiment_warning: str | None = None
         self._micro_profit_errors = 0
         self._micro_profit_warning: str | None = None
+        self._protected_runner_errors = 0
+        self._protected_runner_warning: str | None = None
 
     @classmethod
     def with_live_collectors(
@@ -295,6 +309,7 @@ class LiveShadowPipeline:
         dynamic_target_manager: DynamicVerifiedTargetManager | None = None,
         holding_experiment: HoldingExperimentRuntime | None = None,
         micro_profit_experiment: MicroProfitExperimentRuntime | None = None,
+        protected_runner: ProtectedRunnerRuntime | None = None,
     ) -> LiveShadowPipeline:
         """Compose lazy Bybit public streams without opening a connection."""
 
@@ -347,6 +362,7 @@ class LiveShadowPipeline:
             subscription_controller=unified,
             holding_experiment=holding_experiment,
             micro_profit_experiment=micro_profit_experiment,
+            protected_runner=protected_runner,
         )
         holder.append(pipeline)
         return pipeline
@@ -372,6 +388,8 @@ class LiveShadowPipeline:
             protected.update(self._holding_experiment.protected_symbols())
         if self._micro_profit_experiment is not None:
             protected.update(self._micro_profit_experiment.protected_symbols())
+        if self._protected_runner is not None:
+            protected.update(self._protected_runner.protected_symbols())
         snapshot = manager.refresh(
             at=self._clock(),
             protected_symbols=protected,
@@ -428,6 +446,7 @@ class LiveShadowPipeline:
         self._current_frames.pop(symbol, None)
         self._liquidations.pop(symbol, None)
         self._registered_provider_targets.discard(symbol)
+        self._micro_evidence.pop(symbol, None)
         self._trade_flow.remove_symbol(symbol)
         self._retired_symbols.pop(symbol, None)
         self._retired_symbols[symbol] = None
@@ -470,6 +489,11 @@ class LiveShadowPipeline:
                 self._micro_profit_experiment.start(at=self._clock())
             except (OSError, RuntimeError, ValueError) as exc:
                 self._record_micro_profit_error(exc)
+        if self._protected_runner is not None:
+            try:
+                self._protected_runner.start(at=self._clock())
+            except (OSError, RuntimeError, ValueError) as exc:
+                self._record_protected_runner_error(exc)
         self._worker = asyncio.create_task(self._consume())
         self._worker.add_done_callback(
             lambda task: self._capture_task_failure("pipeline worker", task)
@@ -522,6 +546,11 @@ class LiveShadowPipeline:
                 self._micro_profit_experiment.stop(at=self._clock())
             except (OSError, RuntimeError, ValueError) as exc:
                 self._record_micro_profit_error(exc)
+        if self._protected_runner is not None:
+            try:
+                self._protected_runner.stop(at=self._clock())
+            except (OSError, RuntimeError, ValueError) as exc:
+                self._record_protected_runner_error(exc)
 
     def enqueue_event(
         self,
@@ -624,6 +653,11 @@ class LiveShadowPipeline:
             if self._micro_profit_experiment is not None
             else None
         )
+        protected_runner = (
+            self._protected_runner.metrics()
+            if self._protected_runner is not None
+            else None
+        )
         return LiveShadowPipelineMetrics(
             market_events_received=self._received,
             duplicate_events_suppressed=self._duplicates,
@@ -686,6 +720,20 @@ class LiveShadowPipeline:
             micro_profit_warning=(
                 self._micro_profit_warning
                 or (micro_profit.last_warning if micro_profit else None)
+            ),
+            protected_runner_active_branches=(
+                protected_runner.active_branches if protected_runner else 0
+            ),
+            protected_runner_protected_symbols=(
+                protected_runner.protected_symbols if protected_runner else 0
+            ),
+            protected_runner_capacity_rejections=(
+                protected_runner.capacity_rejections if protected_runner else 0
+            ),
+            protected_runner_errors=self._protected_runner_errors,
+            protected_runner_warning=(
+                self._protected_runner_warning
+                or (protected_runner.last_warning if protected_runner else None)
             ),
         )
 
@@ -793,14 +841,31 @@ class LiveShadowPipeline:
             ),
             None,
         )
+        micro_records: list[MicroProfitRecord] = []
         if self._micro_profit_experiment is not None:
             try:
                 if lifecycle_trade is not None:
-                    self._micro_profit_experiment.sync_baseline(lifecycle_trade)
+                    micro_records.extend(
+                        self._micro_profit_experiment.sync_baseline(lifecycle_trade)
+                    )
                 if isinstance(event, PublicTradeEvent):
-                    self._micro_profit_experiment.process_event(event)
+                    micro_records.extend(
+                        self._micro_profit_experiment.process_event(event)
+                    )
             except (OSError, RuntimeError, ValueError) as exc:
                 self._record_micro_profit_error(exc)
+        if self._protected_runner is not None and isinstance(
+            event, PublicTradeEvent
+        ):
+            try:
+                self._protected_runner.observe_micro_records(
+                    micro_records,
+                    evidence=self._micro_evidence.get(event.symbol),
+                    event=event,
+                )
+                self._protected_runner.process_event(event)
+            except (OSError, RuntimeError, ValueError) as exc:
+                self._record_protected_runner_error(exc)
         emitted = [
             self._emit(
                 PipelineEventType.MARKET_DATA_RECEIVED,
@@ -833,11 +898,20 @@ class LiveShadowPipeline:
         if self._micro_profit_experiment is not None:
             try:
                 continuation_evidence = ContinuationEvidence.from_analysis(analysis)
+                self._micro_evidence[event.symbol] = continuation_evidence
                 self._micro_profit_experiment.update_evidence(
                     continuation_evidence
                 )
             except (OSError, RuntimeError, ValueError) as exc:
                 self._record_micro_profit_error(exc)
+        if (
+            self._protected_runner is not None
+            and continuation_evidence is not None
+        ):
+            try:
+                self._protected_runner.update_evidence(continuation_evidence)
+            except (OSError, RuntimeError, ValueError) as exc:
+                self._record_protected_runner_error(exc)
         emitted.extend(
             (
                 self._emit(
@@ -1108,6 +1182,13 @@ class LiveShadowPipeline:
         self._micro_profit_errors += 1
         self._micro_profit_warning = (
             "Micro profit experiment isolated failure: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    def _record_protected_runner_error(self, exc: Exception) -> None:
+        self._protected_runner_errors += 1
+        self._protected_runner_warning = (
+            "Protected runner experiment isolated failure: "
             f"{type(exc).__name__}: {exc}"
         )
 

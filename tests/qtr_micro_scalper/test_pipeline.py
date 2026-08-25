@@ -55,6 +55,13 @@ from market_signal_assistant.qtr_micro_scalper.price_context_adapter import (
     VerifiedPriceContextAdapter,
     VerifiedSetupRecord,
 )
+from market_signal_assistant.qtr_micro_scalper.protected_runner_experiment import (
+    ProtectedRunnerConfig,
+    ProtectedRunnerJournal,
+    ProtectedRunnerRecordType,
+    ProtectedRunnerRuntime,
+    iter_protected_runner_records,
+)
 from market_signal_assistant.qtr_micro_scalper.setup_context import (
     PriceContext,
     ShadowDirection,
@@ -370,6 +377,71 @@ def test_ready_entry_drives_micro_profit_lifecycle_without_baseline_change(
         assert baseline_journal.records()[0].trade_id == original_trade.trade_id
         assert baseline_journal.records()[0].tp1 == original_trade.tp1_price
         assert baseline_journal.records()[0].tp2 == original_trade.tp2_price
+
+    asyncio.run(scenario())
+
+
+def test_micro_target_transition_creates_protected_branch_in_pipeline(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        micro_journal = MicroProfitJournal(tmp_path / "micro-control.jsonl")
+        experiment = MicroProfitExperimentRuntime(
+            micro_journal,
+            MicroProfitExperimentConfig(enabled=True),
+        )
+        protected_journal = ProtectedRunnerJournal(tmp_path / "protected.jsonl")
+        protected = ProtectedRunnerRuntime(
+            protected_journal,
+            ProtectedRunnerConfig(enabled=True),
+        )
+        baseline_journal = ShadowTradeJournal(tmp_path / "baseline.jsonl")
+        service = LiveShadowPipeline(
+            symbols=("BTCUSDT",),
+            price_context_provider=price_context,
+            orchestrator=ShadowOrchestrator(journal=baseline_journal),
+            micro_profit_experiment=experiment,
+            protected_runner=protected,
+            clock=lambda: NOW + timedelta(seconds=5),
+        )
+        assert service.register_target(target(), observed_at=NOW)
+        created = await ready_result(service)
+        assert created.trade is not None
+        source = created.trade
+        await service.process_event(
+            trade(
+                trade_id="protected-entry-bucket",
+                at=NOW + timedelta(milliseconds=300),
+                price=source.entry_price,
+            )
+        )
+        await service.process_event(
+            trade(
+                trade_id="protected-entry-close",
+                at=NOW + timedelta(seconds=1, milliseconds=300),
+                price=source.entry_price,
+            )
+        )
+        await service.process_event(
+            trade(
+                trade_id="protected-target",
+                at=NOW + timedelta(seconds=2, milliseconds=300),
+                price=source.entry_price + source.risk_per_unit * 0.050001,
+            )
+        )
+
+        records = tuple(iter_protected_runner_records(protected_journal.path))
+        assert records[0].record_type is (
+            ProtectedRunnerRecordType.PROTECTED_RUNNER_CREATED
+        )
+        assert len(records) in {1, 2}
+        if len(records) == 2:
+            assert records[1].record_type is (
+                ProtectedRunnerRecordType.NET_FLOOR_ARMED
+            )
+        assert protected.metrics().active_branches == 1
+        assert baseline_journal.records()[0].tp1 == source.tp1_price
+        assert baseline_journal.records()[0].tp2 == source.tp2_price
 
     asyncio.run(scenario())
 

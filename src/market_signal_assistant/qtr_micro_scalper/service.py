@@ -41,6 +41,12 @@ from market_signal_assistant.qtr_micro_scalper.price_context_adapter import (
     JsonlVerifiedSetupProvider,
     VerifiedPriceContextAdapter,
 )
+from market_signal_assistant.qtr_micro_scalper.protected_runner_experiment import (
+    DEFAULT_PROTECTED_RUNNER_JOURNAL_PATH,
+    ProtectedRunnerConfig,
+    ProtectedRunnerJournal,
+    ProtectedRunnerRuntime,
+)
 from market_signal_assistant.qtr_micro_scalper.shadow_journal import (
     DEFAULT_SHADOW_JOURNAL_PATH,
     ShadowTradeJournal,
@@ -199,6 +205,7 @@ class ShadowService:
                 or self._last_error
                 or pipeline_metrics.holding_experiment_warning
                 or pipeline_metrics.micro_profit_warning
+                or pipeline_metrics.protected_runner_warning
             ),
             reconnect_attempts=self._reconnect_attempts,
             pipeline_errors=pipeline_metrics.errors,
@@ -303,6 +310,9 @@ def build_shadow_service_from_environment(
     dynamic_settings = DynamicTargetSettings.from_environment()
     experiment_settings = HoldingExperimentConfig.from_environment()
     micro_profit_settings = MicroProfitExperimentConfig.from_environment()
+    protected_runner_settings = ProtectedRunnerConfig.from_environment(
+        micro_profit_settings
+    )
     symbols = () if dynamic_settings.enabled else _environment_symbols()
     journal_path = Path(
         os.getenv("QTR_SCALPER_V2_JOURNAL_PATH", str(DEFAULT_SHADOW_JOURNAL_PATH))
@@ -353,6 +363,18 @@ def build_shadow_service_from_environment(
             MicroProfitJournal(micro_profit_path),
             micro_profit_settings,
         )
+    protected_runner = None
+    if protected_runner_settings.enabled and micro_profit_experiment is not None:
+        protected_runner_path = Path(
+            os.getenv(
+                "QTR_SCALPER_V2_PROTECTED_RUNNER_JOURNAL_PATH",
+                str(DEFAULT_PROTECTED_RUNNER_JOURNAL_PATH),
+            )
+        )
+        protected_runner = ProtectedRunnerRuntime(
+            ProtectedRunnerJournal(protected_runner_path),
+            protected_runner_settings,
+        )
     pipeline = LiveShadowPipeline.with_live_collectors(
         symbols=symbols,
         price_context_provider=price_context,
@@ -361,6 +383,7 @@ def build_shadow_service_from_environment(
         dynamic_target_manager=dynamic_manager,
         holding_experiment=holding_experiment,
         micro_profit_experiment=micro_profit_experiment,
+        protected_runner=protected_runner,
     )
     return ShadowService(pipeline, resolved_journal, settings)
 
