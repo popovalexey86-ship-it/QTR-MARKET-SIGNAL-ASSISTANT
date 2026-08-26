@@ -47,6 +47,8 @@ class ProtectedRunnerPair:
     floor_armed: bool
     floor_exit: bool
     floor_breach_amount_r: float
+    non_floor_divergence: bool
+    non_floor_abs_delta_r: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +74,8 @@ class ProtectedRunnerPerformance:
     control_beats_protected: int
     protected_beats_control: int
     same_result: int
+    non_floor_divergence_count: int
+    non_floor_max_abs_delta_r: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +129,8 @@ class _Accumulator:
     control_beats: int = 0
     protected_beats: int = 0
     same: int = 0
+    non_floor_divergences: int = 0
+    non_floor_max_abs_delta: float = 0.0
     deltas: _BoundedSamples = field(default_factory=lambda: _BoundedSamples())
 
     def observe(self, pair: ProtectedRunnerPair) -> None:
@@ -155,6 +161,11 @@ class _Accumulator:
             self.control_beats += 1
         else:
             self.protected_beats += 1
+        self.non_floor_divergences += int(pair.non_floor_divergence)
+        self.non_floor_max_abs_delta = max(
+            self.non_floor_max_abs_delta,
+            pair.non_floor_abs_delta_r,
+        )
         self.deltas.add(delta)
 
     def freeze(self) -> ProtectedRunnerPerformance:
@@ -199,6 +210,8 @@ class _Accumulator:
             control_beats_protected=self.control_beats,
             protected_beats_control=self.protected_beats,
             same_result=self.same,
+            non_floor_divergence_count=self.non_floor_divergences,
+            non_floor_max_abs_delta_r=self.non_floor_max_abs_delta,
         )
 
 
@@ -323,6 +336,8 @@ def format_protected_runner_report(analytics: ProtectedRunnerAnalytics) -> str:
             ),
             f"Net floor armed: {item.net_floor_armed_pct:.1f}%",
             f"Net floor exits: {item.net_floor_exit_pct:.1f}%",
+            f"Non-floor divergences: {item.non_floor_divergence_count}",
+            f"Non-floor max |ΔR|: {item.non_floor_max_abs_delta_r:.12g}",
             f"Checkpoint: {checkpoint}",
             "Shadow-only; no winner is selected automatically.",
         )
@@ -355,6 +370,18 @@ def _pair(
         raise ValueError("Protected paired result requires terminal Net R.")
     control_net = control.costs.net_r
     protected_net = protected.actual_net_r
+    floor_exit = (
+        protected.exit_reason == ProtectedRunnerExitReason.NET_PROFIT_FLOOR.value
+    )
+    non_floor_divergence = not floor_exit and (
+        protected.actual_exit_price != control.current_price
+        or protected.actual_gross_r != control.costs.gross_r
+        or protected.actual_total_cost_r != control.costs.total_cost_r
+        or protected.actual_net_r != control.costs.net_r
+        or protected.recorded_at != control.recorded_at
+        or protected.exit_reason != control.runner_exit_reason
+    )
+    non_floor_abs_delta = 0.0 if floor_exit else abs(protected_net - control_net)
     control_max_estimate = max(
         control_net,
         control.maximum_excursion_after_r - control.costs.cost_floor_r,
@@ -375,11 +402,10 @@ def _pair(
         protected_profit_giveback_r=max(0.0, protected_max - protected_net),
         profit_saved_by_protection_r=protected_net - control_net,
         floor_armed=armed or protected.floor_armed_at is not None,
-        floor_exit=(
-            protected.exit_reason
-            == ProtectedRunnerExitReason.NET_PROFIT_FLOOR.value
-        ),
+        floor_exit=floor_exit,
         floor_breach_amount_r=protected.floor_breach_amount_r or 0.0,
+        non_floor_divergence=non_floor_divergence,
+        non_floor_abs_delta_r=non_floor_abs_delta,
     )
 
 

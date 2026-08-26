@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
 import pytest
 
+from market_signal_assistant.qtr_micro_scalper.data.market_state import MarketBias
 from market_signal_assistant.qtr_micro_scalper.data.models import (
     OrderBookEvent,
     OrderBookEventType,
@@ -36,10 +37,12 @@ from market_signal_assistant.qtr_micro_scalper.live.collector import (
     UnifiedSubscriptionMetrics,
 )
 from market_signal_assistant.qtr_micro_scalper.micro_profit_experiment import (
+    ContinuationEvidence,
     MicroExperimentRecordType,
     MicroProfitExperimentConfig,
     MicroProfitExperimentRuntime,
     MicroProfitJournal,
+    MicroProfitRecord,
     iter_micro_profit_records,
 )
 from market_signal_assistant.qtr_micro_scalper.orchestrator import ShadowOrchestrator
@@ -442,6 +445,171 @@ def test_micro_target_transition_creates_protected_branch_in_pipeline(
         assert protected.metrics().active_branches == 1
         assert baseline_journal.records()[0].tp1 == source.tp1_price
         assert baseline_journal.records()[0].tp2 == source.tp2_price
+
+    asyncio.run(scenario())
+
+
+def test_pipeline_mirrors_control_terminal_before_net_floor_evaluation(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        micro_journal = MicroProfitJournal(tmp_path / "causal-control.jsonl")
+        experiment = MicroProfitExperimentRuntime(
+            micro_journal,
+            MicroProfitExperimentConfig(enabled=True),
+        )
+        protected_journal = ProtectedRunnerJournal(
+            tmp_path / "causal-protected.jsonl"
+        )
+        protected = ProtectedRunnerRuntime(
+            protected_journal,
+            ProtectedRunnerConfig(enabled=True),
+        )
+        service = LiveShadowPipeline(
+            symbols=("BTCUSDT",),
+            price_context_provider=price_context,
+            orchestrator=ShadowOrchestrator(
+                journal=ShadowTradeJournal(tmp_path / "causal-baseline.jsonl")
+            ),
+            micro_profit_experiment=experiment,
+            protected_runner=protected,
+            clock=lambda: NOW + timedelta(seconds=5),
+        )
+        assert service.register_target(target(), observed_at=NOW)
+        created = await ready_result(service)
+        assert created.trade is not None
+        source = created.trade
+        for trade_id, offset, price in (
+            ("causal-entry", 0.3, source.entry_price),
+            ("causal-entry-close", 1.3, source.entry_price),
+            (
+                "causal-target",
+                2.3,
+                source.entry_price + source.risk_per_unit * 0.050001,
+            ),
+            (
+                "causal-peak",
+                3.3,
+                source.entry_price + source.risk_per_unit * 0.20,
+            ),
+            (
+                "causal-trailing-exit",
+                4.3,
+                source.entry_price + source.risk_per_unit * 0.09,
+            ),
+        ):
+            await service.process_event(
+                trade(
+                    trade_id=trade_id,
+                    at=NOW + timedelta(seconds=offset),
+                    price=price,
+                )
+            )
+        control = next(
+            item
+            for item in iter_micro_profit_records(micro_journal.path)
+            if item.target.value == "M05"
+            and item.record_type is MicroExperimentRecordType.RUNNER_EXITED
+        )
+        mirrored = next(
+            item
+            for item in iter_protected_runner_records(protected_journal.path)
+            if item.target.value == "M05"
+            and item.record_type
+            is ProtectedRunnerRecordType.PROTECTED_RUNNER_EXITED
+        )
+        assert mirrored.actual_exit_price == control.current_price
+        assert mirrored.actual_gross_r == control.costs.gross_r
+        assert mirrored.actual_total_cost_r == control.costs.total_cost_r
+        assert mirrored.actual_net_r == control.costs.net_r
+        assert mirrored.recorded_at == control.recorded_at
+        assert mirrored.exit_reason == control.runner_exit_reason
+
+    asyncio.run(scenario())
+
+
+def test_pipeline_captures_control_continuation_exit_for_protected_mirror(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        micro_journal = MicroProfitJournal(tmp_path / "continuation-control.jsonl")
+        experiment = MicroProfitExperimentRuntime(
+            micro_journal,
+            MicroProfitExperimentConfig(enabled=True),
+        )
+        original_update = experiment.update_evidence
+
+        def force_control_exit(
+            observed: ContinuationEvidence,
+        ) -> tuple[MicroProfitRecord, ...]:
+            return original_update(
+                replace(observed, market_bias=MarketBias.BEARISH)
+            )
+
+        monkeypatch.setattr(experiment, "update_evidence", force_control_exit)
+        protected_journal = ProtectedRunnerJournal(
+            tmp_path / "continuation-protected.jsonl"
+        )
+        protected = ProtectedRunnerRuntime(
+            protected_journal,
+            ProtectedRunnerConfig(enabled=True),
+        )
+        service = LiveShadowPipeline(
+            symbols=("BTCUSDT",),
+            price_context_provider=price_context,
+            orchestrator=ShadowOrchestrator(
+                journal=ShadowTradeJournal(tmp_path / "continuation-baseline.jsonl")
+            ),
+            micro_profit_experiment=experiment,
+            protected_runner=protected,
+            clock=lambda: NOW + timedelta(seconds=5),
+        )
+        assert service.register_target(target(), observed_at=NOW)
+        created = await ready_result(service)
+        assert created.trade is not None
+        source = created.trade
+        for trade_id, offset, price in (
+            ("continuation-entry", 0.3, source.entry_price),
+            ("continuation-entry-close", 1.3, source.entry_price),
+            (
+                "continuation-target",
+                2.3,
+                source.entry_price + source.risk_per_unit * 0.050001,
+            ),
+        ):
+            await service.process_event(
+                trade(
+                    trade_id=trade_id,
+                    at=NOW + timedelta(seconds=offset),
+                    price=price,
+                )
+            )
+        await service.process_event(
+            book(
+                OrderBookEventType.SNAPSHOT,
+                99,
+                at=NOW + timedelta(seconds=2, milliseconds=400),
+            )
+        )
+
+        control = next(
+            item
+            for item in iter_micro_profit_records(micro_journal.path)
+            if item.target.value == "M05"
+            and item.record_type is MicroExperimentRecordType.RUNNER_EXITED
+        )
+        mirrored = next(
+            item
+            for item in iter_protected_runner_records(protected_journal.path)
+            if item.target.value == "M05"
+            and item.record_type
+            is ProtectedRunnerRecordType.PROTECTED_RUNNER_EXITED
+        )
+        assert mirrored.actual_exit_price == control.current_price
+        assert mirrored.actual_net_r == control.costs.net_r
+        assert mirrored.recorded_at == control.recorded_at
+        assert mirrored.exit_reason == control.runner_exit_reason
 
     asyncio.run(scenario())
 

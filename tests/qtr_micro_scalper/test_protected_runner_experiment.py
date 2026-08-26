@@ -46,6 +46,7 @@ def target_hit(
     stop: float = 90.0,
     trade_id: str = "baseline-1",
     cost: MicroCostModelConfig | None = None,
+    maximum_bars: int = 300,
 ) -> tuple[
     MicroProfitExperimentRuntime,
     MicroProfitRecord,
@@ -55,6 +56,7 @@ def target_hit(
         tmp_path,
         stop=stop,
         cost=cost,
+        maximum_bars=maximum_bars,
     )
     source = baseline(stop=stop, trade_id=trade_id)
     if trade_id != "baseline-1":
@@ -106,6 +108,26 @@ def activate_protected(
         evidence=evidence(at=event.exchange_at, price=event.price),
         event=event,
     )
+
+
+def mirror_control(
+    runner: ProtectedRunnerRuntime,
+    records: tuple[MicroProfitRecord, ...],
+) -> tuple[ProtectedRunnerRecord, ...]:
+    return runner.observe_micro_records(records, evidence=None, event=None)
+
+
+def assert_exact_control_mirror(
+    protected: ProtectedRunnerRecord,
+    control: MicroProfitRecord,
+) -> None:
+    assert protected.actual_exit_price == control.current_price
+    assert protected.actual_gross_r == control.costs.gross_r
+    assert protected.actual_total_cost_r == control.costs.total_cost_r
+    assert protected.actual_net_r == control.costs.net_r
+    assert protected.recorded_at == control.recorded_at
+    assert protected.exit_reason == control.runner_exit_reason
+    assert protected.completed_bars == control.completed_bars
 
 
 def test_positive_net_at_m05_arms_floor(tmp_path: Path) -> None:
@@ -172,67 +194,94 @@ def test_armed_branch_exits_at_observed_price_when_net_floor_is_breached(
     assert exited.floor_breach_amount_r == pytest.approx(-exited.actual_net_r)
 
 
-def test_existing_continuation_condition_closes_before_floor(tmp_path: Path) -> None:
+def test_control_continuation_exit_is_mirrored_exactly(tmp_path: Path) -> None:
     cost = MicroCostModelConfig(slippage_bps=2.0)
-    _, source, event = target_hit(tmp_path, stop=99.0, cost=cost)
+    control, source, event = target_hit(tmp_path, stop=99.0, cost=cost)
     runner, _ = protected_runtime(tmp_path, cost=cost)
     activate_protected(runner, source, event)
-
-    records = runner.update_evidence(
-        evidence(
-            at=event.exchange_at + timedelta(milliseconds=1),
-            price=event.price,
-            bias=MarketBias.BEARISH,
-        )
+    changed = evidence(
+        at=event.exchange_at + timedelta(milliseconds=1),
+        price=event.price,
+        bias=MarketBias.BEARISH,
     )
+    runner.update_evidence(changed)
+    control_records = control.update_evidence(changed)
+
+    records = mirror_control(runner, control_records)
 
     assert len(records) == 1
-    assert records[0].exit_reason == (
-        ProtectedRunnerExitReason.OPPOSITE_MARKET_STATE.value
+    control_exit = next(
+        item
+        for item in control_records
+        if item.target is MicroTarget.M05
+        and item.record_type is MicroExperimentRecordType.RUNNER_EXITED
     )
+    assert_exact_control_mirror(records[0], control_exit)
 
 
-def test_existing_trailing_condition_has_priority_over_floor(tmp_path: Path) -> None:
-    _, source, event = target_hit(tmp_path)
+def test_control_trailing_exit_has_priority_over_floor(tmp_path: Path) -> None:
+    control, source, event = target_hit(tmp_path)
     runner, _ = protected_runtime(tmp_path)
     activate_protected(runner, source, event)
-    runner.process_event(trade(3, 102.0))
+    peak = trade(3, 102.0)
+    control.process_event(peak)
+    runner.process_event(peak)
+    reversal = trade(4, 100.9)
 
-    records = runner.process_event(trade(4, 100.9))
+    control_records = control.process_event(reversal)
+    records = mirror_control(runner, control_records)
+    floor_records = runner.process_event(reversal)
 
     assert len(records) == 1
-    assert records[0].exit_reason == (
-        ProtectedRunnerExitReason.TRAILING_EXCURSION.value
+    control_exit = next(
+        item
+        for item in control_records
+        if item.target is MicroTarget.M05
+        and item.record_type is MicroExperimentRecordType.RUNNER_EXITED
     )
-    assert records[0].actual_net_r is not None
-    assert records[0].actual_net_r > 0
+    assert_exact_control_mirror(records[0], control_exit)
+    assert floor_records == ()
 
 
-def test_existing_maximum_safety_horizon_is_preserved(tmp_path: Path) -> None:
-    _, source, event = target_hit(tmp_path)
-    runner, _ = protected_runtime(tmp_path, maximum_bars=1)
+def test_control_maximum_safety_horizon_is_mirrored_exactly(tmp_path: Path) -> None:
+    control, source, event = target_hit(tmp_path, maximum_bars=2)
+    runner, _ = protected_runtime(tmp_path, maximum_bars=2)
     activate_protected(runner, source, event)
+    later = trade(20, 100.6)
 
-    records = runner.process_event(trade(20, 100.6))
+    control_records = control.process_event(later)
+    records = mirror_control(runner, control_records)
 
     assert len(records) == 1
-    assert records[0].exit_reason == (
-        ProtectedRunnerExitReason.MAXIMUM_SAFETY_HORIZON.value
+    control_exit = next(
+        item
+        for item in control_records
+        if item.target is MicroTarget.M05
+        and item.record_type is MicroExperimentRecordType.RUNNER_EXITED
     )
+    assert_exact_control_mirror(records[0], control_exit)
 
 
-def test_stop_uses_real_observed_event_price(tmp_path: Path) -> None:
+def test_control_stop_fill_semantics_are_mirrored_exactly(tmp_path: Path) -> None:
     cost = MicroCostModelConfig(slippage_bps=2.0)
-    _, source, event = target_hit(tmp_path, cost=cost)
+    control, source, event = target_hit(tmp_path, cost=cost)
     runner, _ = protected_runtime(tmp_path, cost=cost)
     activate_protected(runner, source, event)
     stopped = trade(3, 89.5)
 
-    records = runner.process_event(stopped)
+    control_records = control.process_event(stopped)
+    records = mirror_control(runner, control_records)
 
-    assert records[0].exit_reason == ProtectedRunnerExitReason.STOP.value
-    assert records[0].actual_exit_price == 89.5
-    assert records[0].actual_gross_r == pytest.approx(-1.05)
+    control_exit = next(
+        item
+        for item in control_records
+        if item.target is MicroTarget.M05
+        and item.record_type is MicroExperimentRecordType.RUNNER_EXITED
+    )
+    assert control_exit.current_price == source.initial_stop
+    assert control_exit.costs.gross_r == -1.0
+    assert_exact_control_mirror(records[0], control_exit)
+    assert runner.process_event(stopped) == ()
 
 
 def test_entry_exit_costs_match_existing_cost_model(tmp_path: Path) -> None:
@@ -290,6 +339,170 @@ def test_control_runner_result_is_unchanged_by_protected_branch(
     assert target_event.price == protected_event.price
     assert actual_exit.costs == expected_exit.costs
     assert actual_exit.runner_exit_reason == expected_exit.runner_exit_reason
+
+
+def test_floor_never_arms_then_control_terminal_is_exact_mirror(
+    tmp_path: Path,
+) -> None:
+    cost = MicroCostModelConfig(slippage_bps=2.0)
+    control, source, target_event = target_hit(
+        tmp_path,
+        stop=99.0,
+        cost=cost,
+    )
+    runner, _ = protected_runtime(tmp_path, cost=cost)
+    activate_protected(runner, source, target_event)
+    assert runner.metrics().branches_armed == 0
+    changed = evidence(
+        at=target_event.exchange_at + timedelta(milliseconds=1),
+        price=target_event.price,
+        bias=MarketBias.BEARISH,
+    )
+
+    control_records = control.update_evidence(changed)
+    protected_records = mirror_control(runner, control_records)
+
+    control_exit = next(
+        item
+        for item in control_records
+        if item.target is MicroTarget.M05
+        and item.record_type is MicroExperimentRecordType.RUNNER_EXITED
+    )
+    assert len(protected_records) == 1
+    assert_exact_control_mirror(protected_records[0], control_exit)
+
+
+def test_floor_arms_without_breach_then_control_terminal_is_exact_mirror(
+    tmp_path: Path,
+) -> None:
+    control, source, target_event = target_hit(tmp_path)
+    runner, _ = protected_runtime(tmp_path)
+    activate_protected(runner, source, target_event)
+    assert runner.metrics().branches_armed == 1
+    changed = evidence(
+        at=target_event.exchange_at + timedelta(milliseconds=1),
+        price=target_event.price,
+        bias=MarketBias.BEARISH,
+    )
+
+    control_records = control.update_evidence(changed)
+    protected_records = mirror_control(runner, control_records)
+
+    control_exit = next(
+        item
+        for item in control_records
+        if item.target is MicroTarget.M05
+        and item.record_type is MicroExperimentRecordType.RUNNER_EXITED
+    )
+    assert_exact_control_mirror(protected_records[0], control_exit)
+
+
+def test_protected_evidence_update_never_closes_runner_independently(
+    tmp_path: Path,
+) -> None:
+    _, source, target_event = target_hit(tmp_path)
+    runner, _ = protected_runtime(tmp_path)
+    activate_protected(runner, source, target_event)
+
+    records = runner.update_evidence(
+        evidence(
+            at=target_event.exchange_at + timedelta(milliseconds=1),
+            price=target_event.price,
+            bias=MarketBias.BEARISH,
+        )
+    )
+
+    assert records == ()
+    assert runner.metrics().active_branches == 1
+
+
+def test_later_control_exit_after_floor_does_not_duplicate_terminal(
+    tmp_path: Path,
+) -> None:
+    control, source, target_event = target_hit(tmp_path)
+    runner, journal = protected_runtime(tmp_path)
+    activate_protected(runner, source, target_event)
+    floor_records = runner.process_event(trade(3, 100.0))
+    assert len(floor_records) == 1
+    control_records = control.process_event(trade(4, 99.4))
+
+    mirrored = mirror_control(runner, control_records)
+
+    assert mirrored == ()
+    terminals = tuple(
+        item
+        for item in iter_protected_runner_records(journal.path)
+        if item.record_type is ProtectedRunnerRecordType.PROTECTED_RUNNER_EXITED
+    )
+    assert len(terminals) == 1
+    assert terminals[0].exit_reason == ProtectedRunnerExitReason.NET_PROFIT_FLOOR
+
+
+def test_duplicate_control_terminal_does_not_duplicate_protected_terminal(
+    tmp_path: Path,
+) -> None:
+    control, source, target_event = target_hit(tmp_path)
+    runner, journal = protected_runtime(tmp_path)
+    activate_protected(runner, source, target_event)
+    changed = evidence(
+        at=target_event.exchange_at + timedelta(milliseconds=1),
+        price=target_event.price,
+        bias=MarketBias.BEARISH,
+    )
+    control_records = control.update_evidence(changed)
+
+    first = mirror_control(runner, control_records)
+    second = mirror_control(runner, control_records)
+
+    assert len(first) == 1
+    assert second == ()
+    assert sum(
+        item.record_type is ProtectedRunnerRecordType.PROTECTED_RUNNER_EXITED
+        for item in iter_protected_runner_records(journal.path)
+    ) == 1
+
+
+def test_synthetic_multi_target_non_floor_branches_are_exact_control_copies(
+    tmp_path: Path,
+) -> None:
+    control, _, baseline_trade = runtime(tmp_path)
+    target_event = trade(
+        2,
+        baseline_trade.entry_price + baseline_trade.risk_per_unit * 0.250001,
+    )
+    target_records = tuple(
+        item
+        for item in control.process_event(target_event)
+        if item.record_type is MicroExperimentRecordType.TARGET_REACHED
+    )
+    runner, _ = protected_runtime(tmp_path)
+    created = runner.observe_micro_records(
+        target_records,
+        evidence=evidence(at=target_event.exchange_at, price=target_event.price),
+        event=target_event,
+    )
+    assert sum(
+        item.record_type is ProtectedRunnerRecordType.PROTECTED_RUNNER_CREATED
+        for item in created
+    ) == len(MicroTarget)
+    changed = evidence(
+        at=target_event.exchange_at + timedelta(milliseconds=1),
+        price=target_event.price,
+        bias=MarketBias.BEARISH,
+    )
+
+    control_exits = tuple(
+        item
+        for item in control.update_evidence(changed)
+        if item.record_type is MicroExperimentRecordType.RUNNER_EXITED
+    )
+    protected_exits = mirror_control(runner, control_exits)
+
+    assert len(control_exits) == len(MicroTarget)
+    assert len(protected_exits) == len(MicroTarget)
+    control_by_target = {item.target: item for item in control_exits}
+    for protected in protected_exits:
+        assert_exact_control_mirror(protected, control_by_target[protected.target])
 
 
 def test_all_existing_micro_target_thresholds_are_unchanged() -> None:

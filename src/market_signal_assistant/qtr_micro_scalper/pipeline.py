@@ -895,11 +895,12 @@ class LiveShadowPipeline:
             )
         analysis, snapshot, score = prepared
         continuation_evidence: ContinuationEvidence | None = None
+        continuation_records: tuple[MicroProfitRecord, ...] = ()
         if self._micro_profit_experiment is not None:
             try:
                 continuation_evidence = ContinuationEvidence.from_analysis(analysis)
                 self._micro_evidence[event.symbol] = continuation_evidence
-                self._micro_profit_experiment.update_evidence(
+                continuation_records = self._micro_profit_experiment.update_evidence(
                     continuation_evidence
                 )
             except (OSError, RuntimeError, ValueError) as exc:
@@ -910,6 +911,11 @@ class LiveShadowPipeline:
         ):
             try:
                 self._protected_runner.update_evidence(continuation_evidence)
+                self._protected_runner.observe_micro_records(
+                    continuation_records,
+                    evidence=continuation_evidence,
+                    event=None,
+                )
             except (OSError, RuntimeError, ValueError) as exc:
                 self._record_protected_runner_error(exc)
         emitted.extend(

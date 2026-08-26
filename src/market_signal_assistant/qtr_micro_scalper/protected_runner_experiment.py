@@ -22,7 +22,6 @@ from market_signal_assistant.qtr_micro_scalper.micro_profit_experiment import (
     MicroProfitExperimentConfig,
     MicroProfitRecord,
     MicroTarget,
-    _continuation_exit,
     calculate_cost_breakdown,
 )
 from market_signal_assistant.qtr_micro_scalper.setup_context import ShadowDirection
@@ -452,7 +451,7 @@ class _ProtectedBranch:
 
 
 class ProtectedRunnerRuntime:
-    """Independent protected-Net branch spawned only after a target hit."""
+    """Net-floor observer whose non-floor terminal authority is CONTROL."""
 
     def __init__(
         self,
@@ -463,6 +462,7 @@ class ProtectedRunnerRuntime:
         self._config = config
         self._branches: dict[str, _ProtectedBranch] = {}
         self._branches_by_symbol: dict[str, set[str]] = {}
+        self._branches_by_source: dict[tuple[str, MicroTarget, str], str] = {}
         self._seen_branches: dict[str, None] = {}
         self._branches_created = 0
         self._branches_armed = 0
@@ -507,14 +507,21 @@ class ProtectedRunnerRuntime:
         records: Iterable[MicroProfitRecord],
         *,
         evidence: ContinuationEvidence | None,
-        event: PublicTradeEvent,
+        event: PublicTradeEvent | None,
     ) -> tuple[ProtectedRunnerRecord, ...]:
-        if not self.enabled or evidence is None:
+        if not self.enabled:
             return ()
         with self._lock:
             persisted: list[ProtectedRunnerRecord] = []
             for source in records:
+                if source.record_type is MicroExperimentRecordType.RUNNER_EXITED:
+                    mirrored = self._mirror_control_exit(source)
+                    if mirrored is not None:
+                        persisted.append(mirrored)
+                    continue
                 if source.record_type is not MicroExperimentRecordType.TARGET_REACHED:
+                    continue
+                if evidence is None or event is None:
                     continue
                 if source.entry_at is None or source.symbol != event.symbol:
                     continue
@@ -533,6 +540,7 @@ class ProtectedRunnerRuntime:
                 self._branches_by_symbol.setdefault(source.symbol, set()).add(
                     branch_id
                 )
+                self._branches_by_source[_source_key(source)] = branch_id
                 self._remember_branch(branch_id)
                 self._branches_created += 1
                 created = self._record(
@@ -570,27 +578,15 @@ class ProtectedRunnerRuntime:
                 costs = self._costs(branch, at=event.exchange_at, price=event.price)
                 branch.maximum_gross_r = max(branch.maximum_gross_r, gross_r)
                 branch.maximum_net_r = max(branch.maximum_net_r, costs.net_r)
-                reason: ProtectedRunnerExitReason | None = None
-                if gross_r <= -1.0:
-                    reason = ProtectedRunnerExitReason.STOP
-                elif (
-                    branch.maximum_gross_r - gross_r
-                    >= self._config.runner_trailing_r
-                ):
-                    reason = ProtectedRunnerExitReason.TRAILING_EXCURSION
-                elif branch.completed_bars >= self._config.maximum_safety_bars:
-                    reason = ProtectedRunnerExitReason.MAXIMUM_SAFETY_HORIZON
-                elif (
+                if (
                     branch.armed_at is not None
                     and costs.net_r <= self._config.protected_min_net_r
                 ):
-                    reason = ProtectedRunnerExitReason.NET_PROFIT_FLOOR
-                if reason is not None:
                     record = self._exit(
                         branch,
                         at=event.exchange_at,
                         price=event.price,
-                        reason=reason,
+                        reason=ProtectedRunnerExitReason.NET_PROFIT_FLOOR,
                     )
                     if self._journal.append(record):
                         persisted.append(record)
@@ -626,21 +622,44 @@ class ProtectedRunnerRuntime:
                 if branch is None:
                     continue
                 branch.evidence = evidence
-                source_reason = _continuation_exit(branch.source.direction, evidence)
-                if source_reason is None:
-                    continue
-                reason = ProtectedRunnerExitReason(source_reason.value)
-                record = self._exit(
-                    branch,
-                    at=branch.last_event_at,
-                    price=branch.current_price,
-                    reason=reason,
-                )
-                if self._journal.append(record):
-                    persisted.append(record)
-                self._remove_branch(branch)
-                self._branches_completed += 1
             return tuple(persisted)
+
+    def _mirror_control_exit(
+        self,
+        source: MicroProfitRecord,
+    ) -> ProtectedRunnerRecord | None:
+        branch_id = self._branches_by_source.get(_source_key(source))
+        branch = self._branches.get(branch_id) if branch_id is not None else None
+        if branch is None:
+            return None
+        branch.current_price = source.current_price
+        branch.last_event_at = source.recorded_at
+        branch.completed_bars = source.completed_bars
+        branch.maximum_gross_r = max(
+            branch.maximum_gross_r,
+            source.costs.gross_r,
+        )
+        branch.maximum_net_r = max(branch.maximum_net_r, source.costs.net_r)
+        record = self._record(
+            branch,
+            record_type=ProtectedRunnerRecordType.PROTECTED_RUNNER_EXITED,
+            at=source.recorded_at,
+            price=source.current_price,
+            stage=ProtectedRunnerStage.CLOSED,
+            outcome=ProtectedRunnerOutcome.COMPLETE,
+            exit_reason=source.runner_exit_reason,
+            actual_exit_price=source.current_price,
+            actual_gross_r=source.costs.gross_r,
+            actual_total_cost_r=source.costs.total_cost_r,
+            actual_net_r=source.costs.net_r,
+            estimated_net_r_before_exit=source.costs.net_r,
+            completed_bars=source.completed_bars,
+            wall_clock_seconds=source.wall_clock_seconds,
+        )
+        persisted = self._journal.append(record)
+        self._remove_branch(branch)
+        self._branches_completed += 1
+        return record if persisted else None
 
     def stop(self, *, at: datetime) -> tuple[ProtectedRunnerRecord, ...]:
         normalized = _utc(at)
@@ -823,6 +842,9 @@ class ProtectedRunnerRuntime:
         actual_total_cost_r: float | None = None,
         actual_net_r: float | None = None,
         floor_breach_amount_r: float | None = None,
+        estimated_net_r_before_exit: float | None = None,
+        completed_bars: int | None = None,
+        wall_clock_seconds: float | None = None,
     ) -> ProtectedRunnerRecord:
         source = branch.source
         entry_at = source.entry_at
@@ -851,7 +873,11 @@ class ProtectedRunnerRuntime:
             stage=stage,
             outcome=outcome,
             requested_net_floor_r=self._config.protected_min_net_r,
-            estimated_net_r_before_exit=costs.net_r,
+            estimated_net_r_before_exit=(
+                costs.net_r
+                if estimated_net_r_before_exit is None
+                else estimated_net_r_before_exit
+            ),
             current_price=price,
             actual_exit_price=actual_exit_price,
             actual_gross_r=actual_gross_r,
@@ -862,13 +888,20 @@ class ProtectedRunnerRuntime:
             net_r_at_floor_arm=branch.net_r_at_floor_arm,
             maximum_net_r_observed=max(branch.maximum_net_r, costs.net_r),
             maximum_excursion_after_target_r=branch.maximum_gross_r,
-            wall_clock_seconds=max(0.0, (at - entry_at).total_seconds()),
-            completed_bars=branch.completed_bars,
+            wall_clock_seconds=(
+                max(0.0, (at - entry_at).total_seconds())
+                if wall_clock_seconds is None
+                else wall_clock_seconds
+            ),
+            completed_bars=(
+                branch.completed_bars if completed_bars is None else completed_bars
+            ),
             exit_reason=exit_reason,
         )
 
     def _remove_branch(self, branch: _ProtectedBranch) -> None:
         self._branches.pop(branch.branch_id, None)
+        self._branches_by_source.pop(_source_key(branch.source), None)
         symbol_branches = self._branches_by_symbol.get(branch.source.symbol)
         if symbol_branches is None:
             return
@@ -1035,6 +1068,10 @@ def _branch_id(source: MicroProfitRecord) -> str:
         ).encode()
     ).hexdigest()[:24]
     return f"protected-{digest}"
+
+
+def _source_key(source: MicroProfitRecord) -> tuple[str, MicroTarget, str]:
+    return source.baseline_trade_id, source.target, source.variant_id
 
 
 def _gross_r(source: MicroProfitRecord, price: float) -> float:

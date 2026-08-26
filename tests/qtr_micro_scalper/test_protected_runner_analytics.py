@@ -7,6 +7,7 @@ import pytest
 from test_micro_profit_experiment import NOW, trade
 from test_protected_runner_experiment import (
     activate_protected,
+    mirror_control,
     protected_runtime,
     target_hit,
 )
@@ -35,6 +36,18 @@ def completed_pair(tmp_path: Path) -> tuple[Path, Path]:
     control.process_event(floor_event)
     protected.process_event(floor_event)
     control.process_event(trade(4, 99.4))
+    return control.journal.path, protected_journal.path
+
+
+def completed_non_floor_pair(tmp_path: Path) -> tuple[Path, Path]:
+    control, source, target_event = target_hit(tmp_path)
+    protected, protected_journal = protected_runtime(tmp_path)
+    activate_protected(protected, source, target_event)
+    peak = trade(3, 102.0)
+    control.process_event(peak)
+    protected.process_event(peak)
+    control_records = control.process_event(trade(4, 100.9))
+    mirror_control(protected, control_records)
     return control.journal.path, protected_journal.path
 
 
@@ -75,6 +88,52 @@ def test_analytics_reports_negative_rate_floor_and_profit_giveback(
     assert item.average_floor_breach_r > 0
     assert item.average_control_profit_giveback_r_estimated > 0
     assert item.average_protected_profit_giveback_r > 0
+
+
+def test_non_floor_terminal_has_zero_causal_divergence(tmp_path: Path) -> None:
+    control_path, protected_path = completed_non_floor_pair(tmp_path)
+
+    result = ProtectedRunnerAnalyticsEngine().analyze(
+        control_path,
+        protected_path,
+    )
+
+    assert result.overall.paired_n == 1
+    assert result.overall.non_floor_divergence_count == 0
+    assert result.overall.non_floor_max_abs_delta_r == 0.0
+    pair = result.pairs[0]
+    assert not pair.floor_exit
+    assert not pair.non_floor_divergence
+    assert pair.delta_net_r == 0.0
+
+
+def test_analytics_detects_legacy_non_floor_divergence(tmp_path: Path) -> None:
+    control_source, protected_source = completed_non_floor_pair(tmp_path / "source")
+    protected_record = next(
+        item
+        for item in iter_protected_runner_records(protected_source)
+        if item.actual_net_r is not None
+    )
+    assert protected_record.actual_net_r is not None
+    divergent_path = tmp_path / "divergent-protected.jsonl"
+    divergent_path.write_text(
+        serialize_protected_runner_record(
+            replace(
+                protected_record,
+                actual_net_r=protected_record.actual_net_r + 0.25,
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = ProtectedRunnerAnalyticsEngine().analyze(
+        control_source,
+        divergent_path,
+    )
+
+    assert result.overall.non_floor_divergence_count == 1
+    assert result.overall.non_floor_max_abs_delta_r == pytest.approx(0.25)
 
 
 def test_breakdowns_cover_target_direction_symbol_and_score(tmp_path: Path) -> None:
