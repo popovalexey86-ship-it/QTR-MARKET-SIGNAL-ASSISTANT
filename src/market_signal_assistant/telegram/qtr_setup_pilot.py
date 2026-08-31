@@ -66,6 +66,19 @@ class QtrSetupPilotNotifier:
                 plan = await asyncio.to_thread(
                     self._notifications.prepare, candidates, now
                 )
+                metrics = self._notifications.metrics
+                _LOGGER.info(
+                    "QTR Scanner Telegram filter: candidates_seen=%d, "
+                    "telegram_quality_passed=%d, suppressed_status=%d, "
+                    "suppressed_quality=%d, suppressed_distance=%d, "
+                    "suppressed_duplicate=%d",
+                    metrics.candidates_seen,
+                    metrics.telegram_quality_passed,
+                    metrics.suppressed_status,
+                    metrics.suppressed_quality,
+                    metrics.suppressed_distance,
+                    metrics.suppressed_duplicate,
+                )
                 selected = select_qtr_setup_decisions(plan)
                 sent_ids: set[str] = set()
                 try:
@@ -163,15 +176,15 @@ def select_qtr_setup_decisions(
     plan: QtrSetupNotificationPlan,
 ) -> tuple[QtrSetupDecision, ...]:
     selected = [
-        item for item in plan.decisions if item.should_notify and item.event is not None
+        item
+        for item in plan.decisions
+        if item.should_notify
+        and item.event is not None
+        and item.event.state is SetupState.READY_TO_CONSIDER
     ]
     selected.sort(
         key=lambda item: (
-            _priority(
-                item.event.state
-                if item.event is not None
-                else SetupState.FORMING
-            ),
+            -(item.event.quality_score if item.event is not None else 0.0),
             -item.candidate.result.confidence,
             item.candidate.result.symbol,
         )
@@ -180,33 +193,38 @@ def select_qtr_setup_decisions(
 
 
 def format_qtr_setup_event(event: QtrSetupEvent) -> str:
+    if event.state is not SetupState.READY_TO_CONSIDER:
+        raise ValueError("Telegram formatter accepts only elite READY candidates.")
     result = event.candidate.result
-    title = _title(event.state)
+    direction, marker = _direction_signal(event.direction)
     lines = [
-        title,
+        "🔥 QTR A+ CANDIDATE",
         "",
-        result.symbol,
-        f"Направление: {_direction_ru(event.direction)}",
-        f"Конструкция: {_type_ru(event.setup_type)}",
-        f"Статус: {_state_ru(event.state)}",
+        f"{result.symbol} — {direction} {marker}",
+        f"Setup: {_type_ru(event.setup_type)}",
+        f"Quality: {event.quality_score:.0f}/100",
     ]
     if result.trigger_level is not None:
-        lines.append(f"Ключевой уровень: {_number(result.trigger_level)}")
+        lines.extend(("", f"Уровень: {_number(result.trigger_level)}"))
     if result.current_price is not None:
-        lines.append(f"Текущая цена: {_number(result.current_price)}")
+        lines.append(f"Цена: {_number(result.current_price)}")
     if result.distance_to_trigger_atr is not None:
         lines.append(
-            f"Расстояние от уровня: {_number(result.distance_to_trigger_atr)} ATR"
+            f"Distance: {_number(abs(result.distance_to_trigger_atr))} ATR"
         )
-    lines.extend(("", "Подтверждения:"))
+    lines.append("")
     confirmations = event.visible_confirmations[:6]
-    lines.extend(f"• {item}" for item in confirmations)
-    if not confirmations:
-        lines.append("• Явных подтверждений пока недостаточно")
-    lines.extend(("", _action(event)))
-    if event.warnings:
-        lines.extend(("", f"Риск: {event.warnings[0]}"))
-    lines.extend(("", "Информационный анализ, не торговая рекомендация."))
+    lines.extend(f"✅ {_confirmation_short(item)}" for item in confirmations)
+    lines.extend(
+        (
+            "",
+            "👤 Требуется ручная проверка:",
+            "уровни / объём / стоп / риск.",
+            "",
+            "Quality — внутренний рейтинг QTR,",
+            "НЕ вероятность выигрыша.",
+        )
+    )
     text = "\n".join(lines)
     forbidden = ("WATCHING", "FORMING", "CONFIRMING", "READY", "FALSE_BREAKOUT")
     if any(item in text for item in forbidden):
@@ -214,33 +232,11 @@ def format_qtr_setup_event(event: QtrSetupEvent) -> str:
     return text
 
 
-def _priority(state: SetupState) -> int:
+def _direction_signal(direction: SetupDirection) -> tuple[str, str]:
     return {
-        SetupState.READY_TO_CONSIDER: 0,
-        SetupState.CANCELLED: 1,
-        SetupState.LATE: 2,
-        SetupState.CONFIRMING: 3,
-        SetupState.FORMING: 4,
-        SetupState.WATCHING: 5,
-    }[state]
-
-
-def _title(state: SetupState) -> str:
-    return {
-        SetupState.FORMING: "🟡 QTR SCANNER — ФОРМИРУЕТСЯ",
-        SetupState.CONFIRMING: "🟠 QTR SCANNER — ПОДТВЕРЖДАЕТСЯ",
-        SetupState.READY_TO_CONSIDER: "🟢 QTR SCANNER — ГОТОВО К РАССМОТРЕНИЮ",
-        SetupState.LATE: "⛔ QTR SCANNER — ПОЗДНО",
-        SetupState.CANCELLED: "⚫ QTR SCANNER — ОТМЕНЕНО",
-        SetupState.WATCHING: "⚪ QTR SCANNER — НАБЛЮДАЕМ",
-    }[state]
-
-
-def _direction_ru(direction: SetupDirection) -> str:
-    return {
-        SetupDirection.UP: "ВВЕРХ",
-        SetupDirection.DOWN: "ВНИЗ",
-        SetupDirection.NEUTRAL: "НЕЙТРАЛЬНО",
+        SetupDirection.UP: ("LONG", "🟢"),
+        SetupDirection.DOWN: ("SHORT", "🔴"),
+        SetupDirection.NEUTRAL: ("WATCH", "⚪"),
     }[direction]
 
 
@@ -257,28 +253,16 @@ def _type_ru(setup_type: SetupType) -> str:
     }[setup_type]
 
 
-def _state_ru(state: SetupState) -> str:
+def _confirmation_short(value: str) -> str:
     return {
-        SetupState.WATCHING: "НАБЛЮДАЕМ",
-        SetupState.FORMING: "ФОРМИРУЕТСЯ",
-        SetupState.CONFIRMING: "ПОДТВЕРЖДАЕТСЯ",
-        SetupState.READY_TO_CONSIDER: "ГОТОВО К РАССМОТРЕНИЮ",
-        SetupState.LATE: "ПОЗДНО",
-        SetupState.CANCELLED: "ОТМЕНЕНО",
-    }[state]
-
-
-def _action(event: QtrSetupEvent) -> str:
-    return {
-        SetupState.FORMING: "Действие: наблюдать за развитием конструкции.",
-        SetupState.CONFIRMING: "Действие: дождаться полного подтверждения условий.",
-        SetupState.READY_TO_CONSIDER: (
-            "Следующий этап: определить точку входа, стоп и риск."
-        ),
-        SetupState.LATE: "Действие: не догонять движение; ждать новую конструкцию.",
-        SetupState.CANCELLED: "Действие: исключить эту конструкцию из рассмотрения.",
-        SetupState.WATCHING: "Действие: продолжать наблюдение.",
-    }[event.state]
+        "Структура подтверждена": "Структура",
+        "Цена удерживает нужную сторону уровня": "Нужная сторона уровня",
+        "Ретест уровня удержан": "Ретест удержан",
+        "Объём подтверждает движение": "Объём",
+        "Волатильность подтверждает импульс": "Волатильность",
+        "Ликвидность и спред допустимы": "Ликвидность / spread",
+        "Конструкция остаётся свежей": "Свежий setup",
+    }.get(value, value)
 
 
 def _number(value: float) -> str:

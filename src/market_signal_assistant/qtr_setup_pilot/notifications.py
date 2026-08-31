@@ -3,9 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -21,23 +22,50 @@ from market_signal_assistant.setup_engine.models import (
 DEFAULT_QTR_SETUP_NOTIFICATION_STATE_PATH = (
     Path(__file__).resolve().parents[3] / "data" / "qtr_setup_notifications.json"
 )
-QTR_SETUP_NOTIFICATION_COOLDOWN = timedelta(hours=6)
 STATE_VERSION = 1
+QTR_TELEGRAM_QUALITY_IMPROVEMENT = 10.0
+QTR_SETUP_NOTIFICATION_STATE_CAPACITY = 10_000
 _LOGGER = logging.getLogger(__name__)
 
 
 class QtrNotificationReason(StrEnum):
     NEW_EPISODE = "new_episode"
-    STAGE_ADVANCED = "stage_advanced"
     DIRECTION_CHANGED = "direction_changed"
     TYPE_CHANGED = "type_changed"
-    BECAME_LATE = "became_late"
-    CANCELLED = "cancelled"
-    COOLDOWN_EXPIRED = "cooldown_expired"
+    QUALITY_IMPROVED = "quality_improved"
     DUPLICATE = "duplicate"
-    NOT_USER_FACING = "not_user_facing"
+    STATUS_SUPPRESSED = "status_suppressed"
+    QUALITY_BELOW_THRESHOLD = "quality_below_threshold"
+    DISTANCE_EXCEEDED = "distance_exceeded"
     TECHNICAL_DATA_UNAVAILABLE = "technical_data_unavailable"
-    CANCELLATION_ALREADY_SENT = "cancellation_already_sent"
+
+
+@dataclass(frozen=True, slots=True)
+class QtrTelegramFilterPolicy:
+    minimum_quality: float = 90.0
+    maximum_distance_atr: float = 1.2
+
+    def __post_init__(self) -> None:
+        if (
+            not math.isfinite(self.minimum_quality)
+            or not 0 <= self.minimum_quality <= 100
+        ):
+            raise ValueError("QTR Telegram minimum quality must be within 0..100.")
+        if (
+            not math.isfinite(self.maximum_distance_atr)
+            or self.maximum_distance_atr <= 0
+        ):
+            raise ValueError("QTR Telegram maximum ATR distance must be positive.")
+
+
+@dataclass(frozen=True, slots=True)
+class QtrTelegramFilterMetrics:
+    candidates_seen: int
+    telegram_quality_passed: int
+    suppressed_status: int
+    suppressed_quality: int
+    suppressed_distance: int
+    suppressed_duplicate: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +79,7 @@ class QtrSetupEvent:
     retest_held: bool
     visible_confirmations: tuple[str, ...]
     warnings: tuple[str, ...]
+    quality_score: float
     semantic_fingerprint: str
 
     @property
@@ -70,6 +99,7 @@ class QtrSetupNotificationRecord:
     last_sent_at: datetime
     send_count: int
     cancellation_sent: bool
+    last_quality_score: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,8 +186,30 @@ class JsonQtrSetupNotificationStore:
 
 
 class QtrSetupNotificationService:
-    def __init__(self, store: JsonQtrSetupNotificationStore) -> None:
+    def __init__(
+        self,
+        store: JsonQtrSetupNotificationStore,
+        policy: QtrTelegramFilterPolicy | None = None,
+    ) -> None:
         self._store = store
+        self._policy = policy or QtrTelegramFilterPolicy()
+        self._candidates_seen = 0
+        self._telegram_quality_passed = 0
+        self._suppressed_status = 0
+        self._suppressed_quality = 0
+        self._suppressed_distance = 0
+        self._suppressed_duplicate = 0
+
+    @property
+    def metrics(self) -> QtrTelegramFilterMetrics:
+        return QtrTelegramFilterMetrics(
+            candidates_seen=self._candidates_seen,
+            telegram_quality_passed=self._telegram_quality_passed,
+            suppressed_status=self._suppressed_status,
+            suppressed_quality=self._suppressed_quality,
+            suppressed_distance=self._suppressed_distance,
+            suppressed_duplicate=self._suppressed_duplicate,
+        )
 
     def prepare(
         self,
@@ -167,8 +219,21 @@ class QtrSetupNotificationService:
         now = _utc(observed_at)
         state = self._store.load()
         decisions = tuple(
-            _decision(candidate, state.records, now) for candidate in candidates
+            _decision(candidate, state.records, self._policy)
+            for candidate in candidates
         )
+        self._candidates_seen += len(decisions)
+        for decision in decisions:
+            if decision.should_notify:
+                self._telegram_quality_passed += 1
+            elif decision.reason is QtrNotificationReason.STATUS_SUPPRESSED:
+                self._suppressed_status += 1
+            elif decision.reason is QtrNotificationReason.DISTANCE_EXCEEDED:
+                self._suppressed_distance += 1
+            elif decision.reason is QtrNotificationReason.DUPLICATE:
+                self._suppressed_duplicate += 1
+            else:
+                self._suppressed_quality += 1
         return QtrSetupNotificationPlan(now, decisions, dict(state.records))
 
     def commit(
@@ -207,14 +272,30 @@ class QtrSetupNotificationService:
                     event.state is SetupState.CANCELLED
                     or bool(previous and previous.cancellation_sent)
                 ),
+                last_quality_score=event.quality_score,
             )
+        if len(records) > QTR_SETUP_NOTIFICATION_STATE_CAPACITY:
+            newest = sorted(
+                records.items(),
+                key=lambda item: item[1].last_sent_at,
+                reverse=True,
+            )[:QTR_SETUP_NOTIFICATION_STATE_CAPACITY]
+            records = dict(newest)
         self._store.save(QtrSetupNotificationState(plan.observed_at, records))
 
 
-def event_from_candidate(candidate: QtrSetupCandidate) -> QtrSetupEvent:
+def event_from_candidate(
+    candidate: QtrSetupCandidate,
+    *,
+    maximum_distance_atr: float = 1.2,
+) -> QtrSetupEvent:
     result = candidate.result
     confirmations = _visible_confirmations(candidate)
     warnings = _visible_warnings(candidate)
+    quality_score = qtr_telegram_quality_score(
+        candidate,
+        maximum_distance_atr=maximum_distance_atr,
+    )
     fingerprint = _fingerprint(
         result.symbol,
         result.direction,
@@ -236,6 +317,7 @@ def event_from_candidate(candidate: QtrSetupCandidate) -> QtrSetupEvent:
         result.retest_held,
         confirmations,
         warnings,
+        quality_score,
         fingerprint,
     )
 
@@ -243,49 +325,58 @@ def event_from_candidate(candidate: QtrSetupCandidate) -> QtrSetupEvent:
 def _decision(
     candidate: QtrSetupCandidate,
     records: Mapping[str, QtrSetupNotificationRecord],
-    now: datetime,
+    policy: QtrTelegramFilterPolicy,
 ) -> QtrSetupDecision:
     result = candidate.result
     if result.technical_gap or result.missing_data:
         return QtrSetupDecision(
             None, candidate, False, QtrNotificationReason.TECHNICAL_DATA_UNAVAILABLE
         )
-    event = event_from_candidate(candidate)
+    event = event_from_candidate(
+        candidate,
+        maximum_distance_atr=policy.maximum_distance_atr,
+    )
     previous = records.get(event.record_key)
-    if event.state is SetupState.WATCHING or event.setup_type is SetupType.NO_TRADE:
-        if previous is None or previous.last_state not in _ACTIVE_STATES:
-            return QtrSetupDecision(
-                None, candidate, False, QtrNotificationReason.NOT_USER_FACING
-            )
-        if previous.cancellation_sent:
-            return QtrSetupDecision(
-                None,
-                candidate,
-                False,
-                QtrNotificationReason.CANCELLATION_ALREADY_SENT,
-            )
-        event = _cancelled_event(candidate, previous)
-    if event.state not in _SENDABLE_STATES:
-        return QtrSetupDecision(
-            None, candidate, False, QtrNotificationReason.NOT_USER_FACING
-        )
-    if previous is None:
-        if event.state is SetupState.CANCELLED:
-            return QtrSetupDecision(
-                event,
-                candidate,
-                False,
-                QtrNotificationReason.NOT_USER_FACING,
-            )
-        return QtrSetupDecision(
-            event, candidate, True, QtrNotificationReason.NEW_EPISODE
-        )
-    if event.state is SetupState.CANCELLED and previous.cancellation_sent:
+    if (
+        event.state is not SetupState.READY_TO_CONSIDER
+        or event.trade_eligibility is not TradeEligibility.READY_TO_CONSIDER
+        or event.direction is SetupDirection.NEUTRAL
+        or event.setup_type is SetupType.NO_TRADE
+    ):
         return QtrSetupDecision(
             event,
             candidate,
             False,
-            QtrNotificationReason.CANCELLATION_ALREADY_SENT,
+            QtrNotificationReason.STATUS_SUPPRESSED,
+        )
+    distance = result.distance_to_trigger_atr
+    if distance is None or abs(distance) > policy.maximum_distance_atr:
+        return QtrSetupDecision(
+            event,
+            candidate,
+            False,
+            QtrNotificationReason.DISTANCE_EXCEEDED,
+        )
+    retest_missing = event.setup_type is SetupType.RETEST and not event.retest_held
+    if (
+        not result.structure_confirmation
+        or candidate.source_input.correct_side_of_level is not True
+        or retest_missing
+        or not result.liquidity_ok
+        or not result.spread_ok
+        or not result.freshness_confirmation
+        or result.current_breakout_failure
+        or event.quality_score < policy.minimum_quality
+    ):
+        return QtrSetupDecision(
+            event,
+            candidate,
+            False,
+            QtrNotificationReason.QUALITY_BELOW_THRESHOLD,
+        )
+    if previous is None:
+        return QtrSetupDecision(
+            event, candidate, True, QtrNotificationReason.NEW_EPISODE
         )
     if event.direction is not previous.last_direction:
         return QtrSetupDecision(
@@ -295,74 +386,54 @@ def _decision(
         return QtrSetupDecision(
             event, candidate, True, QtrNotificationReason.TYPE_CHANGED
         )
-    if _stage_rank(event.state) > _stage_rank(previous.last_state):
-        reason = (
-            QtrNotificationReason.BECAME_LATE
-            if event.state is SetupState.LATE
-            else QtrNotificationReason.CANCELLED
-            if event.state is SetupState.CANCELLED
-            else QtrNotificationReason.STAGE_ADVANCED
-        )
-        return QtrSetupDecision(event, candidate, True, reason)
-    if event.semantic_fingerprint == previous.last_semantic_fingerprint:
-        if now - previous.last_sent_at >= QTR_SETUP_NOTIFICATION_COOLDOWN:
-            return QtrSetupDecision(
-                event, candidate, True, QtrNotificationReason.COOLDOWN_EXPIRED
-            )
+    previous_quality = previous.last_quality_score
+    if (
+        previous_quality is not None
+        and event.quality_score
+        >= previous_quality + QTR_TELEGRAM_QUALITY_IMPROVEMENT
+    ):
         return QtrSetupDecision(
-            event, candidate, False, QtrNotificationReason.DUPLICATE
+            event,
+            candidate,
+            True,
+            QtrNotificationReason.QUALITY_IMPROVED,
         )
-    return QtrSetupDecision(event, candidate, True, QtrNotificationReason.TYPE_CHANGED)
-
-
-_ACTIVE_STATES = frozenset(
-    (SetupState.FORMING, SetupState.CONFIRMING, SetupState.READY_TO_CONSIDER)
-)
-_SENDABLE_STATES = frozenset(
-    (*_ACTIVE_STATES, SetupState.LATE, SetupState.CANCELLED)
-)
-
-
-def _stage_rank(state: SetupState) -> int:
-    return {
-        SetupState.WATCHING: 0,
-        SetupState.FORMING: 1,
-        SetupState.CONFIRMING: 2,
-        SetupState.READY_TO_CONSIDER: 3,
-        SetupState.LATE: 4,
-        SetupState.CANCELLED: 4,
-    }[state]
-
-
-def _cancelled_event(
-    candidate: QtrSetupCandidate,
-    previous: QtrSetupNotificationRecord,
-) -> QtrSetupEvent:
-    confirmations = _visible_confirmations(candidate)
-    warnings = ("Конструкция больше не подтверждается.",)
-    fingerprint = _fingerprint(
-        candidate.result.symbol,
-        previous.last_direction,
-        previous.last_setup_type,
-        SetupState.CANCELLED,
-        TradeEligibility.CANCELLED,
-        candidate.result.current_breakout_failure,
-        candidate.result.retest_held,
-        confirmations,
-        warnings,
-    )
-    return QtrSetupEvent(
+    return QtrSetupDecision(
+        event,
         candidate,
-        previous.last_direction,
-        previous.last_setup_type,
-        SetupState.CANCELLED,
-        TradeEligibility.CANCELLED,
-        candidate.result.current_breakout_failure,
-        candidate.result.retest_held,
-        confirmations,
-        warnings,
-        fingerprint,
+        False,
+        QtrNotificationReason.DUPLICATE,
     )
+
+
+def qtr_telegram_quality_score(
+    candidate: QtrSetupCandidate,
+    *,
+    maximum_distance_atr: float = 1.2,
+) -> float:
+    """Return a deterministic Telegram rank, never a win probability."""
+    result = candidate.result
+    source = candidate.source_input
+    setup_confirmation = (
+        result.retest_held
+        if result.setup_type is SetupType.RETEST
+        else result.structure_confirmation
+    )
+    distance_ok = (
+        result.distance_to_trigger_atr is not None
+        and abs(result.distance_to_trigger_atr) <= maximum_distance_atr
+    )
+    components = (
+        (result.structure_confirmation, 20.0),
+        (source.correct_side_of_level is True, 15.0),
+        (setup_confirmation, 15.0),
+        (result.volume_confirmation, 15.0),
+        (result.volatility_confirmation, 10.0),
+        (result.liquidity_ok and result.spread_ok, 15.0),
+        (result.freshness_confirmation, 5.0),
+        (distance_ok, 5.0),
+    )
+    return sum(weight for enabled, weight in components if enabled)
 
 
 def _visible_confirmations(candidate: QtrSetupCandidate) -> tuple[str, ...]:
@@ -435,6 +506,7 @@ def _record_to_json(record: QtrSetupNotificationRecord) -> dict[str, Any]:
         "last_sent_at": record.last_sent_at.isoformat(),
         "send_count": record.send_count,
         "cancellation_sent": record.cancellation_sent,
+        "last_quality_score": record.last_quality_score,
     }
 
 
@@ -459,6 +531,11 @@ def _state_from_json(raw: Any) -> QtrSetupNotificationState:
             last_sent_at=_parse_time(value["last_sent_at"]),
             send_count=int(value["send_count"]),
             cancellation_sent=bool(value["cancellation_sent"]),
+            last_quality_score=(
+                float(value["last_quality_score"])
+                if value.get("last_quality_score") is not None
+                else None
+            ),
         )
     updated = raw.get("updated_at")
     return QtrSetupNotificationState(

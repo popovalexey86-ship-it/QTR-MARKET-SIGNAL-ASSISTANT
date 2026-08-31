@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from urllib.parse import urlsplit
@@ -229,10 +230,43 @@ class QtrSetupTelegramSettings:
     """Opt-in Telegram delivery for Setup Engine results."""
 
     enabled: bool = False
+    minimum_quality: float = 90.0
+    maximum_distance_atr: float = 1.2
+
+    def __post_init__(self) -> None:
+        if (
+            not math.isfinite(self.minimum_quality)
+            or not 0 <= self.minimum_quality <= 100
+        ):
+            raise ValueError(
+                "QTR_SCANNER_TELEGRAM_MIN_QUALITY должна быть от 0 до 100."
+            )
+        if (
+            not math.isfinite(self.maximum_distance_atr)
+            or self.maximum_distance_atr <= 0
+        ):
+            raise ValueError(
+                "QTR_SCANNER_TELEGRAM_MAX_DISTANCE_ATR должна быть положительной."
+            )
 
     @classmethod
     def from_environment(cls) -> QtrSetupTelegramSettings:
-        return cls(enabled=_environment_bool("QTR_SETUP_TELEGRAM_ENABLED"))
+        try:
+            minimum_quality = float(
+                os.getenv("QTR_SCANNER_TELEGRAM_MIN_QUALITY", "90").strip()
+            )
+            maximum_distance_atr = float(
+                os.getenv("QTR_SCANNER_TELEGRAM_MAX_DISTANCE_ATR", "1.2").strip()
+            )
+        except ValueError:
+            raise ValueError(
+                "Настройки качества QTR Scanner Telegram должны быть числами."
+            ) from None
+        return cls(
+            enabled=_environment_bool("QTR_SETUP_TELEGRAM_ENABLED"),
+            minimum_quality=minimum_quality,
+            maximum_distance_atr=maximum_distance_atr,
+        )
 
 
 @dataclass(frozen=True, slots=True)

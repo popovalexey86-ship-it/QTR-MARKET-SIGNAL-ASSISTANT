@@ -235,6 +235,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         from market_signal_assistant.qtr_setup_pilot.notifications import (
             JsonQtrSetupNotificationStore,
             QtrSetupNotificationService,
+            QtrTelegramFilterPolicy,
         )
         from market_signal_assistant.qtr_setup_pilot.service import QtrSetupScanService
 
@@ -245,7 +246,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         qtr_setup_notifier = QtrSetupPilotNotifier(
             scanner=QtrSetupScanService(v2_service),
             notification_service=QtrSetupNotificationService(
-                JsonQtrSetupNotificationStore()
+                JsonQtrSetupNotificationStore(),
+                QtrTelegramFilterPolicy(
+                    minimum_quality=qtr_setup_settings.minimum_quality,
+                    maximum_distance_atr=qtr_setup_settings.maximum_distance_atr,
+                ),
             ),
             audit_store=JsonlQtrSetupTelegramAuditStore(),
             allowed_chat_ids=telegram_settings.allowed_chat_ids,
