@@ -21,6 +21,17 @@ from market_signal_assistant.qtr_micro_scalper.decision_journal import (
     recover_decision_journal,
     serialize_decision_record,
 )
+from market_signal_assistant.qtr_micro_scalper.entry_telemetry import (
+    DEFAULT_ENTRY_FEATURE_JOURNAL_PATH,
+    ENTRY_FEATURE_SCHEMA_VERSION,
+    EntryFeatureJournal,
+    EntryFeatureJournalMetrics,
+    EntryFeatureSnapshot,
+    EntryFeatureTelemetry,
+    EntryFeatureTelemetrySettings,
+    build_entry_feature_snapshot,
+    serialize_entry_feature_snapshot,
+)
 from market_signal_assistant.qtr_micro_scalper.holding_experiment import (
     DEFAULT_HOLDING_EXPERIMENT_JOURNAL_PATH,
     HoldingExperimentActivation,
@@ -233,6 +244,15 @@ __all__ = (
     "deserialize_decision_record",
     "recover_decision_journal",
     "serialize_decision_record",
+    "DEFAULT_ENTRY_FEATURE_JOURNAL_PATH",
+    "ENTRY_FEATURE_SCHEMA_VERSION",
+    "EntryFeatureJournal",
+    "EntryFeatureJournalMetrics",
+    "EntryFeatureSnapshot",
+    "EntryFeatureTelemetry",
+    "EntryFeatureTelemetrySettings",
+    "build_entry_feature_snapshot",
+    "serialize_entry_feature_snapshot",
     "InPlayTargetBridge",
     "InPlayTargetBridgeConfig",
     "ScalperTarget",

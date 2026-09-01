@@ -182,6 +182,7 @@ def test_upward_sweep_requires_levels_move_flow_and_depletion() -> None:
     assert result.swept_notional == pytest.approx(3_000.6)
     assert result.price_displacement_bps == pytest.approx(3.0)
     assert result.depth_depletion is not None and result.depth_depletion > 0
+    assert result.delta_acceleration == pytest.approx(1.0)
 
 
 def test_downward_sweep_is_symmetric() -> None:

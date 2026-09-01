@@ -57,6 +57,12 @@ class PriceContext:
     health_reasons: tuple[str, ...] = ()
     confirmations: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
+    verified_setup_state: str | None = None
+    verified_setup_confidence: float | None = None
+    volume_confirmation: bool | None = None
+    volatility_confirmation: bool | None = None
+    liquidity_confirmation: bool | None = None
+    source_observed_at: datetime | None = None
 
     def __post_init__(self) -> None:
         symbol = self.symbol.strip().upper()
@@ -64,6 +70,12 @@ class PriceContext:
             raise ValueError("Price context symbol cannot be empty.")
         object.__setattr__(self, "symbol", symbol)
         object.__setattr__(self, "assessed_at", _utc(self.assessed_at))
+        if self.source_observed_at is not None:
+            object.__setattr__(
+                self,
+                "source_observed_at",
+                _utc(self.source_observed_at),
+            )
         if not isinstance(self.direction, ShadowDirection):
             raise ValueError("Price context direction is invalid.")
         for name, value in (
@@ -93,6 +105,10 @@ class PriceContext:
             raise ValueError("Ready price context cannot contain health reasons.")
         if not self.ready and not health:
             raise ValueError("Not-ready price context must explain its state.")
+        if self.verified_setup_confidence is not None:
+            confidence = self.verified_setup_confidence
+            if not math.isfinite(confidence) or not 0.0 <= confidence <= 100.0:
+                raise ValueError("Verified setup confidence must be within 0..100.")
 
     @property
     def trigger_progress_atr(self) -> float | None:

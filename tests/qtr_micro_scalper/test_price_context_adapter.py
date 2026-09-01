@@ -74,6 +74,12 @@ def test_valid_long_price_context(tmp_path: Path) -> None:
     assert result.invalidation_price == 59_800.0
     assert result.local_range_low == 59_500.0
     assert result.local_range_high == 60_000.0
+    assert result.verified_setup_state == "CONFIRMING"
+    assert result.verified_setup_confidence == 75.0
+    assert result.volume_confirmation is True
+    assert result.volatility_confirmation is True
+    assert result.liquidity_confirmation is True
+    assert result.source_observed_at == NOW
 
 
 def test_valid_short_price_context(tmp_path: Path) -> None:

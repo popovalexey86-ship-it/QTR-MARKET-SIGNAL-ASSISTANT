@@ -136,6 +136,7 @@ class SweepDetection:
     price_displacement_bps: float | None
     depth_depletion: float | None
     reasons: tuple[str, ...]
+    delta_acceleration: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -359,6 +360,7 @@ def detect_sweep(
         price_displacement_bps=displacement,
         depth_depletion=depletion,
         reasons=tuple(reasons),
+        delta_acceleration=acceleration,
     )
 
 

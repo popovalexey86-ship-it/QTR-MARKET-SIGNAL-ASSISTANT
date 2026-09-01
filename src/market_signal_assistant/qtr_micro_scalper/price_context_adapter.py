@@ -258,6 +258,12 @@ class VerifiedPriceContextAdapter:
             local_range_high=source.local_range_high,
             confirmations=source.confirmations,
             warnings=source.warnings,
+            verified_setup_state=source.setup_state,
+            verified_setup_confidence=source.setup_confidence,
+            volume_confirmation=source.volume_confirmation,
+            volatility_confirmation=source.volatility_confirmation,
+            liquidity_confirmation=source.liquidity_ok,
+            source_observed_at=source.observed_at,
         )
         return context if context.structure_valid else None
 

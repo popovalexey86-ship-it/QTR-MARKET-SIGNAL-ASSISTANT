@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import warnings
 from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -20,6 +21,9 @@ from market_signal_assistant.qtr_micro_scalper.decision_journal import (
     ShadowDecisionEventType,
     ShadowDecisionJournal,
     ShadowDecisionRecord,
+)
+from market_signal_assistant.qtr_micro_scalper.entry_telemetry import (
+    EntryFeatureTelemetry,
 )
 from market_signal_assistant.qtr_micro_scalper.inplay_bridge import (
     InPlayTargetBridge,
@@ -166,6 +170,7 @@ class ShadowOrchestrator:
         runtime: ShadowRuntime | None = None,
         journal: ShadowTradeJournal | None = None,
         decision_journal: ShadowDecisionJournal | None = None,
+        entry_telemetry: EntryFeatureTelemetry | None = None,
         journal_path: Path = DEFAULT_SHADOW_JOURNAL_PATH,
         event_retention_capacity: int = 10_000,
     ) -> None:
@@ -181,6 +186,8 @@ class ShadowOrchestrator:
         )
         self._journal = journal or ShadowTradeJournal(journal_path)
         self._decision_journal = decision_journal
+        self._entry_telemetry = entry_telemetry
+        self._entry_telemetry_warning: str | None = None
         self._scores_by_trade: dict[str, ScalperScore] = {}
         self._context_by_trade: dict[str, tuple[str, str]] = {}
         self._event_retention_capacity = event_retention_capacity
@@ -198,6 +205,10 @@ class ShadowOrchestrator:
         self._errors = 0
         self._events_emitted = 0
         self._lock = Lock()
+
+    @property
+    def entry_telemetry_warning(self) -> str | None:
+        return self._entry_telemetry_warning
 
     def discover_target(
         self,
@@ -453,6 +464,16 @@ class ShadowOrchestrator:
                 )
             runtime_score = runtime_decision.score or score
             trade = runtime_decision.trade
+            if self._entry_telemetry is not None:
+                try:
+                    self._entry_telemetry.capture(analysis, runtime_score, trade)
+                except (OSError, TypeError, ValueError) as exc:
+                    message = (
+                        "Entry feature telemetry write failed; shadow trade "
+                        f"continues: {type(exc).__name__}: {exc}"
+                    )
+                    self._entry_telemetry_warning = message
+                    warnings.warn(message, RuntimeWarning, stacklevel=2)
             entry_event = self._emit(
                 ShadowOrchestratorEventType.ENTRY_CREATED,
                 occurred_at=trade.planned_at,

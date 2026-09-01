@@ -19,6 +19,11 @@ from market_signal_assistant.qtr_micro_scalper.dynamic_targets import (
     DynamicTargetSettings,
     DynamicVerifiedTargetManager,
 )
+from market_signal_assistant.qtr_micro_scalper.entry_telemetry import (
+    EntryFeatureJournal,
+    EntryFeatureTelemetry,
+    EntryFeatureTelemetrySettings,
+)
 from market_signal_assistant.qtr_micro_scalper.holding_experiment import (
     DEFAULT_HOLDING_EXPERIMENT_JOURNAL_PATH,
     HoldingExperimentConfig,
@@ -313,6 +318,7 @@ def build_shadow_service_from_environment(
     protected_runner_settings = ProtectedRunnerConfig.from_environment(
         micro_profit_settings
     )
+    entry_telemetry_settings = EntryFeatureTelemetrySettings.from_environment()
     symbols = () if dynamic_settings.enabled else _environment_symbols()
     journal_path = Path(
         os.getenv("QTR_SCALPER_V2_JOURNAL_PATH", str(DEFAULT_SHADOW_JOURNAL_PATH))
@@ -328,9 +334,15 @@ def build_shadow_service_from_environment(
         decision_journal_path,
         retain_records=False,
     )
+    entry_telemetry = None
+    if entry_telemetry_settings.enabled:
+        entry_telemetry = EntryFeatureTelemetry(
+            EntryFeatureJournal(entry_telemetry_settings.journal_path)
+        )
     orchestrator = ShadowOrchestrator(
         journal=resolved_journal,
         decision_journal=resolved_decisions,
+        entry_telemetry=entry_telemetry,
     )
     verified_provider = JsonlVerifiedSetupProvider(_setup_audit_path())
     price_context = VerifiedPriceContextAdapter(verified_provider)

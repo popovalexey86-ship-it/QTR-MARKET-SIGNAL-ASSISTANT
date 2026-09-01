@@ -198,3 +198,19 @@ restart never fabricates the missing market interval; recovered active branches
 are closed as `INTERRUPTED/INCOMPLETE` and excluded from paired PnL analytics.
 Keep the floor at exactly `0.0R` through the pre-registered 3/20/50-pair research
 checkpoints. This Shadow-only experiment has no execution or order authority.
+
+## Entry Feature Telemetry (Shadow only)
+
+Entry-time feature capture is independently opt-in and disabled by default:
+
+```text
+QTR_SCALPER_V2_ENTRY_TELEMETRY_ENABLED=false
+QTR_SCALPER_V2_ENTRY_TELEMETRY_JOURNAL_PATH=/opt/qtr/scalper-shadow/data/qtr_micro_scalper_entry_features.jsonl
+```
+
+When enabled, one immutable causal snapshot is appended for each newly created
+shadow trade plan. It contains only the score and market/setup inputs already
+available at decision time; it never stores MFE, MAE, outcomes, exits or future
+bars. The journal is separate from all trade and experiment journals. Capture
+failure produces a warning and cannot block the shadow lifecycle. Enabling this
+diagnostic does not change scoring, entries, stops, targets or execution.
