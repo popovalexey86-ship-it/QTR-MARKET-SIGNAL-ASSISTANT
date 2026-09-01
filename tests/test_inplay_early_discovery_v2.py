@@ -721,3 +721,26 @@ def test_fixed_schedule_does_not_add_scan_duration() -> None:
     schedule.run(maximum_scans=3)
 
     assert sleeps == [180.0, 180.0]
+
+
+def test_runtime_error_log_contains_utc_timestamp(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class FailingScheduledService:
+        def scan(self) -> object:
+            raise MarketDataError("secret provider payload")
+
+    schedule = EarlyDiscoveryV2FixedSchedule(
+        FailingScheduledService(),  # type: ignore[arg-type]
+        interval_seconds=300.0,
+        monotonic=lambda: 0.0,
+        sleeper=lambda delay: None,
+        reporter=lambda report: None,
+    )
+    with caplog.at_level("WARNING"):
+        schedule.run(maximum_scans=1)
+    message = caplog.messages[-1]
+    assert message[4] == "-" and message[7] == "-" and "T" in message[:20]
+    assert "Z — Сканирование раннего обнаружения V2" in message
+    assert "MarketDataError" in message
+    assert "secret provider payload" not in message

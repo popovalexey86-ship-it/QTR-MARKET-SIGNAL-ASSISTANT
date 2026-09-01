@@ -199,7 +199,15 @@ def test_start_and_status_each_create_one_russian_reply() -> None:
         "Автосканирование IN PLAY: отключено\n"
         "Интервал IN PLAY: 15 минут\n"
         "Автоновости: отключены\n"
-        "Интервал новостей: 60 минут"
+        "Интервал новостей: 60 минут\n"
+        "QTR Setup Pilot: отключён\n"
+        "QTR Micro Demo: отключён\n"
+        "Demo API: заблокирован\n"
+        "Открытые Micro позиции: 0\n"
+        "Риск: 0,5–1%\n"
+        "Плечо: x5–x10\n"
+        "Дневной Demo PnL: +0.00 USDT\n"
+        "Kill switch: выключен"
     )
     assert service.requests == []
 

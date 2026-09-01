@@ -65,13 +65,31 @@ class CatalogInstrument:
 
     @property
     def is_crypto_linear_usdt(self) -> bool:
-        return (
-            self.quote_coin.upper() == "USDT"
-            and self.settle_coin.upper() == "USDT"
-            and self.contract_type == "LinearPerpetual"
-            and self.symbol_type.lower() in {"", "innovation"}
-            and not self.is_pre_listing
+        return is_crypto_linear_usdt_metadata(
+            quote_coin=self.quote_coin,
+            settle_coin=self.settle_coin,
+            contract_type=self.contract_type,
+            symbol_type=self.symbol_type,
+            is_pre_listing=self.is_pre_listing,
         )
+
+
+def is_crypto_linear_usdt_metadata(
+    *,
+    quote_coin: str,
+    settle_coin: str,
+    contract_type: str,
+    symbol_type: str,
+    is_pre_listing: bool,
+) -> bool:
+    """Shared Bybit metadata gate; trading status is checked by each caller."""
+    return (
+        quote_coin.upper() == "USDT"
+        and settle_coin.upper() == "USDT"
+        and contract_type == "LinearPerpetual"
+        and symbol_type.lower() in {"", "innovation"}
+        and not is_pre_listing
+    )
 
 
 class InPlayDirection(Enum):

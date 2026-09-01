@@ -160,6 +160,8 @@ class BreakoutAssessment:
     returned_inside_range: bool
     breakout_age_bars: int
     volume_ratio: float | None
+    local_range_low: float | None = None
+    local_range_high: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,6 +223,8 @@ class EarlyDiscoveryV2Result:
     warnings: tuple[str, ...]
     technical_error: str | None
     reason_v2_ru: str
+    local_range_low: float | None = None
+    local_range_high: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -688,7 +692,9 @@ class EarlyDiscoveryV2FixedSchedule:
                 report = self._service.scan()
             except Exception as error:
                 _LOGGER.warning(
-                    "Сканирование раннего обнаружения V2 завершилось ошибкой (%s).",
+                    "%s — Сканирование раннего обнаружения V2 "
+                    "завершилось ошибкой (%s).",
+                    _utc_runtime_timestamp(),
                     type(error).__name__,
                 )
             else:
@@ -698,6 +704,10 @@ class EarlyDiscoveryV2FixedSchedule:
             if now >= next_run:
                 missed = int((now - next_run) // self._interval) + 1
                 next_run += missed * self._interval
+
+
+def _utc_runtime_timestamp() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def print_scan_report(report: EarlyDiscoveryV2ScanReport) -> None:
@@ -819,6 +829,8 @@ def _analyze_v2(
         warnings=warnings,
         technical_error=None,
         reason_v2_ru=_stage_reason(v1.discovery_stage, stage, assessment, sequence),
+        local_range_low=assessment.local_range_low if assessment else None,
+        local_range_high=assessment.local_range_high if assessment else None,
     )
 
 
@@ -888,6 +900,8 @@ class _BreakoutEvent:
     candles: tuple[Candle, ...]
     atr: float | None
     volume_ratio: float | None
+    local_range_low: float
+    local_range_high: float
 
 
 def _breakout_assessment(
@@ -961,6 +975,8 @@ def _breakout_assessment(
         returned_inside_range=returned_inside,
         breakout_age_bars=len(event.candles) - 1 - event.index,
         volume_ratio=event.volume_ratio,
+        local_range_low=event.local_range_low,
+        local_range_high=event.local_range_high,
     )
 
 
@@ -987,7 +1003,18 @@ def _latest_breakout_event(
         tuple(item.volume for item in candles[index - lookback : index])
     )
     volume_ratio = candles[index].volume / prior_volume if prior_volume > 0 else None
-    return _BreakoutEvent(direction, interval, level, index, candles, atr, volume_ratio)
+    history = candles[index - lookback : index]
+    return _BreakoutEvent(
+        direction,
+        interval,
+        level,
+        index,
+        candles,
+        atr,
+        volume_ratio,
+        min(item.low for item in history),
+        max(item.high for item in history),
+    )
 
 
 def _completed_series(
