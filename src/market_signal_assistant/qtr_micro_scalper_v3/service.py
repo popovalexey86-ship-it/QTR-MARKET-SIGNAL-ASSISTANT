@@ -23,6 +23,10 @@ from market_signal_assistant.qtr_micro_scalper.live.orderbook_ws import (
 from market_signal_assistant.qtr_micro_scalper.live.trades_ws import (
     PublicTradeCollector,
 )
+from market_signal_assistant.qtr_micro_scalper_v3.diagnostics import (
+    DEFAULT_DECISION_DIAGNOSTICS_PATH,
+    DecisionDiagnostics,
+)
 from market_signal_assistant.qtr_micro_scalper_v3.engine import (
     CashScalperConfig,
     CashScalperEngine,
@@ -50,6 +54,7 @@ class V3ServiceSettings:
     entry_telemetry_path: Path = DEFAULT_ENTRY_TELEMETRY_PATH
     trade_journal_path: Path = DEFAULT_TRADE_JOURNAL_PATH
     forward_outcome_path: Path = DEFAULT_FORWARD_OUTCOME_PATH
+    decision_diagnostics_path: Path = DEFAULT_DECISION_DIAGNOSTICS_PATH
 
     def __post_init__(self) -> None:
         normalized = tuple(
@@ -89,6 +94,12 @@ class V3ServiceSettings:
                 os.getenv(
                     "QTR_SCALPER_V3_FORWARD_OUTCOME_PATH",
                     str(DEFAULT_FORWARD_OUTCOME_PATH),
+                )
+            ),
+            decision_diagnostics_path=Path(
+                os.getenv(
+                    "QTR_SCALPER_V3_DECISION_DIAGNOSTICS_PATH",
+                    str(DEFAULT_DECISION_DIAGNOSTICS_PATH),
                 )
             ),
         )
@@ -138,6 +149,7 @@ class V3ShadowService:
         if worker is not None:
             worker.cancel()
             await asyncio.gather(worker, return_exceptions=True)
+        self._runtime.flush_diagnostics()
         self._running = False
 
     async def wait(self) -> None:
@@ -209,6 +221,9 @@ def build_v3_shadow_service(
         trade_journal=JsonlTelemetryJournal(resolved.trade_journal_path),
         outcome_journal=JsonlTelemetryJournal(resolved.forward_outcome_path),
         notional=resolved.notional,
+        decision_diagnostics=DecisionDiagnostics(
+            resolved.decision_diagnostics_path
+        ),
     )
     return V3ShadowService(
         settings=resolved,
@@ -242,6 +257,7 @@ async def _run(args: argparse.Namespace) -> int:
             entry_telemetry_path=settings.entry_telemetry_path,
             trade_journal_path=settings.trade_journal_path,
             forward_outcome_path=settings.forward_outcome_path,
+            decision_diagnostics_path=settings.decision_diagnostics_path,
         )
     service = build_v3_shadow_service(settings)
     await service.start()

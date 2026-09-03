@@ -1,5 +1,9 @@
 """QTR Micro Scalper V3: isolated cash-first shadow research engine."""
 
+from market_signal_assistant.qtr_micro_scalper_v3.diagnostics import (
+    DecisionDiagnostics,
+    DecisionDiagnosticSummary,
+)
 from market_signal_assistant.qtr_micro_scalper_v3.engine import (
     CashScalperConfig,
     CashScalperEngine,
@@ -13,6 +17,8 @@ from market_signal_assistant.qtr_micro_scalper_v3.models import (
 __all__ = [
     "CashScalperConfig",
     "CashScalperEngine",
+    "DecisionDiagnosticSummary",
+    "DecisionDiagnostics",
     "ImpulseDirection",
     "ImpulseSnapshot",
     "V3EntryDecision",

@@ -36,7 +36,6 @@ class CashScalperConfig:
     min_potential_cost_ratio: float = 1.5
     min_flow_imbalance: float = 0.25
     min_price_response_bps: float = 3.0
-    min_price_response_per_10k: float = 0.25
     min_flow_acceleration: float = 0.75
     max_impulse_age_seconds: float = 20.0
     max_impulse_displacement_bps: float = 20.0
@@ -57,7 +56,6 @@ class CashScalperConfig:
             self.min_potential_cost_ratio,
             self.min_flow_imbalance,
             self.min_price_response_bps,
-            self.min_price_response_per_10k,
             self.min_flow_acceleration,
             self.max_impulse_age_seconds,
             self.max_impulse_displacement_bps,
@@ -137,8 +135,8 @@ class CashScalperEngine:
             blocking.append("insufficient_bid_liquidity")
         if snapshot.ask_depth_10bps < self._config.min_depth_10bps:
             blocking.append("insufficient_ask_liquidity")
-        net_potential = snapshot.estimated_potential_bps - cost.total_round_trip_bps
-        potential_ratio = snapshot.estimated_potential_bps / cost.total_round_trip_bps
+        net_potential = self._config.target_bps - cost.total_round_trip_bps
+        potential_ratio = self._config.target_bps / cost.total_round_trip_bps
         if (
             net_potential < self._config.min_net_potential_bps
             or potential_ratio < self._config.min_potential_cost_ratio
@@ -153,10 +151,8 @@ class CashScalperEngine:
             if (
                 snapshot.price_displacement_5s_bps * sign
                 < self._config.min_price_response_bps
-                or snapshot.price_response_bps_per_10k
-                < self._config.min_price_response_per_10k
             ):
-                blocking.append("flow_price_not_aligned")
+                blocking.append("insufficient_directional_displacement")
             if (
                 snapshot.orderbook_imbalance * sign
                 < -self._config.max_opposing_book_imbalance

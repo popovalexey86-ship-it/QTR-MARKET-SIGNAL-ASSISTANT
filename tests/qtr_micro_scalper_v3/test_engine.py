@@ -55,12 +55,8 @@ def test_accepts_fresh_short_with_flow_and_price_response() -> None:
             "insufficient_bid_liquidity",
         ),
         (
-            replace(snapshot(), estimated_potential_bps=20.0),
-            "insufficient_net_potential",
-        ),
-        (
             replace(snapshot(), price_displacement_5s_bps=-8.0),
-            "flow_price_not_aligned",
+            "insufficient_directional_displacement",
         ),
         (
             replace(snapshot(), absorption_detected=True),
@@ -88,6 +84,59 @@ def test_hard_gates_reject_non_tradable_or_exhausted_inputs(
 def test_stale_input_is_rejected() -> None:
     stale = replace(snapshot(), source_at=NOW - timedelta(seconds=3))
     assert "stale_market_data" in CashScalperEngine().evaluate(stale).blocking_reasons
+
+
+def test_economic_gate_uses_planned_target_not_trailing_realized_range() -> None:
+    candidate = replace(
+        snapshot(),
+        spread_bps=1.0,
+        estimated_potential_bps=2.0,
+        local_volatility_bps=2.0,
+    )
+
+    result = CashScalperEngine().evaluate(candidate)
+
+    assert result.cost.total_round_trip_bps == pytest.approx(14.0)
+    assert result.accepted is True
+    assert "insufficient_net_potential" not in result.blocking_reasons
+
+
+def test_economic_gate_blocks_when_planned_target_cannot_cover_costs() -> None:
+    engine = CashScalperEngine(CashScalperConfig(target_bps=20.0))
+
+    result = engine.evaluate(snapshot())
+
+    assert result.accepted is False
+    assert "insufficient_net_potential" in result.blocking_reasons
+
+
+def test_large_notional_response_metric_is_telemetry_only() -> None:
+    candidate = replace(snapshot(), price_response_bps_per_10k=0.000_001)
+
+    result = CashScalperEngine().evaluate(candidate)
+
+    assert result.accepted is True
+    assert "flow_price_not_aligned" not in result.blocking_reasons
+    assert "insufficient_directional_displacement" not in result.blocking_reasons
+
+
+@pytest.mark.parametrize("displacement", (-1.0, 2.99))
+def test_wrong_or_insufficient_directional_displacement_blocks(
+    displacement: float,
+) -> None:
+    result = CashScalperEngine().evaluate(
+        replace(snapshot(), price_displacement_5s_bps=displacement)
+    )
+
+    assert result.accepted is False
+    assert "insufficient_directional_displacement" in result.blocking_reasons
+
+
+def test_flow_acceleration_remains_an_independent_gate() -> None:
+    result = CashScalperEngine().evaluate(replace(snapshot(), flow_acceleration=0.5))
+
+    assert result.accepted is False
+    assert "flow_not_accelerating" in result.blocking_reasons
 
 
 def test_same_impulse_cannot_reenter_after_exit() -> None:

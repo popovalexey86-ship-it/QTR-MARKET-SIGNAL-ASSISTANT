@@ -12,6 +12,9 @@ from market_signal_assistant.qtr_micro_scalper.data.models import (
 )
 from market_signal_assistant.qtr_micro_scalper.data.orderbook import OrderBookState
 from market_signal_assistant.qtr_micro_scalper.data.trades import TradeFlowAccumulator
+from market_signal_assistant.qtr_micro_scalper_v3.diagnostics import (
+    DecisionDiagnostics,
+)
 from market_signal_assistant.qtr_micro_scalper_v3.engine import CashScalperEngine
 from market_signal_assistant.qtr_micro_scalper_v3.models import (
     ImpulseDirection,
@@ -204,12 +207,14 @@ class V3ShadowRuntime:
         trade_journal: JsonlTelemetryJournal,
         outcome_journal: JsonlTelemetryJournal,
         notional: float = 1_000.0,
+        decision_diagnostics: DecisionDiagnostics | None = None,
     ) -> None:
         self._engine = engine
         self._entry_journal = entry_journal
         self._trade_journal = trade_journal
         self._outcome_journal = outcome_journal
         self._notional = notional
+        self._decision_diagnostics = decision_diagnostics
         self._active: dict[str, V3ShadowTrade] = {}
         self._trackers: dict[str, ForwardOutcomeTracker] = {}
 
@@ -221,6 +226,8 @@ class V3ShadowRuntime:
                 ("active_trade",),
             )
         decision = self._engine.evaluate(snapshot, notional=self._notional)
+        if self._decision_diagnostics is not None:
+            self._decision_diagnostics.observe(decision)
         if not decision.accepted:
             return V3RuntimeResult(False, None, decision.blocking_reasons)
         trade = self._engine.open_shadow_trade(decision)
@@ -293,6 +300,11 @@ class V3ShadowRuntime:
 
     def active_trade(self, symbol: str) -> V3ShadowTrade | None:
         return self._active.get(symbol.strip().upper())
+
+    def flush_diagnostics(self) -> bool:
+        if self._decision_diagnostics is None:
+            return False
+        return self._decision_diagnostics.flush()
 
 
 def _displacement(
