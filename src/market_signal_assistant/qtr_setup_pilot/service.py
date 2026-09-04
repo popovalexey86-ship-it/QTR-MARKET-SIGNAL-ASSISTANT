@@ -42,21 +42,12 @@ class QtrSetupScanService:
                     episode_id=episode_id,
                     source_input=source_input,
                     result=analyze_setup(source_input),
-                    atr_value=_atr_value(
-                        result.absolute_distance, result.absolute_distance_atr
-                    ),
+                    atr_value=result.atr,
                     local_range_low=result.local_range_low,
                     local_range_high=result.local_range_high,
                 )
             )
         return tuple(candidates)
-
-
-def _atr_value(distance: float | None, distance_atr: float | None) -> float | None:
-    if distance is None or distance_atr is None or distance_atr <= 0:
-        return None
-    value = distance / distance_atr
-    return value if value > 0 else None
 
 
 def _structural_invalidation(result: EarlyDiscoveryV2Result) -> float | None:

@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
+import pytest
+
+import market_signal_assistant.qtr_setup_pilot.service as qtr_setup_service
 from market_signal_assistant.inplay.early_discovery import MarketDirection
-from market_signal_assistant.inplay.early_discovery_v2 import EarlyDiscoveryV2Result
+from market_signal_assistant.inplay.early_discovery_v2 import (
+    EarlyDiscoveryV2Result,
+    EarlyDiscoveryV2ScanReport,
+)
 from market_signal_assistant.qtr_setup_pilot.audit import (
     JsonlQtrSetupTelegramAuditStore,
     QtrSetupAuditOutcome,
@@ -16,8 +23,13 @@ from market_signal_assistant.qtr_setup_pilot.models import QtrSetupCandidate
 from market_signal_assistant.qtr_setup_pilot.notifications import (
     JsonQtrSetupNotificationStore,
     QtrSetupNotificationService,
+    qtr_telegram_quality_components,
+    qtr_telegram_quality_score,
 )
-from market_signal_assistant.qtr_setup_pilot.service import _structural_invalidation
+from market_signal_assistant.qtr_setup_pilot.service import (
+    QtrSetupScanService,
+    _structural_invalidation,
+)
 from market_signal_assistant.setup_engine.analyzer import analyze_setup
 from market_signal_assistant.setup_engine.models import (
     SetupAnalysisInput,
@@ -118,6 +130,75 @@ def test_producer_writes_complete_verified_projection(tmp_path: Path) -> None:
     assert record["telegram_quality_score"] == 100.0
     components = cast(dict[str, float], record["quality_components"])
     assert sum(components.values()) == record["telegram_quality_score"]
+
+
+@pytest.mark.parametrize(
+    ("market_price", "distance_atr"),
+    ((100.0, 0.0), (101.0, 0.5)),
+)
+def test_setup_scan_persists_direct_source_atr_without_changing_quality(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    market_price: float,
+    distance_atr: float,
+) -> None:
+    raw_atr = 2.0
+    trigger_price = 100.0
+    source = replace(
+        _source(),
+        current_price=market_price,
+        trigger_level=trigger_price,
+        distance_to_trigger_pct=abs(market_price - trigger_price),
+        distance_to_trigger_atr=distance_atr,
+    )
+    raw_result = cast(
+        EarlyDiscoveryV2Result,
+        SimpleNamespace(
+            first_detected_at=NOW,
+            atr=raw_atr,
+            absolute_distance=abs(market_price - trigger_price),
+            absolute_distance_atr=distance_atr,
+            local_range_low=98.0,
+            local_range_high=trigger_price,
+            market_direction=MarketDirection.UP,
+        ),
+    )
+
+    class Scanner:
+        def scan(self) -> EarlyDiscoveryV2ScanReport:
+            return EarlyDiscoveryV2ScanReport(
+                NOW, NOW, 1, 1, 0, 0, 1, 0, (raw_result,)
+            )
+
+    def adapt(
+        result: EarlyDiscoveryV2Result,
+        *,
+        invalidation_level: float | None = None,
+    ) -> Any:
+        assert result is raw_result
+        assert invalidation_level == 98.0
+        return source
+
+    monkeypatch.setattr(qtr_setup_service, "input_from_early_discovery_v2", adapt)
+    item = QtrSetupScanService(Scanner()).scan()[0]
+
+    assert item.atr_value == raw_atr
+    assert item.result.distance_to_trigger_atr == distance_atr
+    assert qtr_telegram_quality_components(item)["distance"] == 5.0
+    assert qtr_telegram_quality_score(item) == 100.0
+
+    notifications = QtrSetupNotificationService(
+        JsonQtrSetupNotificationStore(tmp_path / "state.json")
+    )
+    decision = notifications.prepare((item,), NOW).decisions[0]
+    audit_path = tmp_path / "audit.jsonl"
+    JsonlQtrSetupTelegramAuditStore(audit_path).append(
+        (QtrSetupAuditOutcome(decision, True, True),), NOW
+    )
+    record = cast(dict[str, Any], json.loads(audit_path.read_text(encoding="utf-8")))
+    projection = cast(dict[str, Any], record["price_context"])
+    assert projection["atr"] == raw_atr
+    assert record["telegram_quality_score"] == 100.0
 
 
 def test_missing_verified_values_remain_null_without_fallback(tmp_path: Path) -> None:
