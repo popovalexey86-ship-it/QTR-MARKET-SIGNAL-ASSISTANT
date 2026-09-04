@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+from dataclasses import fields, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -17,6 +19,7 @@ from market_signal_assistant.inplay.early_discovery_v2 import (
     BreakoutAssessment,
     EarlyDiscoveryV2Config,
     EarlyDiscoveryV2FixedSchedule,
+    EarlyDiscoveryV2Result,
     EarlyDiscoveryV2SequenceTracker,
     EarlyDiscoveryV2Service,
     JsonEarlyDiscoveryV2StateStore,
@@ -412,6 +415,24 @@ def test_up_and_down_use_symmetric_correct_side() -> None:
     assert down.signed_distance_atr is not None and down.signed_distance_atr < 0
 
 
+def test_zero_distance_preserves_source_atr() -> None:
+    raw = candles("5m", direction=MarketDirection.UP)
+    last = replace(raw.candles[-1], low=100.4, close=100.5)
+    exact_trigger = MarketSeries(
+        raw.instrument,
+        raw.interval,
+        (*raw.candles[:-1], last),
+    )
+
+    result = _breakout_assessment(exact_trigger, candles("15m"))
+
+    assert result is not None
+    assert result.current_price == result.level
+    assert result.absolute_distance == 0.0
+    assert result.absolute_distance_atr == 0.0
+    assert result.atr is not None and result.atr > 0.0
+
+
 def test_failed_breakout_blocks_confirmation() -> None:
     failed = _breakout_assessment(
         candles("5m", direction=MarketDirection.UP, failed=True),
@@ -499,6 +520,7 @@ def test_service_uses_one_shared_snapshot_for_v1_and_v2(tmp_path: Path) -> None:
     assert second.stage_v2 is DiscoveryStage.SETUP_FORMING
     assert third.stage_v2 is DiscoveryStage.READY_CANDIDATE
     assert first.stage_v1 is not None
+    assert first.atr is not None and first.atr > 0.0
     assert len(first.component_scores) == 17
     for component in first.component_scores:
         assert component.score_kind in {"discovery", "readiness"}
@@ -507,6 +529,28 @@ def test_service_uses_one_shared_snapshot_for_v1_and_v2(tmp_path: Path) -> None:
         assert 0 <= component.points <= component.maximum_points
         assert component.reason
         assert component.explanation_ru
+
+
+def test_legacy_result_mapping_without_atr_uses_none(tmp_path: Path) -> None:
+    service = EarlyDiscoveryV2Service(
+        catalog_provider=Catalog((catalog(),)),
+        market_provider=Provider(),
+        audit_store=JsonlEarlyDiscoveryV2AuditStore(tmp_path / "audit.jsonl"),
+        state_store=JsonEarlyDiscoveryV2StateStore(tmp_path / "state.json"),
+        config=EarlyDiscoveryV2Config(),
+        clock=lambda: NOW,
+        maximum_workers=1,
+    )
+    current = service.scan().results[0]
+    legacy = {
+        field.name: getattr(current, field.name)
+        for field in fields(EarlyDiscoveryV2Result)
+        if field.name != "atr"
+    }
+
+    restored = cast(Any, EarlyDiscoveryV2Result)(**legacy)
+
+    assert restored.atr is None
 
 
 def test_v1_and_v2_audits_share_the_same_loaded_snapshot(tmp_path: Path) -> None:

@@ -64,6 +64,9 @@ class JsonlQtrSetupTelegramAuditStore:
                 "telegram_quality_score": (
                     event.quality_score if event is not None else None
                 ),
+                "quality_components": (
+                    dict(event.quality_components) if event is not None else None
+                ),
                 "price_context": {
                     "observed_at": result.analyzed_at.isoformat(),
                     "source_direction": decision.candidate.source_input.direction.value,
