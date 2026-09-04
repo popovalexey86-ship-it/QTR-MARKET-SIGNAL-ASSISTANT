@@ -115,6 +115,9 @@ def test_producer_writes_complete_verified_projection(tmp_path: Path) -> None:
     assert projection["local_range_low"] == 98.0
     assert projection["local_range_high"] == 100.0
     assert projection["observed_at"] == NOW.isoformat()
+    assert record["telegram_quality_score"] == 100.0
+    components = cast(dict[str, float], record["quality_components"])
+    assert sum(components.values()) == record["telegram_quality_score"]
 
 
 def test_missing_verified_values_remain_null_without_fallback(tmp_path: Path) -> None:

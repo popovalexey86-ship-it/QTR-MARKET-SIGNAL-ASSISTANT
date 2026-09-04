@@ -21,6 +21,7 @@ from market_signal_assistant.qtr_setup_pilot.notifications import (
     QtrSetupNotificationService,
     QtrTelegramFilterPolicy,
     event_from_candidate,
+    qtr_telegram_quality_components,
     qtr_telegram_quality_score,
 )
 from market_signal_assistant.settings import QtrSetupTelegramSettings
@@ -117,6 +118,24 @@ def test_ready_candidate_at_threshold_is_sent(tmp_path: Path) -> None:
 
     assert qtr_telegram_quality_score(item) == 90.0
     assert decision.should_notify is True
+
+
+def test_quality_components_preserve_exact_existing_score() -> None:
+    item = _candidate()
+
+    components = qtr_telegram_quality_components(item)
+
+    assert sum(components.values()) == qtr_telegram_quality_score(item) == 100.0
+    assert components == {
+        "structure": 20.0,
+        "correct_side": 15.0,
+        "setup_or_retest": 15.0,
+        "volume": 15.0,
+        "volatility": 10.0,
+        "liquidity_and_spread": 15.0,
+        "freshness": 5.0,
+        "distance": 5.0,
+    }
 
 
 def test_ready_below_quality_threshold_is_suppressed(tmp_path: Path) -> None:

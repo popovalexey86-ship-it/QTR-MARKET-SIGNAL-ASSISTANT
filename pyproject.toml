@@ -20,6 +20,7 @@ market-screener = "market_signal_assistant.cli:main"
 market-signal-cli = "market_signal_assistant.cli:main"
 market-signal-web = "market_signal_assistant.web.app:main"
 market-signal-telegram = "market_signal_assistant.telegram.bot:main"
+market-signal-outcome-audit = "market_signal_assistant.qtr_signal_outcome.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
