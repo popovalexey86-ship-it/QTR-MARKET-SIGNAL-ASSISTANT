@@ -35,12 +35,14 @@ from market_signal_assistant.setup_engine.offline_analyzer import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
-REAL_AUDIT = ROOT / "data" / "inplay_early_discovery_v2_audit.jsonl"
+FIXTURE_AUDIT = (
+    ROOT / "tests" / "fixtures" / "early_discovery_v2_recovered_retest.jsonl"
+)
 
 
 @pytest.fixture(scope="module")
 def base() -> ReplaySnapshot:
-    return read_v2_audit(REAL_AUDIT).snapshots[0]
+    return read_v2_audit(FIXTURE_AUDIT).snapshots[0]
 
 
 def _snapshot(
@@ -272,7 +274,7 @@ def test_false_group_marks_previous_error(base: ReplaySnapshot) -> None:
 def test_outputs_use_bom_and_sources_remain_unchanged(tmp_path: Path) -> None:
     source = tmp_path / "audit.jsonl"
     source.write_text(
-        REAL_AUDIT.read_text(encoding="utf-8-sig").splitlines()[0] + "\n",
+        FIXTURE_AUDIT.read_text(encoding="utf-8-sig").splitlines()[0] + "\n",
         encoding="utf-8",
     )
     runtime = tmp_path / "runtime.log"

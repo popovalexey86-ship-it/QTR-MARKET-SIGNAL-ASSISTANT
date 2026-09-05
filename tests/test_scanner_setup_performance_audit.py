@@ -21,13 +21,15 @@ from market_signal_assistant.setup_engine.performance_audit import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
-REAL_AUDIT = ROOT / "data" / "inplay_early_discovery_v2_audit.jsonl"
+FIXTURE_AUDIT = (
+    ROOT / "tests" / "fixtures" / "early_discovery_v2_recovered_retest.jsonl"
+)
 
 
 def _fixture_snapshot(tmp_path: Path) -> Path:
     directory = tmp_path / "snapshot"
     directory.mkdir()
-    raw = json.loads(REAL_AUDIT.read_text(encoding="utf-8-sig").splitlines()[0])
+    raw = json.loads(FIXTURE_AUDIT.read_text(encoding="utf-8-sig").splitlines()[0])
     start = datetime(2026, 8, 10, 8, 0, tzinfo=UTC)
     rows: list[dict[str, object]] = []
     for minutes, price in (

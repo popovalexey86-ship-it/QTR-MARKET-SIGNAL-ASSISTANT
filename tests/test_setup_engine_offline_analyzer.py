@@ -29,12 +29,14 @@ from market_signal_assistant.setup_engine.offline_analyzer import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
-REAL_AUDIT = ROOT / "data" / "inplay_early_discovery_v2_audit.jsonl"
+FIXTURE_AUDIT = (
+    ROOT / "tests" / "fixtures" / "early_discovery_v2_recovered_retest.jsonl"
+)
 
 
 @pytest.fixture(scope="module")
 def replayed() -> tuple[ReplaySnapshot, ...]:
-    return read_v2_audit(REAL_AUDIT).snapshots
+    return read_v2_audit(FIXTURE_AUDIT).snapshots
 
 
 def _snapshot(
@@ -95,7 +97,7 @@ def _snapshot(
     return ReplaySnapshot(line or minutes + 1, source, setup_input, result)
 
 
-def test_reads_real_jsonl_and_replays_production_engine(
+def test_reads_fixture_jsonl_and_replays_production_engine(
     replayed: tuple[ReplaySnapshot, ...],
 ) -> None:
     assert replayed
@@ -103,7 +105,7 @@ def test_reads_real_jsonl_and_replays_production_engine(
 
 
 def test_corrupted_row_is_rejected_without_losing_valid_row(tmp_path: Path) -> None:
-    first = REAL_AUDIT.read_text(encoding="utf-8").splitlines()[0]
+    first = FIXTURE_AUDIT.read_text(encoding="utf-8").splitlines()[0]
     audit = tmp_path / "audit.jsonl"
     audit.write_text(first + "\n{bad json\n", encoding="utf-8")
     result = read_v2_audit(audit)
@@ -120,7 +122,7 @@ def test_reader_is_offline_and_does_not_import_transport(
         raise AssertionError("network access is forbidden")
 
     monkeypatch.setattr(socket, "create_connection", forbidden)
-    assert read_v2_audit(REAL_AUDIT).snapshots
+    assert read_v2_audit(FIXTURE_AUDIT).snapshots
 
 
 @pytest.mark.parametrize(
@@ -263,7 +265,7 @@ def test_false_breakout_retest_and_confidence_metrics_are_emitted(
     )
     future = _snapshot(replayed[0], minutes=60, price=101)
     audit = replace(
-        read_v2_audit(REAL_AUDIT),
+        read_v2_audit(FIXTURE_AUDIT),
         snapshots=(ready, future),
         total_lines=2,
         rejected=(),
@@ -284,12 +286,12 @@ def test_false_breakout_retest_and_confidence_metrics_are_emitted(
 def test_outputs_have_russian_headers_bom_and_leave_source_unchanged(
     tmp_path: Path,
 ) -> None:
-    before = REAL_AUDIT.read_bytes()
-    analysis = analyze_audit(REAL_AUDIT)
+    before = FIXTURE_AUDIT.read_bytes()
+    analysis = analyze_audit(FIXTURE_AUDIT)
     files = write_outputs(analysis, tmp_path)
     assert files.episodes.read_bytes().startswith(b"\xef\xbb\xbf")
     with files.episodes.open(encoding="utf-8-sig", newline="") as handle:
         reader = csv.reader(handle, delimiter=";")
         assert next(reader)[:3] == ["Номер эпизода", "Символ", "Направление"]
     assert json.loads(files.metrics.read_text(encoding="utf-8"))["source"]["unchanged"]
-    assert REAL_AUDIT.read_bytes() == before
+    assert FIXTURE_AUDIT.read_bytes() == before
