@@ -162,6 +162,7 @@ class BreakoutAssessment:
     volume_ratio: float | None
     local_range_low: float | None = None
     local_range_high: float | None = None
+    atr: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,6 +226,7 @@ class EarlyDiscoveryV2Result:
     reason_v2_ru: str
     local_range_low: float | None = None
     local_range_high: float | None = None
+    atr: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -831,6 +833,7 @@ def _analyze_v2(
         reason_v2_ru=_stage_reason(v1.discovery_stage, stage, assessment, sequence),
         local_range_low=assessment.local_range_low if assessment else None,
         local_range_high=assessment.local_range_high if assessment else None,
+        atr=assessment.atr if assessment else None,
     )
 
 
@@ -977,6 +980,7 @@ def _breakout_assessment(
         volume_ratio=event.volume_ratio,
         local_range_low=event.local_range_low,
         local_range_high=event.local_range_high,
+        atr=event.atr,
     )
 
 

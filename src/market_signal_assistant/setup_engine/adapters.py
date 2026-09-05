@@ -96,11 +96,7 @@ def input_from_early_discovery_v2(
         direction=direction,
         current_price=result.current_price,
         trigger_level=result.breakout_level,
-        invalidation_level=(
-            invalidation_level
-            if invalidation_level is not None
-            else _invalidation_level(result, direction)
-        ),
+        invalidation_level=invalidation_level,
         price_change_24h_pct=result.price_change_24h_pct,
         distance_to_trigger_pct=_distance_pct(
             result.current_price,
@@ -226,23 +222,3 @@ def _distance_pct(current_price: float | None, level: float | None) -> float | N
     if current_price is None or level is None or level <= 0:
         return None
     return abs(current_price - level) / level * 100.0
-
-
-def _invalidation_level(
-    result: EarlyDiscoveryV2Result,
-    direction: SetupDirection,
-) -> float | None:
-    if (
-        result.breakout_level is None
-        or result.absolute_distance is None
-        or result.absolute_distance_atr is None
-        or result.absolute_distance_atr <= 0
-        or direction is SetupDirection.NEUTRAL
-    ):
-        return None
-    atr = result.absolute_distance / result.absolute_distance_atr
-    if atr <= 0:
-        return None
-    if direction is SetupDirection.UP:
-        return max(1e-12, result.breakout_level - atr)
-    return result.breakout_level + atr

@@ -234,10 +234,7 @@ def format_qtr_setup_event(event: QtrSetupEvent) -> str:
             "👤 Требуется ручная проверка:",
             "уровни / объём / стоп / риск.",
             "",
-            (
-                f"Quality {event.quality_score:.0f}/100 — это внутренний рейтинг "
-                "QTR,"
-            ),
+            "Quality — внутренний рейтинг QTR,",
             "НЕ вероятность выигрыша.",
         )
     )

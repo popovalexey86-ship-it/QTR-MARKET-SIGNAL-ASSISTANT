@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from market_signal_assistant.qtr_setup_pilot.models import QtrSetupCandidate
@@ -30,7 +31,6 @@ _LOGGER = logging.getLogger(__name__)
 
 class QtrNotificationReason(StrEnum):
     NEW_EPISODE = "new_episode"
-    STAGE_ADVANCED = "stage_advanced"
     DIRECTION_CHANGED = "direction_changed"
     TYPE_CHANGED = "type_changed"
     QUALITY_IMPROVED = "quality_improved"
@@ -80,6 +80,7 @@ class QtrSetupEvent:
     retest_held: bool
     visible_confirmations: tuple[str, ...]
     warnings: tuple[str, ...]
+    quality_components: Mapping[str, float]
     quality_score: float
     semantic_fingerprint: str
 
@@ -293,10 +294,11 @@ def event_from_candidate(
     result = candidate.result
     confirmations = _visible_confirmations(candidate)
     warnings = _visible_warnings(candidate)
-    quality_score = qtr_telegram_quality_score(
+    quality_components = qtr_telegram_quality_components(
         candidate,
         maximum_distance_atr=maximum_distance_atr,
     )
+    quality_score = sum(quality_components.values())
     fingerprint = _fingerprint(
         result.symbol,
         result.direction,
@@ -318,6 +320,7 @@ def event_from_candidate(
         result.retest_held,
         confirmations,
         warnings,
+        quality_components,
         quality_score,
         fingerprint,
     )
@@ -399,7 +402,12 @@ def _decision(
             True,
             QtrNotificationReason.QUALITY_IMPROVED,
         )
-    return QtrSetupDecision(event, candidate, False, QtrNotificationReason.DUPLICATE)
+    return QtrSetupDecision(
+        event,
+        candidate,
+        False,
+        QtrNotificationReason.DUPLICATE,
+    )
 
 
 def qtr_telegram_quality_score(
@@ -407,7 +415,21 @@ def qtr_telegram_quality_score(
     *,
     maximum_distance_atr: float = 1.2,
 ) -> float:
-    """Deterministic Telegram rank; it is not a win probability."""
+    """Return a deterministic Telegram rank, never a win probability."""
+    return sum(
+        qtr_telegram_quality_components(
+            candidate,
+            maximum_distance_atr=maximum_distance_atr,
+        ).values()
+    )
+
+
+def qtr_telegram_quality_components(
+    candidate: QtrSetupCandidate,
+    *,
+    maximum_distance_atr: float = 1.2,
+) -> Mapping[str, float]:
+    """Expose the existing score inputs without changing score semantics."""
     result = candidate.result
     source = candidate.source_input
     setup_confirmation = (
@@ -419,17 +441,19 @@ def qtr_telegram_quality_score(
         result.distance_to_trigger_atr is not None
         and abs(result.distance_to_trigger_atr) <= maximum_distance_atr
     )
-    components = (
-        (result.structure_confirmation, 20.0),
-        (source.correct_side_of_level is True, 15.0),
-        (setup_confirmation, 15.0),
-        (result.volume_confirmation, 15.0),
-        (result.volatility_confirmation, 10.0),
-        (result.liquidity_ok and result.spread_ok, 15.0),
-        (result.freshness_confirmation, 5.0),
-        (distance_ok, 5.0),
-    )
-    return sum(weight for enabled, weight in components if enabled)
+    components = {
+        "structure": 20.0 if result.structure_confirmation else 0.0,
+        "correct_side": 15.0 if source.correct_side_of_level is True else 0.0,
+        "setup_or_retest": 15.0 if setup_confirmation else 0.0,
+        "volume": 15.0 if result.volume_confirmation else 0.0,
+        "volatility": 10.0 if result.volatility_confirmation else 0.0,
+        "liquidity_and_spread": (
+            15.0 if result.liquidity_ok and result.spread_ok else 0.0
+        ),
+        "freshness": 5.0 if result.freshness_confirmation else 0.0,
+        "distance": 5.0 if distance_ok else 0.0,
+    }
+    return MappingProxyType(components)
 
 
 def _visible_confirmations(candidate: QtrSetupCandidate) -> tuple[str, ...]:
