@@ -8,7 +8,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, cast
 
 from market_signal_assistant.inplay.models import is_crypto_linear_usdt_metadata
@@ -83,6 +83,14 @@ class DemoTradingClient(Protocol):
     ) -> OrderAcknowledgement: ...
     def cancel_order(self, symbol: str, order_id: str) -> None: ...
     def execution_fill(self, order_id: str, symbol: str) -> ExecutionFill | None: ...
+    def protective_stop_fill(
+        self,
+        *,
+        symbol: str,
+        opened_at: datetime,
+        direction: object,
+        expected_qty: float,
+    ) -> ExecutionFill | None: ...
     def set_protective_stop(
         self, *, symbol: str, stop_price: float, position_idx: int = 0
     ) -> None: ...
@@ -376,6 +384,93 @@ class BybitDemoTradingClient:
             fee=fee,
             filled_at=datetime.fromtimestamp(timestamp / 1000, tz=UTC),
         )
+
+    def protective_stop_fill(
+        self,
+        *,
+        symbol: str,
+        opened_at: datetime,
+        direction: object,
+        expected_qty: float,
+    ) -> ExecutionFill | None:
+        """Recover a confirmed exchange-side protective StopLoss fill.
+
+        Recovery is intentionally strict. Disappearance of a remote
+        position alone is never treated as evidence of a stop execution.
+        """
+        normalized_symbol = symbol.upper().strip()
+        if not normalized_symbol or expected_qty <= 0:
+            return None
+        if opened_at.tzinfo is None:
+            return None
+
+        direction_value = str(getattr(direction, "value", direction)).upper()
+        close_side = {
+            "LONG": "Sell",
+            "SHORT": "Buy",
+        }.get(direction_value)
+        if close_side is None:
+            return None
+
+        opened_utc = opened_at.astimezone(UTC)
+        opened_ms = int(opened_utc.timestamp() * 1000)
+
+        # Bybit V5 history windows are bounded. QTR Micro positions are
+        # designed to close far inside this seven-day recovery window.
+        now_utc = datetime.now(UTC)
+        end_utc = min(now_utc, opened_utc + timedelta(days=7))
+        if end_utc < opened_utc:
+            return None
+
+        payload = self._request(
+            "GET",
+            "/v5/order/history",
+            {
+                "category": "linear",
+                "symbol": normalized_symbol,
+                "startTime": opened_ms,
+                "endTime": int(end_utc.timestamp() * 1000),
+                "limit": 100,
+            },
+        )
+
+        candidates: list[ExecutionFill] = []
+        for row in _result_list(payload):
+            if str(row.get("symbol", "")).upper() != normalized_symbol:
+                continue
+            if str(row.get("orderStatus", "")) != "Filled":
+                continue
+            if str(row.get("stopOrderType", "")) != "StopLoss":
+                continue
+            if str(row.get("side", "")) != close_side:
+                continue
+
+            reduce_only = row.get("reduceOnly")
+            if not (reduce_only is True or str(reduce_only).lower() == "true"):
+                continue
+
+            try:
+                updated_ms = int(str(row.get("updatedTime", "0")))
+            except ValueError:
+                continue
+            if updated_ms < opened_ms:
+                continue
+
+            order_id = str(row.get("orderId", "")).strip()
+            if not order_id:
+                continue
+
+            fill = self.execution_fill(order_id, normalized_symbol)
+            if fill is None or fill.filled_at < opened_utc:
+                continue
+            if fill.filled_qty + 1e-9 < expected_qty:
+                continue
+            candidates.append(fill)
+
+        # Ambiguous history must remain fail-closed.
+        if len(candidates) != 1:
+            return None
+        return candidates[0]
 
     def set_protective_stop(
         self, *, symbol: str, stop_price: float, position_idx: int = 0

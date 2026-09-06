@@ -641,6 +641,55 @@ class QtrMicroExecutionService:
                             )
                         else:
                             fill = None
+                elif (
+                    prior_position is not None
+                    and prior_position.stage
+                    in {
+                        MicroStage.OPEN,
+                        MicroStage.TP1_FILLED,
+                        MicroStage.TP2_FILLED,
+                        MicroStage.RUNNER,
+                    }
+                ):
+                    fill = self._client.protective_stop_fill(
+                        symbol=prior_position.symbol,
+                        opened_at=(
+                            prior_position.opened_at or prior_position.signal_at
+                        ),
+                        direction=prior_position.direction,
+                        expected_qty=prior_position.current_qty,
+                    )
+                    if fill is not None:
+                        closed_qty = min(fill.filled_qty, prior_position.current_qty)
+                        if closed_qty >= prior_position.current_qty:
+                            gross = _realised_pnl(prior_position, fill, closed_qty)
+                            position = replace(
+                                prior_position,
+                                current_qty=0.0,
+                                realised_partial_pnl=(
+                                    prior_position.realised_partial_pnl + gross
+                                ),
+                                fees=prior_position.fees + fill.fee,
+                                exit_fees=prior_position.exit_fees + fill.fee,
+                                stage=MicroStage.CLOSED,
+                                last_updated=fill.filled_at,
+                                pending_exit_order_id=None,
+                                pending_exit_order_link_id=None,
+                                pending_exit_reason=None,
+                                pending_exit_qty=0.0,
+                                pending_new_stop=None,
+                                runner_exit_price=fill.average_price,
+                            )
+                            records[trade_id] = position
+                            reason = MicroExitReason.STOP
+                            reconciled = record_trade_result(
+                                reconciled,
+                                pnl=position.realised_partial_pnl - position.fees,
+                                now=timestamp,
+                                settings=self._settings,
+                            )
+                        else:
+                            fill = None
                 elif position.runner_exit_price is not None:
                     fill = ExecutionFill(
                         order_id="durable-exit-fill",

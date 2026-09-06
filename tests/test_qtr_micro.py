@@ -272,6 +272,7 @@ class FakeClient:
         self.equity = 10_000.0
         self.stop_failures_remaining = 0
         self.fills_by_order: dict[str, ExecutionFill | None] = {}
+        self.protective_stop_recovery_fill: ExecutionFill | None = None
 
     def connectivity(self) -> None:
         if self.fail:
@@ -332,6 +333,17 @@ class FakeClient:
                 NOW,
             )
         return self.fill
+
+    def protective_stop_fill(
+        self,
+        *,
+        symbol: str,
+        opened_at: datetime,
+        direction: object,
+        expected_qty: float,
+    ) -> ExecutionFill | None:
+        del symbol, opened_at, direction, expected_qty
+        return self.protective_stop_recovery_fill
 
     def cancel_order(self, symbol: str, order_id: str) -> None:
         self.cancelled_orders.append((symbol, order_id))
@@ -2395,3 +2407,260 @@ def test_completion_restart_after_ack_and_after_fill_before_protection(
     protected = restarted_service.confirm_entry(plan.trade_id, NOW, rules=RULES)
     assert protected is not None and protected.stage is MicroStage.OPEN
     assert client.stop_calls == 1
+
+
+def test_completion_reconciliation_recovers_exchange_side_stop_exactly_once(
+    tmp_path: Path,
+) -> None:
+    plan = decision().plan
+    assert plan is not None
+    client = FakeClient()
+    stop_fill = ExecutionFill(
+        "bybit-protective-stop-1",
+        plan.stop_price,
+        plan.qty,
+        0.2,
+        NOW + timedelta(minutes=13),
+    )
+    client.protective_stop_recovery_fill = stop_fill
+    journal_path = tmp_path / "trades.jsonl"
+    store = JsonQtrMicroStateStore(tmp_path / "state.json")
+    opened = position_from_plan(
+        plan,
+        stage=MicroStage.OPEN,
+        current_qty=plan.qty,
+        opened_at=NOW,
+        last_updated=NOW,
+        pending_exit_order_id=None,
+        pending_exit_order_link_id=None,
+        pending_exit_reason=None,
+        pending_exit_qty=0.0,
+        runner_exit_price=None,
+        journaled=False,
+    )
+    store.save(state(positions={plan.trade_id: opened}))
+    client.positions = ()
+    client.active_orders = ()
+    service = QtrMicroExecutionService(
+        settings=settings(),
+        client=client,
+        state_store=store,
+        engine=QtrMicroEntryEngine(settings()),
+        journal=JsonlQtrMicroTradeJournal(journal_path),
+    )
+
+    first = service.reconcile(NOW + timedelta(minutes=14))
+
+    assert first.trading_enabled is True
+    assert first.blocked_reason is None
+    recovered = first.positions[plan.trade_id]
+    assert recovered.stage is MicroStage.CLOSED
+    assert recovered.current_qty == 0
+    assert recovered.journaled is True
+    assert recovered.runner_exit_price == stop_fill.average_price
+    assert recovered.exit_fees == stop_fill.fee
+    assert recovered.fees == opened.fees + stop_fill.fee
+    expected_pnl = (
+        recovered.realised_partial_pnl - recovered.fees
+    )
+    assert first.realised_daily_pnl == pytest.approx(expected_pnl)
+
+    rows = [
+        json.loads(line)
+        for line in journal_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(rows) == 1
+    assert rows[0]["trade_id"] == plan.trade_id
+    assert rows[0]["exit_reason"] == MicroExitReason.STOP.value
+
+    second = service.reconcile(NOW + timedelta(minutes=15))
+
+    assert second.trading_enabled is True
+    assert second.blocked_reason is None
+    rows_after_second_reconcile = [
+        json.loads(line)
+        for line in journal_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(rows_after_second_reconcile) == 1
+
+
+class ProtectiveStopRecoveryTransport:
+    base_url = DEMO_BASE_URL
+
+    def __init__(
+        self,
+        history: list[dict[str, object]],
+        executions: dict[str, list[dict[str, object]]],
+    ) -> None:
+        self.history = history
+        self.executions = executions
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        params: Any,
+        *,
+        authenticated: bool,
+    ) -> Any:
+        assert authenticated is True
+        assert method == "GET"
+        assert params["symbol"] == "FARTCOINUSDT"
+        if path == "/v5/order/history":
+            return {"result": {"list": self.history}}
+        if path == "/v5/execution/list":
+            order_id = str(params["orderId"])
+            return {"result": {"list": self.executions.get(order_id, [])}}
+        raise AssertionError(f"unexpected path: {path}")
+
+
+def stop_history_row(
+    order_id: str,
+    *,
+    symbol: str = "FARTCOINUSDT",
+    side: str = "Buy",
+    status: str = "Filled",
+    stop_order_type: str = "StopLoss",
+    reduce_only: bool = True,
+    updated_at: datetime = NOW + timedelta(minutes=13),
+) -> dict[str, object]:
+    return {
+        "orderId": order_id,
+        "symbol": symbol,
+        "side": side,
+        "orderStatus": status,
+        "stopOrderType": stop_order_type,
+        "reduceOnly": reduce_only,
+        "updatedTime": str(int(updated_at.timestamp() * 1000)),
+    }
+
+
+def execution_row(
+    *,
+    qty: float,
+    filled_at: datetime = NOW + timedelta(minutes=13),
+) -> dict[str, object]:
+    return {
+        "execQty": str(qty),
+        "execPrice": "0.15996",
+        "execFee": "0.02",
+        "execTime": str(int(filled_at.timestamp() * 1000)),
+    }
+
+
+def recover_stop(
+    history: list[dict[str, object]],
+    executions: dict[str, list[dict[str, object]]],
+    *,
+    expected_qty: float = 10.0,
+) -> ExecutionFill | None:
+    client = BybitDemoTradingClient(
+        ProtectiveStopRecoveryTransport(history, executions)
+    )
+    return client.protective_stop_fill(
+        symbol="FARTCOINUSDT",
+        opened_at=NOW,
+        direction=MicroDirection.SHORT,
+        expected_qty=expected_qty,
+    )
+
+
+def test_bybit_demo_client_recovers_only_confirmed_protective_stop() -> None:
+    history = [
+        stop_history_row("ordinary-close", stop_order_type="UNKNOWN"),
+        stop_history_row("wrong-side-stop", side="Sell"),
+        stop_history_row("confirmed-stop"),
+    ]
+    executions = {
+        "ordinary-close": [execution_row(qty=10)],
+        "wrong-side-stop": [execution_row(qty=10)],
+        "confirmed-stop": [execution_row(qty=10)],
+    }
+
+    fill = recover_stop(history, executions)
+
+    assert fill is not None
+    assert fill.order_id == "confirmed-stop"
+    assert fill.average_price == pytest.approx(0.15996)
+    assert fill.filled_qty == pytest.approx(10)
+    assert fill.fee == pytest.approx(0.02)
+    assert fill.filled_at == NOW + timedelta(minutes=13)
+
+
+@pytest.mark.parametrize(
+    ("history", "executions"),
+    (
+        (
+            [stop_history_row("not-reduce-only", reduce_only=False)],
+            {"not-reduce-only": [execution_row(qty=10)]},
+        ),
+        (
+            [
+                stop_history_row(
+                    "pre-open",
+                    updated_at=NOW - timedelta(milliseconds=1),
+                )
+            ],
+            {"pre-open": [execution_row(qty=10)]},
+        ),
+        (
+            [stop_history_row("partial")],
+            {"partial": [execution_row(qty=9.0)]},
+        ),
+        (
+            [stop_history_row("missing-execution")],
+            {},
+        ),
+    ),
+)
+def test_bybit_demo_client_rejects_unconfirmed_or_partial_stop(
+    history: list[dict[str, object]],
+    executions: dict[str, list[dict[str, object]]],
+) -> None:
+    assert recover_stop(history, executions) is None
+
+
+def test_bybit_demo_client_rejects_ambiguous_protective_stops() -> None:
+    history = [stop_history_row("stop-1"), stop_history_row("stop-2")]
+    executions = {
+        "stop-1": [execution_row(qty=10)],
+        "stop-2": [execution_row(qty=10)],
+    }
+
+    assert recover_stop(history, executions) is None
+
+
+def test_completion_reconciliation_never_invents_protective_stop(
+    tmp_path: Path,
+) -> None:
+    plan = decision().plan
+    assert plan is not None
+    client = FakeClient()
+    journal_path = tmp_path / "trades.jsonl"
+    store = JsonQtrMicroStateStore(tmp_path / "state.json")
+    opened = position_from_plan(
+        plan,
+        stage=MicroStage.OPEN,
+        current_qty=plan.qty,
+        opened_at=NOW,
+        journaled=False,
+    )
+    store.save(state(positions={plan.trade_id: opened}))
+    client.positions = ()
+    client.active_orders = ()
+    service = QtrMicroExecutionService(
+        settings=settings(),
+        client=client,
+        state_store=store,
+        engine=QtrMicroEntryEngine(settings()),
+        journal=JsonlQtrMicroTradeJournal(journal_path),
+    )
+
+    reconciled = service.reconcile(NOW + timedelta(minutes=14))
+
+    assert reconciled.trading_enabled is False
+    assert reconciled.blocked_reason is not None
+    assert reconciled.positions[plan.trade_id].stage is MicroStage.CLOSED
+    assert not journal_path.exists()
