@@ -2708,8 +2708,16 @@ def test_completion_reconciliation_recovers_exchange_side_stop_after_partial_exi
         pending_exit_reason=None,
         pending_exit_qty=0.0,
         runner_exit_price=None,
+        realised_partial_pnl=12.50,
+        entry_fees=0.40,
+        exit_fees=0.60,
+        fees=1.00,
         journaled=False,
     )
+
+    prior_gross = partial.realised_partial_pnl
+    prior_fees = partial.fees
+    prior_exit_fees = partial.exit_fees
 
     store.save(state(positions={plan.trade_id: partial}))
     client.positions = ()
@@ -2733,7 +2741,20 @@ def test_completion_reconciliation_recovers_exchange_side_stop_after_partial_exi
     assert recovered.current_qty == 0
     assert recovered.journaled is True
     assert recovered.runner_exit_price == stop_fill.average_price
-    assert recovered.exit_fees == stop_fill.fee
+
+    expected_stop_gross = (
+        (stop_fill.average_price - partial.average_fill) * current_qty
+        if partial.direction is MicroDirection.LONG
+        else (partial.average_fill - stop_fill.average_price) * current_qty
+    )
+    expected_total_gross = prior_gross + expected_stop_gross
+    expected_total_fees = prior_fees + stop_fill.fee
+    expected_exit_fees = prior_exit_fees + stop_fill.fee
+    expected_net = expected_total_gross - expected_total_fees
+
+    assert recovered.realised_partial_pnl == pytest.approx(expected_total_gross)
+    assert recovered.fees == pytest.approx(expected_total_fees)
+    assert recovered.exit_fees == pytest.approx(expected_exit_fees)
 
     rows = [
         json.loads(line)
@@ -2743,6 +2764,15 @@ def test_completion_reconciliation_recovers_exchange_side_stop_after_partial_exi
     assert len(rows) == 1
     assert rows[0]["trade_id"] == plan.trade_id
     assert rows[0]["exit_reason"] == MicroExitReason.STOP.value
+    assert rows[0]["realised_gross_pnl"] == pytest.approx(expected_total_gross)
+    assert rows[0]["realised_net_pnl"] == pytest.approx(expected_net)
+    assert rows[0]["gross_pnl"] == pytest.approx(expected_total_gross)
+    assert rows[0]["net_pnl"] == pytest.approx(expected_net)
+    assert rows[0]["entry_fees"] == pytest.approx(partial.entry_fees)
+    assert rows[0]["exit_fees"] == pytest.approx(
+        expected_total_fees - partial.entry_fees
+    )
+    assert rows[0]["total_fees"] == pytest.approx(expected_total_fees)
 
     second = service.reconcile(NOW + timedelta(minutes=22))
 
