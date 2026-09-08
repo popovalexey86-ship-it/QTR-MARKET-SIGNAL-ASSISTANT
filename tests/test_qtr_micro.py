@@ -2664,3 +2664,94 @@ def test_completion_reconciliation_never_invents_protective_stop(
     assert reconciled.blocked_reason is not None
     assert reconciled.positions[plan.trade_id].stage is MicroStage.CLOSED
     assert not journal_path.exists()
+
+@pytest.mark.parametrize(
+    ("stage", "remaining_qty"),
+    (
+        (MicroStage.TP1_FILLED, lambda plan: plan.tp2_qty + plan.runner_qty),
+        (MicroStage.TP2_FILLED, lambda plan: plan.runner_qty),
+        (MicroStage.RUNNER, lambda plan: plan.runner_qty),
+    ),
+)
+def test_completion_reconciliation_recovers_exchange_side_stop_after_partial_exit(
+    tmp_path: Path,
+    stage: MicroStage,
+    remaining_qty: Any,
+) -> None:
+    plan = decision().plan
+    assert plan is not None
+
+    current_qty = float(remaining_qty(plan))
+    assert current_qty > 0
+
+    client = FakeClient()
+    stop_fill = ExecutionFill(
+        "bybit-protective-stop-partial",
+        plan.stop_price,
+        current_qty,
+        0.15,
+        NOW + timedelta(minutes=20),
+    )
+    client.protective_stop_recovery_fill = stop_fill
+
+    journal_path = tmp_path / "trades.jsonl"
+    store = JsonQtrMicroStateStore(tmp_path / "state.json")
+
+    partial = position_from_plan(
+        plan,
+        stage=stage,
+        current_qty=current_qty,
+        opened_at=NOW,
+        last_updated=NOW + timedelta(minutes=10),
+        pending_exit_order_id=None,
+        pending_exit_order_link_id=None,
+        pending_exit_reason=None,
+        pending_exit_qty=0.0,
+        runner_exit_price=None,
+        journaled=False,
+    )
+
+    store.save(state(positions={plan.trade_id: partial}))
+    client.positions = ()
+    client.active_orders = ()
+
+    service = QtrMicroExecutionService(
+        settings=settings(),
+        client=client,
+        state_store=store,
+        engine=QtrMicroEntryEngine(settings()),
+        journal=JsonlQtrMicroTradeJournal(journal_path),
+    )
+
+    first = service.reconcile(NOW + timedelta(minutes=21))
+
+    assert first.trading_enabled is True
+    assert first.blocked_reason is None
+
+    recovered = first.positions[plan.trade_id]
+    assert recovered.stage is MicroStage.CLOSED
+    assert recovered.current_qty == 0
+    assert recovered.journaled is True
+    assert recovered.runner_exit_price == stop_fill.average_price
+    assert recovered.exit_fees == stop_fill.fee
+
+    rows = [
+        json.loads(line)
+        for line in journal_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(rows) == 1
+    assert rows[0]["trade_id"] == plan.trade_id
+    assert rows[0]["exit_reason"] == MicroExitReason.STOP.value
+
+    second = service.reconcile(NOW + timedelta(minutes=22))
+
+    assert second.trading_enabled is True
+    assert second.blocked_reason is None
+
+    rows_after_second_reconcile = [
+        json.loads(line)
+        for line in journal_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(rows_after_second_reconcile) == 1
