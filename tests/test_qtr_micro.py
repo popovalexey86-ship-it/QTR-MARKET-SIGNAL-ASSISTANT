@@ -66,6 +66,7 @@ from market_signal_assistant.qtr_micro.state import (
     JsonQtrMicroStateStore,
     empty_state,
 )
+from market_signal_assistant.qtr_micro.strategy import StrategyDecision
 from market_signal_assistant.qtr_setup_pilot.models import QtrSetupCandidate
 from market_signal_assistant.setup_engine import (
     SetupAnalysisInput,
@@ -2785,3 +2786,81 @@ def test_completion_reconciliation_recovers_exchange_side_stop_after_partial_exi
         if line.strip()
     ]
     assert len(rows_after_second_reconcile) == 1
+
+
+
+
+def test_legacy_strategy_matches_current_entry_gates() -> None:
+    from market_signal_assistant.qtr_micro.legacy_strategy import LegacyStrategy
+
+    config = settings()
+    strategy = LegacyStrategy(config)
+
+    accepted = candidate()
+    blocked = candidate(result_changes={"setup_state": SetupState.FORMING})
+
+    assert strategy.evaluate(accepted, now=NOW).accepted is decision(
+        accepted, config=config, now=NOW
+    ).accepted
+
+    assert strategy.evaluate(blocked, now=NOW).accepted is decision(
+        blocked, config=config, now=NOW
+    ).accepted
+
+
+def test_legacy_strategy_matches_additional_entry_gates() -> None:
+    from market_signal_assistant.qtr_micro.legacy_strategy import LegacyStrategy
+
+    config = settings()
+    strategy = LegacyStrategy(config)
+
+    cases = (
+        candidate(result_changes={"setup_type": SetupType.FALSE_BREAKOUT}),
+        candidate(result_changes={"direction": SetupDirection.NEUTRAL}),
+        candidate(result_changes={"spread_ok": False}),
+        candidate(result_changes={"distance_to_trigger_atr": 0.251}),
+    )
+
+    for item in cases:
+        assert strategy.evaluate(item, now=NOW).accepted is decision(
+            item, config=config, now=NOW
+        ).accepted
+
+def test_runtime_strategy_shadow_skip_does_not_block_existing_entry(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class ShadowSkipStrategy:
+        name = "shadow_skip"
+
+        def evaluate(self, candidate: QtrSetupCandidate, *, now: datetime):
+            return StrategyDecision.skip("forced_shadow_skip")
+
+    client = FakeClient()
+    client.auto_fill = True
+    store = JsonQtrMicroStateStore(tmp_path / "shadow-state.json")
+    runtime = QtrMicroRuntime(
+        settings=settings(),
+        client=client,
+        state_store=store,
+        allowed_chat_ids=frozenset(),
+        clock=lambda: NOW,
+        strategy=ShadowSkipStrategy(),
+        decision_audit=JsonlQtrMicroDecisionAudit(
+            tmp_path / "shadow-decisions.jsonl"
+        ),
+        runtime_audit=JsonlQtrMicroRuntimeAudit(
+            tmp_path / "shadow-runtime.jsonl"
+        ),
+    )
+
+    async def exercise() -> None:
+        assert (await runtime.initialize()).ready
+        await runtime.handle_candidates((candidate(),), _discard_message)
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(exercise())
+
+    assert len(client.orders) == 1
+    assert "strategy parity mismatch" in caplog.text
+    assert "forced_shadow_skip" in caplog.text

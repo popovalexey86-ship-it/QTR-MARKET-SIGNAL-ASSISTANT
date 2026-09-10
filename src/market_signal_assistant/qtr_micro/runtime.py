@@ -13,6 +13,7 @@ from market_signal_assistant.qtr_micro.journal import (
     JsonlQtrMicroDecisionAudit,
     JsonlQtrMicroTradeJournal,
 )
+from market_signal_assistant.qtr_micro.legacy_strategy import LegacyStrategy
 from market_signal_assistant.qtr_micro.models import (
     EntryPlan,
     MicroExitReason,
@@ -29,6 +30,7 @@ from market_signal_assistant.qtr_micro.runtime_audit import (
 )
 from market_signal_assistant.qtr_micro.settings import QtrMicroSettings
 from market_signal_assistant.qtr_micro.state import JsonQtrMicroStateStore
+from market_signal_assistant.qtr_micro.strategy import QtrMicroStrategy
 from market_signal_assistant.qtr_setup_pilot.models import QtrSetupCandidate
 from market_signal_assistant.setup_engine.models import SetupDirection, SetupState
 from market_signal_assistant.telegram.qtr_micro import (
@@ -99,6 +101,7 @@ class QtrMicroRuntime:
         clock: Callable[[], datetime] | None = None,
         decision_audit: JsonlQtrMicroDecisionAudit | None = None,
         runtime_audit: JsonlQtrMicroRuntimeAudit | None = None,
+        strategy: QtrMicroStrategy | None = None,
     ) -> None:
         self._settings = settings
         self._client = client
@@ -107,6 +110,7 @@ class QtrMicroRuntime:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._decision_audit = decision_audit or JsonlQtrMicroDecisionAudit()
         self._runtime_audit = runtime_audit or JsonlQtrMicroRuntimeAudit()
+        self._strategy = strategy or LegacyStrategy(settings)
         self._engine = QtrMicroEntryEngine(settings)
         self._execution = (
             QtrMicroExecutionService(
@@ -241,6 +245,10 @@ class QtrMicroRuntime:
                     rules = await asyncio.to_thread(
                         self._client.instrument_rules, candidate.result.symbol
                     )
+                    strategy_decision = self._strategy.evaluate(
+                        candidate,
+                        now=now,
+                    )
                     decision = self._engine.prepare_entry(
                         candidate,
                         now=now,
@@ -249,6 +257,15 @@ class QtrMicroRuntime:
                         state=state,
                         preflight=self._preflight_result,
                     )
+                    if strategy_decision.accepted != (decision.plan is not None):
+                        _LOGGER.warning(
+                            "QTR Micro strategy parity mismatch for %s: "
+                            "strategy=%s engine=%s reason=%s.",
+                            candidate.result.symbol,
+                            strategy_decision.accepted,
+                            decision.plan is not None,
+                            strategy_decision.reason,
+                        )
                     if decision.plan is None:
                         self._decision_audit.append_skip(
                             decided_at=now,
