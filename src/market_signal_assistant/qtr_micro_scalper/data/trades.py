@@ -72,11 +72,13 @@ class TradeFlowAccumulator:
         *,
         retention: timedelta = timedelta(seconds=75),
         clock: Clock | None = None,
+        prune_on_ingest: bool = True,
     ) -> None:
         if retention < timedelta(seconds=60):
             raise ValueError("Trade retention must be at least 60 seconds.")
         self._retention = retention
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._prune_on_ingest = prune_on_ingest
         self._events: dict[str, dict[str, PublicTradeEvent]] = {}
         self._cvd_process: dict[str, float] = {}
         self._cvd_by_day: dict[tuple[str, date], float] = {}
@@ -94,7 +96,8 @@ class TradeFlowAccumulator:
         identity = (event.symbol, event.trade_id)
         now = self._now()
         with self._lock:
-            self._prune_locked(now)
+            if self._prune_on_ingest:
+                self._prune_locked(now)
             symbol_events = self._events.setdefault(event.symbol, {})
             if event.trade_id in symbol_events:
                 return IngestResult(IngestStatus.DUPLICATE, identity)
