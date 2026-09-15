@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
@@ -33,6 +35,26 @@ class MarketDataProvider(Protocol):
 
 
 JsonGetter = Callable[[str, float], Mapping[str, Any]]
+
+
+@dataclass(frozen=True, slots=True)
+class PublicPriceQuote:
+    """One timestamped price from an unauthenticated public market endpoint."""
+
+    symbol: str
+    price: float
+    observed_at: datetime
+
+    def __post_init__(self) -> None:
+        symbol = self.symbol.strip().upper()
+        if not symbol:
+            raise ValueError("Public price symbol cannot be empty.")
+        if not math.isfinite(self.price) or self.price <= 0:
+            raise ValueError("Public market price must be positive and finite.")
+        if self.observed_at.tzinfo is None or self.observed_at.utcoffset() is None:
+            raise ValueError("Public price timestamp must be timezone-aware.")
+        object.__setattr__(self, "symbol", symbol)
+        object.__setattr__(self, "observed_at", self.observed_at.astimezone(UTC))
 
 
 def public_json_get(url: str, timeout: float) -> Mapping[str, Any]:
@@ -165,6 +187,35 @@ class BybitPublicProvider:
                 "Malformed Bybit instrument catalog response."
             ) from None
         return instruments
+
+    def latest_price(self, symbol: str) -> PublicPriceQuote:
+        """Load one unauthenticated ticker quote for shadow revalidation."""
+        normalized = symbol.strip().upper()
+        if not normalized:
+            raise MarketDataError("Bybit symbol cannot be empty.")
+        query = urlencode({"category": "linear", "symbol": normalized})
+        payload = self._request(f"https://api.bybit.com/v5/market/tickers?{query}")
+        if payload.get("retCode") != 0:
+            raise MarketDataError(
+                f"Bybit public API error code {payload.get('retCode')}."
+            )
+        try:
+            rows = payload["result"]["list"]
+            if not isinstance(rows, list):
+                raise ValueError
+            matching = tuple(
+                row
+                for row in rows
+                if isinstance(row, Mapping)
+                and str(row.get("symbol", "")).strip().upper() == normalized
+            )
+            if len(matching) != 1:
+                raise ValueError
+            price = float(matching[0]["lastPrice"])
+            observed_at = datetime.fromtimestamp(int(payload["time"]) / 1000, tz=UTC)
+            return PublicPriceQuote(normalized, price, observed_at)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            raise MarketDataError("Malformed Bybit public ticker response.") from None
 
     def _request(self, url: str) -> Mapping[str, Any]:
         last_error: MarketDataError | None = None
