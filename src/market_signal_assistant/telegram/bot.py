@@ -261,6 +261,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     qtr_setup_notifier: QtrSetupPilotNotifier | None = None
     qtr_micro_runtime: QtrMicroRuntime | None = None
     entry_readiness_observer: QtrSetupShadowObserver | None = None
+    entry_readiness_busy_observer: QtrSetupShadowObserver | None = None
     effective_qtr_setup_settings = QtrSetupTelegramSettings(
         enabled=qtr_setup_settings.enabled or qtr_micro_settings.enabled,
         minimum_quality=qtr_setup_settings.minimum_quality,
@@ -289,6 +290,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             from market_signal_assistant.qtr_entry_readiness.engine import (
                 EntryReadinessEngine,
             )
+            from market_signal_assistant.qtr_entry_readiness.run_audit import (
+                JsonlEntryReadinessRunAuditStore,
+            )
             from market_signal_assistant.qtr_entry_readiness.service import (
                 EntryReadinessShadowService,
             )
@@ -297,6 +301,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 EntryReadinessEngine(),
                 BybitPublicProvider(),
                 JsonlEntryReadinessAuditStore(),
+                run_audit_store=JsonlEntryReadinessRunAuditStore(),
             )
 
             def observe_entry_readiness(
@@ -305,6 +310,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 entry_readiness_service.evaluate(candidates, observed_at)
 
             entry_readiness_observer = observe_entry_readiness
+            entry_readiness_busy_observer = (
+                entry_readiness_service.record_skipped_busy
+            )
         if qtr_micro_settings.enabled:
             from market_signal_assistant.qtr_micro.client import (
                 BybitDemoTradingClient,
@@ -348,6 +356,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 else None
             ),
             shadow_observer=entry_readiness_observer,
+            shadow_busy_observer=entry_readiness_busy_observer,
         )
     elif entry_readiness_settings.enabled:
         _LOGGER.warning(

@@ -80,11 +80,16 @@ class JsonlEntryReadinessAuditStore:
 def append_safely(
     store: JsonlEntryReadinessAuditStore,
     records: tuple[EntryReadinessEvaluation, ...],
-) -> None:
+) -> bool:
     try:
         store.append(records)
-    except (OSError, TypeError, ValueError):
-        _LOGGER.warning("QTR Entry Readiness shadow audit append failed.")
+    except Exception as error:
+        _LOGGER.warning(
+            "QTR Entry Readiness shadow audit append failed (%s).",
+            type(error).__name__,
+        )
+        return False
+    return True
 
 
 def _ensure_line_boundary(path: Path) -> None:

@@ -692,6 +692,7 @@ def test_slow_shadow_observer_does_not_block_or_overlap_primary_scans(
     started = threading.Event()
     release = threading.Event()
     calls = 0
+    busy_scans: list[tuple[tuple[QtrSetupCandidate, ...], datetime]] = []
 
     def observe(
         items: tuple[QtrSetupCandidate, ...], observed_at: datetime
@@ -702,6 +703,11 @@ def test_slow_shadow_observer_does_not_block_or_overlap_primary_scans(
         started.set()
         release.wait(timeout=2.0)
 
+    def observe_busy(
+        items: tuple[QtrSetupCandidate, ...], observed_at: datetime
+    ) -> None:
+        busy_scans.append((items, observed_at))
+
     notifier = QtrSetupPilotNotifier(
         scanner=Scanner(),
         notification_service=service(tmp_path),
@@ -709,6 +715,7 @@ def test_slow_shadow_observer_does_not_block_or_overlap_primary_scans(
         allowed_chat_ids=frozenset((1,)),
         clock=lambda: NOW,
         shadow_observer=observe,
+        shadow_busy_observer=observe_busy,
     )
 
     async def run() -> None:
@@ -728,6 +735,9 @@ def test_slow_shadow_observer_does_not_block_or_overlap_primary_scans(
     asyncio.run(run())
 
     assert calls == 1
+    assert len(busy_scans) == 1
+    assert busy_scans[0][0][0].episode_id == "episode-1"
+    assert busy_scans[0][1] == NOW
 
 
 def test_setting_is_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:

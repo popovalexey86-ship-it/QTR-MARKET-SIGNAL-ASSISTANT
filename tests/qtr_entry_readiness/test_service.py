@@ -5,14 +5,18 @@ from collections.abc import Mapping
 from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from market_signal_assistant.providers import BybitPublicProvider, PublicPriceQuote
 from market_signal_assistant.qtr_entry_readiness.audit import (
     JsonlEntryReadinessAuditStore,
 )
 from market_signal_assistant.qtr_entry_readiness.engine import EntryReadinessEngine
-from market_signal_assistant.qtr_entry_readiness.models import UserReadiness
+from market_signal_assistant.qtr_entry_readiness.models import (
+    EntryReadinessRunStatus,
+    EntryReadinessRunTelemetry,
+    UserReadiness,
+)
 from market_signal_assistant.qtr_entry_readiness.service import (
     EntryReadinessShadowService,
 )
@@ -35,6 +39,14 @@ class SequencePriceProvider:
         if isinstance(value, Exception):
             raise value
         return value
+
+
+class RunRecords:
+    def __init__(self) -> None:
+        self.records: list[EntryReadinessRunTelemetry] = []
+
+    def append(self, record: EntryReadinessRunTelemetry) -> None:
+        self.records.append(record)
 
 
 def batch(price: float, at: datetime = NOW) -> Mapping[str, PublicPriceQuote]:
@@ -69,10 +81,12 @@ def test_wait_to_now_transition_is_tracked_causally(tmp_path: Path) -> None:
 
 def test_provider_failure_is_isolated_as_suppression(tmp_path: Path) -> None:
     path = tmp_path / "entry-readiness.jsonl"
+    runs = RunRecords()
     service = EntryReadinessShadowService(
         EntryReadinessEngine(),
         SequencePriceProvider([RuntimeError("public feed unavailable")]),
         JsonlEntryReadinessAuditStore(path),
+        run_audit_store=runs,
     )
 
     result = service.evaluate((candidate(),), NOW)
@@ -82,6 +96,160 @@ def test_provider_failure_is_isolated_as_suppression(tmp_path: Path) -> None:
     assert json.loads(path.read_text(encoding="utf-8"))["internal_reason"] == (
         "FRESH_PRICE_MISSING"
     )
+    assert [record.status for record in runs.records] == [
+        EntryReadinessRunStatus.STARTED,
+        EntryReadinessRunStatus.PROVIDER_FAILED,
+    ]
+    terminal = runs.records[-1]
+    assert terminal.error_type == "RuntimeError"
+    assert terminal.candidates_received == terminal.candidates_evaluated == 1
+    assert terminal.candidates_suppressed == terminal.prices_missing == 1
+    assert terminal.prices_received == 0
+
+
+def test_completed_run_telemetry_exposes_candidate_coverage(
+    tmp_path: Path,
+) -> None:
+    runs = RunRecords()
+    service = EntryReadinessShadowService(
+        EntryReadinessEngine(),
+        SequencePriceProvider([batch(100.2)]),
+        JsonlEntryReadinessAuditStore(tmp_path / "audit.jsonl"),
+        run_audit_store=runs,
+    )
+
+    result = service.evaluate((candidate(),), NOW)
+
+    assert len(result) == 1
+    assert [record.status for record in runs.records] == [
+        EntryReadinessRunStatus.STARTED,
+        EntryReadinessRunStatus.COMPLETED,
+    ]
+    started, completed = runs.records
+    assert completed.run_id == started.run_id
+    assert completed.candidates_received == 1
+    assert completed.candidates_evaluated == 1
+    assert completed.candidates_suppressed == 0
+    assert completed.prices_received == 1
+    assert completed.prices_missing == 0
+    assert completed.batch_price_latency_ms is not None
+    assert completed.total_run_latency_ms is not None
+    assert completed.candidate_coverage == 1.0
+
+
+def test_partial_missing_prices_are_visible_without_reducing_coverage(
+    tmp_path: Path,
+) -> None:
+    original = candidate()
+    other = replace(
+        original,
+        episode_id="eth-episode",
+        source_input=replace(original.source_input, symbol="ETHUSDT"),
+        result=replace(original.result, symbol="ETHUSDT"),
+    )
+    runs = RunRecords()
+    service = EntryReadinessShadowService(
+        EntryReadinessEngine(),
+        SequencePriceProvider([batch(100.2)]),
+        JsonlEntryReadinessAuditStore(tmp_path / "audit.jsonl"),
+        run_audit_store=runs,
+    )
+
+    result = service.evaluate((original, other), NOW)
+
+    assert len(result) == 2
+    completed = runs.records[-1]
+    assert completed.status is EntryReadinessRunStatus.COMPLETED
+    assert completed.candidates_received == completed.candidates_evaluated == 2
+    assert completed.prices_received == 1
+    assert completed.prices_missing == 1
+    assert completed.candidates_suppressed == 1
+
+
+def test_candidate_audit_failure_is_fail_open_and_marks_run_failed(
+    tmp_path: Path,
+) -> None:
+    class FailedCandidateAudit(JsonlEntryReadinessAuditStore):
+        def append(self, records: tuple[Any, ...]) -> None:
+            del records
+            raise OSError("disk unavailable")
+
+    runs = RunRecords()
+    service = EntryReadinessShadowService(
+        EntryReadinessEngine(),
+        SequencePriceProvider([batch(100.2)]),
+        FailedCandidateAudit(tmp_path / "audit.jsonl"),
+        run_audit_store=runs,
+    )
+
+    result = service.evaluate((candidate(),), NOW)
+
+    assert len(result) == 1
+    assert runs.records[-1].status is EntryReadinessRunStatus.FAILED
+    assert runs.records[-1].error_type == "CandidateAuditError"
+
+
+def test_run_audit_failure_does_not_escape_shadow_service(tmp_path: Path) -> None:
+    class FailedRunAudit:
+        def append(self, record: EntryReadinessRunTelemetry) -> None:
+            del record
+            raise OSError("disk unavailable")
+
+    service = EntryReadinessShadowService(
+        EntryReadinessEngine(),
+        SequencePriceProvider([batch(100.2)]),
+        JsonlEntryReadinessAuditStore(tmp_path / "audit.jsonl"),
+        run_audit_store=FailedRunAudit(),
+    )
+
+    assert len(service.evaluate((candidate(),), NOW)) == 1
+
+
+def test_busy_skip_records_run_without_requesting_prices(tmp_path: Path) -> None:
+    provider = SequencePriceProvider([])
+    runs = RunRecords()
+    service = EntryReadinessShadowService(
+        EntryReadinessEngine(),
+        provider,
+        JsonlEntryReadinessAuditStore(tmp_path / "audit.jsonl"),
+        run_audit_store=runs,
+    )
+
+    service.record_skipped_busy((candidate(),), NOW)
+
+    assert provider.calls == []
+    assert len(runs.records) == 1
+    record = runs.records[0]
+    assert record.status is EntryReadinessRunStatus.SKIPPED_BUSY
+    assert record.candidates_received == 1
+    assert record.candidates_evaluated == 0
+    assert record.prices_received == record.prices_missing == 0
+    assert record.batch_price_latency_ms is None
+    assert record.total_run_latency_ms is None
+
+
+def test_malformed_provider_response_is_fail_open(tmp_path: Path) -> None:
+    class MalformedPrices:
+        def latest_prices(
+            self, symbols: tuple[str, ...]
+        ) -> Mapping[str, PublicPriceQuote]:
+            del symbols
+            return cast(Mapping[str, PublicPriceQuote], None)
+
+    runs = RunRecords()
+    service = EntryReadinessShadowService(
+        EntryReadinessEngine(),
+        MalformedPrices(),
+        JsonlEntryReadinessAuditStore(tmp_path / "audit.jsonl"),
+        run_audit_store=runs,
+    )
+
+    result = service.evaluate((candidate(),), NOW)
+
+    assert len(result) == 1
+    assert result[0].internal_disposition.value == "SUPPRESSED"
+    assert runs.records[-1].status is EntryReadinessRunStatus.PROVIDER_FAILED
+    assert runs.records[-1].error_type == "MalformedProviderResponse"
 
 
 def test_bybit_public_provider_returns_timestamped_quote_without_private_api() -> None:

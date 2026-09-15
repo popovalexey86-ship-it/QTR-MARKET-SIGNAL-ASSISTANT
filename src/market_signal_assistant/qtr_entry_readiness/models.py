@@ -25,6 +25,14 @@ class InternalDisposition(StrEnum):
     SUPPRESSED = "SUPPRESSED"
 
 
+class EntryReadinessRunStatus(StrEnum):
+    STARTED = "STARTED"
+    COMPLETED = "COMPLETED"
+    SKIPPED_BUSY = "SKIPPED_BUSY"
+    PROVIDER_FAILED = "PROVIDER_FAILED"
+    FAILED = "FAILED"
+
+
 class InternalReason(StrEnum):
     ATR_MISSING = "ATR_MISSING"
     TRIGGER_MISSING = "TRIGGER_MISSING"
@@ -177,3 +185,57 @@ class EntryReadinessEpisodeState:
     first_wait_at: datetime | None
     first_now_at: datetime | None
     first_confirmation_observed_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class EntryReadinessRunTelemetry:
+    """Aggregate observability for one shadow evaluation attempt."""
+
+    recorded_at: datetime
+    run_id: str
+    status: EntryReadinessRunStatus
+    candidates_received: int
+    candidates_evaluated: int
+    candidates_suppressed: int
+    prices_received: int
+    prices_missing: int
+    batch_price_latency_ms: float | None
+    total_run_latency_ms: float | None
+    error_type: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.recorded_at.tzinfo is None or self.recorded_at.utcoffset() is None:
+            raise ValueError("Run telemetry timestamp must be timezone-aware.")
+        if not self.run_id.strip():
+            raise ValueError("Run telemetry id cannot be empty.")
+        for count in (
+            self.candidates_received,
+            self.candidates_evaluated,
+            self.candidates_suppressed,
+            self.prices_received,
+            self.prices_missing,
+        ):
+            if count < 0:
+                raise ValueError("Run telemetry counters cannot be negative.")
+        if self.candidates_evaluated > self.candidates_received:
+            raise ValueError("Evaluated candidates cannot exceed received candidates.")
+        if self.candidates_suppressed > self.candidates_evaluated:
+            raise ValueError(
+                "Suppressed candidates cannot exceed evaluated candidates."
+            )
+        if self.prices_received + self.prices_missing > self.candidates_received:
+            raise ValueError("Price coverage cannot exceed received candidates.")
+        for latency in (self.batch_price_latency_ms, self.total_run_latency_ms):
+            if latency is not None and (
+                not math.isfinite(latency) or latency < 0
+            ):
+                raise ValueError(
+                    "Run telemetry latency must be finite and non-negative."
+                )
+        object.__setattr__(self, "recorded_at", self.recorded_at.astimezone(UTC))
+
+    @property
+    def candidate_coverage(self) -> float | None:
+        if self.candidates_received == 0:
+            return None
+        return self.candidates_evaluated / self.candidates_received
