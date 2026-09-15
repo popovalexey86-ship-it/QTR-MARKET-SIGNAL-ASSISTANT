@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from datetime import datetime
+from collections import OrderedDict
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +12,9 @@ from market_signal_assistant.qtr_entry_readiness.models import (
     ENTRY_READINESS_SCHEMA_VERSION as ENTRY_READINESS_SCHEMA_VERSION,
 )
 from market_signal_assistant.qtr_entry_readiness.models import (
+    EntryReadinessEpisodeState,
     EntryReadinessEvaluation,
+    UserReadiness,
 )
 
 DEFAULT_ENTRY_READINESS_AUDIT_PATH = (
@@ -23,7 +26,7 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class JsonlEntryReadinessAuditStore:
-    """Durable append-only shadow journal; it never reads or rewrites history."""
+    """Append-only journal with streaming, bounded transition recovery."""
 
     def __init__(self, path: Path = DEFAULT_ENTRY_READINESS_AUDIT_PATH) -> None:
         self._path = path.resolve()
@@ -46,6 +49,32 @@ class JsonlEntryReadinessAuditStore:
             with self._path.open("a", encoding="utf-8", newline="\n") as stream:
                 stream.write("\n".join(lines))
                 stream.write("\n")
+
+    def recover_episode_states(
+        self, *, capacity: int
+    ) -> tuple[EntryReadinessEpisodeState, ...]:
+        """Stream bounded transition state without materializing JSONL history."""
+        if capacity <= 0:
+            raise ValueError("Entry-readiness state capacity must be positive.")
+        recovered: OrderedDict[str, EntryReadinessEpisodeState] = OrderedDict()
+        try:
+            with self._path.open("r", encoding="utf-8") as stream:
+                for line in stream:
+                    if not line.endswith("\n"):
+                        continue
+                    state = _episode_state_from_line(line, recovered)
+                    if state is None:
+                        continue
+                    recovered[state.setup_episode_key] = state
+                    recovered.move_to_end(state.setup_episode_key)
+                    while len(recovered) > capacity:
+                        recovered.popitem(last=False)
+        except FileNotFoundError:
+            return ()
+        except OSError:
+            _LOGGER.warning("QTR Entry Readiness shadow audit recovery failed.")
+            return ()
+        return tuple(recovered.values())
 
 
 def append_safely(
@@ -95,7 +124,9 @@ def _record_to_json(record: EntryReadinessEvaluation) -> dict[str, Any]:
             record.internal_reason.value if record.internal_reason else None
         ),
         "signal_time": _time(record.signal_time),
-        "confirmation_time": record.confirmation_time.isoformat(),
+        "first_confirmation_observed_at": _time(
+            record.first_confirmation_observed_at
+        ),
         "evaluation_time": record.evaluation_time.isoformat(),
         "fresh_price_time": _time(record.fresh_price_time),
         "signal_age_seconds": record.signal_age_seconds,
@@ -116,7 +147,7 @@ def _record_to_json(record: EntryReadinessEvaluation) -> dict[str, Any]:
         "risk_distance": record.risk_distance,
         "risk_distance_atr": record.risk_distance_atr,
         "risk_bucket": record.risk_bucket.value if record.risk_bucket else None,
-        "age_bucket": record.age_bucket.value,
+        "age_bucket": record.age_bucket.value if record.age_bucket else None,
         "structure_ok": record.structure_ok,
         "confirmation_ok": record.confirmation_ok,
         "retest_held": record.retest_held,
@@ -138,3 +169,74 @@ def _record_to_json(record: EntryReadinessEvaluation) -> dict[str, Any]:
         "first_now_at": _time(record.first_now_at),
         "wait_to_now_seconds": record.wait_to_now_seconds,
     }
+
+
+def _episode_state_from_line(
+    line: str,
+    recovered: OrderedDict[str, EntryReadinessEpisodeState],
+) -> EntryReadinessEpisodeState | None:
+    try:
+        raw = json.loads(line)
+        if not isinstance(raw, dict):
+            return None
+        key = str(raw["setup_episode_key"]).strip()
+        if not key:
+            return None
+        previous = recovered.get(key)
+        readiness = _readiness(raw.get("user_readiness"))
+        latest = readiness if readiness is not None else (
+            previous.latest_readiness if previous is not None else None
+        )
+        first_wait = _first_time(
+            raw,
+            "first_wait_at",
+            previous.first_wait_at if previous is not None else None,
+        )
+        first_now = _first_time(
+            raw,
+            "first_now_at",
+            previous.first_now_at if previous is not None else None,
+        )
+        confirmation = _first_time(
+            raw,
+            "first_confirmation_observed_at",
+            (
+                previous.first_confirmation_observed_at
+                if previous is not None
+                else None
+            ),
+        )
+        if latest is None and confirmation is None:
+            return None
+        return EntryReadinessEpisodeState(
+            setup_episode_key=key,
+            latest_readiness=latest,
+            first_wait_at=first_wait,
+            first_now_at=first_now,
+            first_confirmation_observed_at=confirmation,
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _readiness(value: object) -> UserReadiness | None:
+    try:
+        return UserReadiness(str(value)) if value is not None else None
+    except ValueError:
+        return None
+
+
+def _first_time(
+    raw: dict[str, Any],
+    key: str,
+    previous: datetime | None,
+) -> datetime | None:
+    if previous is not None:
+        return previous
+    value = raw.get(key)
+    if not isinstance(value, str):
+        return None
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(UTC)

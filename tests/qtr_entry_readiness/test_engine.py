@@ -7,7 +7,10 @@ from typing import Any
 import pytest
 
 from market_signal_assistant.providers import PublicPriceQuote
-from market_signal_assistant.qtr_entry_readiness.engine import EntryReadinessEngine
+from market_signal_assistant.qtr_entry_readiness.engine import (
+    EntryReadinessEngine,
+    setup_episode_key,
+)
 from market_signal_assistant.qtr_entry_readiness.models import (
     EntryReadinessConfig,
     EntryReadinessEvaluation,
@@ -78,6 +81,7 @@ def candidate(
     invalidation: float | None = None,
     source_changes: dict[str, Any] | None = None,
     result_changes: dict[str, Any] | None = None,
+    episode_id: str = "2026-09-15T11:59:00+00:00",
 ) -> QtrSetupCandidate:
     is_long = direction is SetupDirection.UP
     invalidation_value = (
@@ -128,7 +132,7 @@ def candidate(
     result_values.update(result_changes or {})
     result = replace(result, **result_values)
     return QtrSetupCandidate(
-        "2026-09-15T11:59:00+00:00",
+        episode_id,
         source,
         result,
         atr_value=atr,
@@ -147,9 +151,15 @@ def evaluate(
     *,
     at: datetime = NOW,
     quote_at: datetime | None = None,
+    confirmation_observed_at: datetime | None = None,
 ) -> EntryReadinessEvaluation:
     market = None if price is None else quote(price, quote_at or at)
-    return EntryReadinessEngine(EntryReadinessConfig()).evaluate(item, market, at)
+    return EntryReadinessEngine(EntryReadinessConfig()).evaluate(
+        item,
+        market,
+        at,
+        first_confirmation_observed_at=confirmation_observed_at,
+    )
 
 
 def test_user_readiness_has_only_wait_and_now() -> None:
@@ -275,7 +285,12 @@ def test_just_above_quarter_atr_waits() -> None:
 
 
 def test_confirmation_age_of_exactly_sixty_seconds_is_allowed() -> None:
-    result = evaluate(candidate(analyzed_at=NOW), 100.2, at=NOW + timedelta(seconds=60))
+    result = evaluate(
+        candidate(analyzed_at=NOW + timedelta(seconds=55)),
+        100.2,
+        at=NOW + timedelta(seconds=60),
+        confirmation_observed_at=NOW,
+    )
 
     assert result.user_readiness is UserReadiness.NOW
     assert result.confirmation_age_seconds == 60.0
@@ -286,6 +301,7 @@ def test_confirmation_older_than_sixty_seconds_is_suppressed() -> None:
         candidate(analyzed_at=NOW),
         100.2,
         at=NOW + timedelta(seconds=60, microseconds=1),
+        confirmation_observed_at=NOW,
     )
 
     assert result.user_readiness is None
@@ -372,3 +388,49 @@ def test_stale_public_quote_is_fail_closed() -> None:
 
     assert result.user_readiness is None
     assert result.internal_reason is InternalReason.FRESH_PRICE_MISSING
+
+
+def test_analyzed_at_is_not_used_as_confirmation_time() -> None:
+    result = evaluate(
+        candidate(analyzed_at=NOW - timedelta(hours=1)),
+        100.2,
+        at=NOW,
+    )
+
+    assert result.user_readiness is UserReadiness.NOW
+    assert result.first_confirmation_observed_at == NOW
+    assert result.confirmation_age_seconds == 0.0
+
+
+def test_unassigned_episode_fallback_ignores_per_scan_observations() -> None:
+    first = candidate(episode_id="unassigned")
+    second = replace(
+        first,
+        source_input=replace(
+            first.source_input,
+            snapshot_ids=("scan-2",),
+            analyzed_at=NOW + timedelta(minutes=5),
+            current_price=100.4,
+        ),
+        result=replace(
+            first.result,
+            analyzed_at=NOW + timedelta(minutes=5),
+            current_price=100.4,
+        ),
+    )
+
+    assert setup_episode_key(first) == setup_episode_key(second)
+
+
+def test_new_structural_breakout_has_new_episode_key() -> None:
+    first = candidate(episode_id="unassigned", trigger=100.0)
+    second = candidate(episode_id="unassigned", trigger=101.0)
+
+    assert setup_episode_key(first) != setup_episode_key(second)
+
+
+def test_new_breakout_level_splits_even_when_upstream_episode_id_is_unchanged() -> None:
+    first = candidate(episode_id="stable-sequence", trigger=100.0)
+    second = candidate(episode_id="stable-sequence", trigger=101.0)
+
+    assert setup_episode_key(first) != setup_episode_key(second)

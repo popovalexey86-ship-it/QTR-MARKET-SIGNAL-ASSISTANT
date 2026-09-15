@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -17,6 +18,14 @@ from market_signal_assistant.inplay.early_discovery_v2 import (
 from market_signal_assistant.inplay.notifications import (
     InPlayNotificationService,
     JsonInPlayNotificationStore,
+)
+from market_signal_assistant.providers import PublicPriceQuote
+from market_signal_assistant.qtr_entry_readiness.audit import (
+    JsonlEntryReadinessAuditStore,
+)
+from market_signal_assistant.qtr_entry_readiness.engine import EntryReadinessEngine
+from market_signal_assistant.qtr_entry_readiness.service import (
+    EntryReadinessShadowService,
 )
 from market_signal_assistant.qtr_micro_scalper.price_context_adapter import (
     JsonlVerifiedSetupProvider,
@@ -37,6 +46,7 @@ from market_signal_assistant.qtr_setup_pilot.notifications import (
 )
 from market_signal_assistant.qtr_setup_pilot.service import QtrSetupScanService
 from market_signal_assistant.settings import (
+    EntryReadinessShadowSettings,
     InPlayAutoSettings,
     QtrSetupTelegramSettings,
     TelegramSettings,
@@ -516,6 +526,210 @@ def test_delivery_failure_does_not_commit_and_retry_succeeds(
     assert len(handled) == 1
 
 
+def test_readiness_shadow_hook_is_off_without_observer(tmp_path: Path) -> None:
+    class Scanner:
+        def scan(self) -> tuple[QtrSetupCandidate, ...]:
+            return (candidate(),)
+
+    notifier = QtrSetupPilotNotifier(
+        scanner=Scanner(),
+        notification_service=service(tmp_path),
+        audit_store=JsonlQtrSetupTelegramAuditStore(tmp_path / "audit.jsonl"),
+        allowed_chat_ids=frozenset((1,)),
+        clock=lambda: NOW,
+    )
+    sent: list[str] = []
+
+    async def run() -> None:
+        async def send(chat_id: int, text: str) -> None:
+            assert chat_id == 1
+            sent.append(text)
+
+        assert await notifier.run_once(send) is True
+        await notifier.wait_for_shadow_observer()
+
+    asyncio.run(run())
+
+    assert len(sent) == 1
+
+
+def test_readiness_shadow_hook_is_audit_side_effect_only(tmp_path: Path) -> None:
+    class Scanner:
+        def scan(self) -> tuple[QtrSetupCandidate, ...]:
+            return (candidate(),)
+
+    observed: list[tuple[tuple[QtrSetupCandidate, ...], datetime]] = []
+
+    def observe(
+        items: tuple[QtrSetupCandidate, ...], observed_at: datetime
+    ) -> None:
+        observed.append((items, observed_at))
+
+    notifier = QtrSetupPilotNotifier(
+        scanner=Scanner(),
+        notification_service=service(tmp_path),
+        audit_store=JsonlQtrSetupTelegramAuditStore(tmp_path / "audit.jsonl"),
+        allowed_chat_ids=frozenset((1,)),
+        clock=lambda: NOW,
+        shadow_observer=observe,
+    )
+    sent: list[str] = []
+
+    async def run() -> None:
+        async def send(chat_id: int, text: str) -> None:
+            assert chat_id == 1
+            sent.append(text)
+
+        assert await notifier.run_once(send) is True
+        await notifier.wait_for_shadow_observer()
+
+    asyncio.run(run())
+
+    assert len(observed) == 1
+    assert observed[0][0][0].episode_id == "episode-1"
+    assert observed[0][1] == NOW
+    assert sent == [format_qtr_setup_event(event_from_candidate(candidate()))]
+
+
+def test_readiness_shadow_exception_does_not_change_telegram_flow(
+    tmp_path: Path,
+) -> None:
+    class Scanner:
+        def scan(self) -> tuple[QtrSetupCandidate, ...]:
+            return (candidate(),)
+
+    def fail(
+        items: tuple[QtrSetupCandidate, ...], observed_at: datetime
+    ) -> None:
+        del items, observed_at
+        raise RuntimeError("shadow unavailable")
+
+    notifier = QtrSetupPilotNotifier(
+        scanner=Scanner(),
+        notification_service=service(tmp_path),
+        audit_store=JsonlQtrSetupTelegramAuditStore(tmp_path / "audit.jsonl"),
+        allowed_chat_ids=frozenset((1,)),
+        clock=lambda: NOW,
+        shadow_observer=fail,
+    )
+    sent: list[str] = []
+
+    async def run() -> None:
+        async def send(chat_id: int, text: str) -> None:
+            del chat_id
+            sent.append(text)
+
+        assert await notifier.run_once(send) is True
+        await notifier.wait_for_shadow_observer()
+
+    asyncio.run(run())
+
+    assert len(sent) == 1
+    audit = json.loads((tmp_path / "audit.jsonl").read_text(encoding="utf-8"))
+    assert audit["delivery_committed"] is True
+
+
+def test_public_price_failure_in_shadow_does_not_change_telegram_flow(
+    tmp_path: Path,
+) -> None:
+    item = replace(candidate(), atr_value=2.0)
+
+    class Scanner:
+        def scan(self) -> tuple[QtrSetupCandidate, ...]:
+            return (item,)
+
+    class FailedPrices:
+        def latest_prices(
+            self, symbols: tuple[str, ...]
+        ) -> dict[str, PublicPriceQuote]:
+            del symbols
+            raise RuntimeError("public feed unavailable")
+
+    readiness_path = tmp_path / "readiness.jsonl"
+    readiness = EntryReadinessShadowService(
+        EntryReadinessEngine(),
+        FailedPrices(),
+        JsonlEntryReadinessAuditStore(readiness_path),
+    )
+
+    def observe(
+        items: tuple[QtrSetupCandidate, ...], observed_at: datetime
+    ) -> None:
+        readiness.evaluate(items, observed_at)
+
+    notifier = QtrSetupPilotNotifier(
+        scanner=Scanner(),
+        notification_service=service(tmp_path),
+        audit_store=JsonlQtrSetupTelegramAuditStore(tmp_path / "audit.jsonl"),
+        allowed_chat_ids=frozenset((1,)),
+        clock=lambda: NOW,
+        shadow_observer=observe,
+    )
+    sent: list[str] = []
+
+    async def run() -> None:
+        async def send(chat_id: int, text: str) -> None:
+            del chat_id
+            sent.append(text)
+
+        assert await notifier.run_once(send) is True
+        await notifier.wait_for_shadow_observer()
+
+    asyncio.run(run())
+
+    assert len(sent) == 1
+    readiness_record = json.loads(readiness_path.read_text(encoding="utf-8"))
+    assert readiness_record["internal_reason"] == "FRESH_PRICE_MISSING"
+
+
+def test_slow_shadow_observer_does_not_block_or_overlap_primary_scans(
+    tmp_path: Path,
+) -> None:
+    class Scanner:
+        def scan(self) -> tuple[QtrSetupCandidate, ...]:
+            return (candidate(),)
+
+    started = threading.Event()
+    release = threading.Event()
+    calls = 0
+
+    def observe(
+        items: tuple[QtrSetupCandidate, ...], observed_at: datetime
+    ) -> None:
+        nonlocal calls
+        del items, observed_at
+        calls += 1
+        started.set()
+        release.wait(timeout=2.0)
+
+    notifier = QtrSetupPilotNotifier(
+        scanner=Scanner(),
+        notification_service=service(tmp_path),
+        audit_store=JsonlQtrSetupTelegramAuditStore(tmp_path / "audit.jsonl"),
+        allowed_chat_ids=frozenset((1,)),
+        clock=lambda: NOW,
+        shadow_observer=observe,
+    )
+
+    async def run() -> None:
+        async def send(chat_id: int, text: str) -> None:
+            del chat_id, text
+
+        assert await asyncio.wait_for(notifier.run_once(send), timeout=0.5) is True
+        for _ in range(100):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.001)
+        assert started.is_set()
+        assert await asyncio.wait_for(notifier.run_once(send), timeout=0.5) is False
+        release.set()
+        await notifier.wait_for_shadow_observer()
+
+    asyncio.run(run())
+
+    assert calls == 1
+
+
 def test_setting_is_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("QTR_SETUP_TELEGRAM_ENABLED", raising=False)
     monkeypatch.delenv("QTR_SCANNER_TELEGRAM_MIN_QUALITY", raising=False)
@@ -524,6 +738,16 @@ def test_setting_is_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None
     assert settings.enabled is False
     assert settings.minimum_quality == 90.0
     assert settings.maximum_distance_atr == 1.2
+
+
+def test_entry_readiness_shadow_setting_is_disabled_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("QTR_ENTRY_READINESS_SHADOW_ENABLED", raising=False)
+    assert EntryReadinessShadowSettings.from_environment().enabled is False
+
+    monkeypatch.setenv("QTR_ENTRY_READINESS_SHADOW_ENABLED", "true")
+    assert EntryReadinessShadowSettings.from_environment().enabled is True
 
 
 def test_quality_and_distance_settings_are_configurable(
@@ -623,6 +847,9 @@ def test_qtr_pilot_uses_existing_telegram_lifecycle(tmp_path: Path) -> None:
             self.calls += 1
             await send(100, "пилот")
             return True
+
+        async def wait_for_shadow_observer(self) -> None:
+            return
 
     class FakeBot:
         def __init__(self) -> None:

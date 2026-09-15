@@ -294,6 +294,17 @@ class QtrSetupTelegramSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class EntryReadinessShadowSettings:
+    """Opt-in audit-only Entry Readiness observer for the Setup Pilot flow."""
+
+    enabled: bool = False
+
+    @classmethod
+    def from_environment(cls) -> EntryReadinessShadowSettings:
+        return cls(enabled=_environment_bool("QTR_ENTRY_READINESS_SHADOW_ENABLED"))
+
+
+@dataclass(frozen=True, slots=True)
 class NewsAutoSettings:
     enabled: bool = False
     interval_minutes: int = 60

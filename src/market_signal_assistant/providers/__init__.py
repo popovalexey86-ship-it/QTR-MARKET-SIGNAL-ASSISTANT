@@ -195,27 +195,25 @@ class BybitPublicProvider:
             raise MarketDataError("Bybit symbol cannot be empty.")
         query = urlencode({"category": "linear", "symbol": normalized})
         payload = self._request(f"https://api.bybit.com/v5/market/tickers?{query}")
-        if payload.get("retCode") != 0:
-            raise MarketDataError(
-                f"Bybit public API error code {payload.get('retCode')}."
-            )
-        try:
-            rows = payload["result"]["list"]
-            if not isinstance(rows, list):
-                raise ValueError
-            matching = tuple(
-                row
-                for row in rows
-                if isinstance(row, Mapping)
-                and str(row.get("symbol", "")).strip().upper() == normalized
-            )
-            if len(matching) != 1:
-                raise ValueError
-            price = float(matching[0]["lastPrice"])
-            observed_at = datetime.fromtimestamp(int(payload["time"]) / 1000, tz=UTC)
-            return PublicPriceQuote(normalized, price, observed_at)
-        except (KeyError, TypeError, ValueError, OverflowError):
-            raise MarketDataError("Malformed Bybit public ticker response.") from None
+        quotes = _public_price_quotes(payload, frozenset((normalized,)))
+        quote = quotes.get(normalized)
+        if quote is None:
+            raise MarketDataError("Malformed Bybit public ticker response.")
+        return quote
+
+    def latest_prices(
+        self, symbols: tuple[str, ...]
+    ) -> Mapping[str, PublicPriceQuote]:
+        """Load one shared public ticker snapshot for a complete shadow scan."""
+        normalized = frozenset(
+            item.strip().upper() for item in symbols if item.strip()
+        )
+        if not normalized:
+            return {}
+        payload = self._request(
+            "https://api.bybit.com/v5/market/tickers?category=linear"
+        )
+        return _public_price_quotes(payload, normalized)
 
     def _request(self, url: str) -> Mapping[str, Any]:
         last_error: MarketDataError | None = None
@@ -231,6 +229,43 @@ class BybitPublicProvider:
         raise MarketDataError(
             "Bybit public market data is temporarily unavailable."
         ) from last_error
+
+
+def _public_price_quotes(
+    payload: Mapping[str, Any], requested: frozenset[str]
+) -> Mapping[str, PublicPriceQuote]:
+    if payload.get("retCode") != 0:
+        raise MarketDataError(
+            f"Bybit public API error code {payload.get('retCode')}."
+        )
+    try:
+        rows = payload["result"]["list"]
+        if not isinstance(rows, list):
+            raise ValueError
+        observed_at = datetime.fromtimestamp(int(payload["time"]) / 1000, tz=UTC)
+        quotes: dict[str, PublicPriceQuote] = {}
+        ambiguous: set[str] = set()
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            symbol = str(row.get("symbol", "")).strip().upper()
+            if symbol not in requested or symbol in ambiguous:
+                continue
+            if symbol in quotes:
+                quotes.pop(symbol)
+                ambiguous.add(symbol)
+                continue
+            try:
+                quotes[symbol] = PublicPriceQuote(
+                    symbol,
+                    float(row["lastPrice"]),
+                    observed_at,
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+        return quotes
+    except (KeyError, TypeError, ValueError, OverflowError):
+        raise MarketDataError("Malformed Bybit public ticker response.") from None
 
 
 def _catalog_instrument(

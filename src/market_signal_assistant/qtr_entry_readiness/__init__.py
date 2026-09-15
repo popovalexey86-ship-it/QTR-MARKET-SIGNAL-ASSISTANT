@@ -9,6 +9,7 @@ from market_signal_assistant.qtr_entry_readiness.engine import EntryReadinessEng
 from market_signal_assistant.qtr_entry_readiness.models import (
     DistanceBucket,
     EntryReadinessConfig,
+    EntryReadinessEpisodeState,
     EntryReadinessEvaluation,
     InternalDisposition,
     InternalReason,
@@ -26,6 +27,7 @@ __all__ = (
     "DistanceBucket",
     "EntryReadinessConfig",
     "EntryReadinessEngine",
+    "EntryReadinessEpisodeState",
     "EntryReadinessEvaluation",
     "EntryReadinessShadowService",
     "InternalDisposition",

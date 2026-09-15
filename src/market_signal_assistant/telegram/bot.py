@@ -4,6 +4,7 @@ import asyncio
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Protocol
 
 from market_signal_assistant.application.models import ScreeningReport, ScreeningRequest
@@ -21,9 +22,11 @@ from market_signal_assistant.qtr_micro.runtime import (
     QtrMicroRuntimeStatus,
 )
 from market_signal_assistant.qtr_micro.settings import QtrMicroSettings
+from market_signal_assistant.qtr_setup_pilot.models import QtrSetupCandidate
 from market_signal_assistant.settings import (
     EarlyDiscoverySettings,
     EarlyDiscoveryV2Settings,
+    EntryReadinessShadowSettings,
     InPlayAutoSettings,
     InPlayTimingAuditSettings,
     LiveDerivativesSettings,
@@ -57,6 +60,7 @@ from market_signal_assistant.telegram.parsing import ParsedCommand, parse_comman
 from market_signal_assistant.telegram.qtr_setup_pilot import (
     QtrSetupPilotLoop,
     QtrSetupPilotNotifier,
+    QtrSetupShadowObserver,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -229,6 +233,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     early_discovery_settings = EarlyDiscoverySettings.from_environment()
     early_discovery_v2_settings = EarlyDiscoveryV2Settings.from_environment()
     qtr_setup_settings = QtrSetupTelegramSettings.from_environment()
+    entry_readiness_settings = EntryReadinessShadowSettings.from_environment()
     qtr_micro_settings = QtrMicroSettings.from_environment()
     news_settings = NewsSettings.from_environment()
     news_auto_settings = NewsAutoSettings.from_environment()
@@ -255,6 +260,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     qtr_setup_notifier: QtrSetupPilotNotifier | None = None
     qtr_micro_runtime: QtrMicroRuntime | None = None
+    entry_readiness_observer: QtrSetupShadowObserver | None = None
     effective_qtr_setup_settings = QtrSetupTelegramSettings(
         enabled=qtr_setup_settings.enabled or qtr_micro_settings.enabled,
         minimum_quality=qtr_setup_settings.minimum_quality,
@@ -275,6 +281,30 @@ def main(argv: Sequence[str] | None = None) -> None:
             early_discovery_v2_settings,
             inplay_evaluator=inplay_service,
         )
+        if entry_readiness_settings.enabled:
+            from market_signal_assistant.providers import BybitPublicProvider
+            from market_signal_assistant.qtr_entry_readiness.audit import (
+                JsonlEntryReadinessAuditStore,
+            )
+            from market_signal_assistant.qtr_entry_readiness.engine import (
+                EntryReadinessEngine,
+            )
+            from market_signal_assistant.qtr_entry_readiness.service import (
+                EntryReadinessShadowService,
+            )
+
+            entry_readiness_service = EntryReadinessShadowService(
+                EntryReadinessEngine(),
+                BybitPublicProvider(),
+                JsonlEntryReadinessAuditStore(),
+            )
+
+            def observe_entry_readiness(
+                candidates: tuple[QtrSetupCandidate, ...], observed_at: datetime
+            ) -> None:
+                entry_readiness_service.evaluate(candidates, observed_at)
+
+            entry_readiness_observer = observe_entry_readiness
         if qtr_micro_settings.enabled:
             from market_signal_assistant.qtr_micro.client import (
                 BybitDemoTradingClient,
@@ -317,6 +347,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                 if qtr_micro_runtime is not None
                 else None
             ),
+            shadow_observer=entry_readiness_observer,
+        )
+    elif entry_readiness_settings.enabled:
+        _LOGGER.warning(
+            "QTR Entry Readiness shadow hook не запущен: "
+            "QTR Setup candidate flow отключён."
         )
     news_service = build_news_service(news_settings)
     news_notification_service = build_news_notification_service(news_settings)

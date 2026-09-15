@@ -36,6 +36,9 @@ QtrSetupSender = Callable[[int, str], Awaitable[None]]
 QtrSetupCandidateHandler = Callable[
     [tuple[QtrSetupCandidate, ...], QtrSetupSender], Awaitable[None]
 ]
+QtrSetupShadowObserver = Callable[
+    [tuple[QtrSetupCandidate, ...], datetime], None
+]
 
 
 class QtrSetupPilotNotifier:
@@ -48,6 +51,7 @@ class QtrSetupPilotNotifier:
         allowed_chat_ids: frozenset[int],
         clock: Callable[[], datetime] | None = None,
         candidate_handler: QtrSetupCandidateHandler | None = None,
+        shadow_observer: QtrSetupShadowObserver | None = None,
     ) -> None:
         self._scanner = scanner
         self._notifications = notification_service
@@ -55,6 +59,8 @@ class QtrSetupPilotNotifier:
         self._allowed_chat_ids = allowed_chat_ids
         self._clock = clock or (lambda: datetime.now(UTC))
         self._candidate_handler = candidate_handler
+        self._shadow_observer = shadow_observer
+        self._shadow_task: asyncio.Task[None] | None = None
         self._lock = asyncio.Lock()
 
     async def run_once(self, send: QtrSetupSender) -> bool:
@@ -68,6 +74,7 @@ class QtrSetupPilotNotifier:
         try:
             async with self._lock:
                 candidates = await asyncio.to_thread(self._scanner.scan)
+                self._launch_shadow_observer(candidates)
                 plan = await asyncio.to_thread(
                     self._notifications.prepare, candidates, now
                 )
@@ -129,6 +136,43 @@ class QtrSetupPilotNotifier:
             )
             return False
 
+    def _launch_shadow_observer(
+        self, candidates: tuple[QtrSetupCandidate, ...]
+    ) -> None:
+        observer = self._shadow_observer
+        if observer is None:
+            return
+        if self._shadow_task is not None and not self._shadow_task.done():
+            _LOGGER.warning(
+                "QTR Entry Readiness shadow evaluation ещё выполняется; scan пропущен."
+            )
+            return
+        observed_at = self._clock()
+        self._shadow_task = asyncio.create_task(
+            self._run_shadow_observer(observer, candidates, observed_at)
+        )
+
+    async def _run_shadow_observer(
+        self,
+        observer: QtrSetupShadowObserver,
+        candidates: tuple[QtrSetupCandidate, ...],
+        observed_at: datetime,
+    ) -> None:
+        try:
+            await asyncio.to_thread(observer, candidates, observed_at)
+        except Exception as error:
+            _LOGGER.warning(
+                "QTR Entry Readiness shadow observer завершился ошибкой (%s).",
+                type(error).__name__,
+            )
+
+    async def wait_for_shadow_observer(self) -> None:
+        """Wait for the optional side effect during tests and graceful shutdown."""
+        task = self._shadow_task
+        if task is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
     def _write_audit(
         self,
         plan: QtrSetupNotificationPlan,
@@ -178,6 +222,7 @@ class QtrSetupPilotLoop:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+        await self._notifier.wait_for_shadow_observer()
 
     async def _run(self) -> None:
         while True:

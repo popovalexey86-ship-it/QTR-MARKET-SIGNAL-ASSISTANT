@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from types import MappingProxyType
 
-ENTRY_READINESS_SCHEMA_VERSION = 1
+ENTRY_READINESS_SCHEMA_VERSION = 2
 
 
 class UserReadiness(StrEnum):
@@ -102,11 +102,11 @@ class EntryReadinessEvaluation:
     internal_disposition: InternalDisposition
     internal_reason: InternalReason | None
     signal_time: datetime | None
-    confirmation_time: datetime
+    first_confirmation_observed_at: datetime | None
     evaluation_time: datetime
     fresh_price_time: datetime | None
     signal_age_seconds: float | None
-    confirmation_age_seconds: float
+    confirmation_age_seconds: float | None
     signal_price: float | None
     fresh_price: float | None
     trigger: float | None
@@ -121,7 +121,7 @@ class EntryReadinessEvaluation:
     risk_distance: float | None
     risk_distance_atr: float | None
     risk_bucket: RiskBucket | None
-    age_bucket: AgeBucket
+    age_bucket: AgeBucket | None
     structure_ok: bool
     confirmation_ok: bool
     retest_held: bool | None
@@ -142,11 +142,7 @@ class EntryReadinessEvaluation:
     def __post_init__(self) -> None:
         if self.schema_version != ENTRY_READINESS_SCHEMA_VERSION:
             raise ValueError("Unsupported entry-readiness schema version.")
-        for value in (
-            self.recorded_at,
-            self.confirmation_time,
-            self.evaluation_time,
-        ):
+        for value in (self.recorded_at, self.evaluation_time):
             if value.tzinfo is None or value.utcoffset() is None:
                 raise ValueError("Entry-readiness timestamps must be timezone-aware.")
         object.__setattr__(
@@ -159,6 +155,25 @@ class EntryReadinessEvaluation:
         object.__setattr__(
             self, "evaluation_time", self.evaluation_time.astimezone(UTC)
         )
-        object.__setattr__(
-            self, "confirmation_time", self.confirmation_time.astimezone(UTC)
-        )
+        if self.first_confirmation_observed_at is not None:
+            if (
+                self.first_confirmation_observed_at.tzinfo is None
+                or self.first_confirmation_observed_at.utcoffset() is None
+            ):
+                raise ValueError("Confirmation observation must be timezone-aware.")
+            object.__setattr__(
+                self,
+                "first_confirmation_observed_at",
+                self.first_confirmation_observed_at.astimezone(UTC),
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class EntryReadinessEpisodeState:
+    """Bounded state reconstructable from the append-only shadow audit."""
+
+    setup_episode_key: str
+    latest_readiness: UserReadiness | None
+    first_wait_at: datetime | None
+    first_now_at: datetime | None
+    first_confirmation_observed_at: datetime | None

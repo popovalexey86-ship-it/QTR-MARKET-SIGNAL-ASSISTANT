@@ -43,6 +43,8 @@ class EntryReadinessEngine:
         candidate: QtrSetupCandidate,
         quote: PublicPriceQuote | None,
         evaluated_at: datetime,
+        *,
+        first_confirmation_observed_at: datetime | None = None,
     ) -> EntryReadinessEvaluation:
         now = _utc(evaluated_at)
         result = candidate.result
@@ -52,8 +54,19 @@ class EntryReadinessEngine:
         trigger = _positive(result.trigger_level)
         atr = _positive(candidate.atr_value)
         invalidation = _positive(result.invalidation_level)
-        confirmation_time = _utc(result.analyzed_at)
-        confirmation_age = (now - confirmation_time).total_seconds()
+        confirmation_ok = confirmation_complete(candidate)
+        confirmation_time = (
+            _utc(first_confirmation_observed_at)
+            if first_confirmation_observed_at is not None
+            else now
+            if confirmation_ok
+            else None
+        )
+        confirmation_age = (
+            (now - confirmation_time).total_seconds()
+            if confirmation_time is not None
+            else None
+        )
         signal_time = _episode_time(candidate.episode_id)
         signal_age = (
             (now - signal_time).total_seconds() if signal_time is not None else None
@@ -63,7 +76,6 @@ class EntryReadinessEngine:
         fresh_price_time = (
             market_quote.observed_at if market_quote is not None else None
         )
-        confirmation_ok = _confirmation_ok(candidate)
         geometry_ok = _geometry_ok(direction, trigger, invalidation)
         structure_ok = bool(result.structure_confirmation and geometry_ok)
         correct_side = _correct_side(direction, fresh_price, trigger)
@@ -87,7 +99,7 @@ class EntryReadinessEngine:
             else None
         )
         quality_components = qtr_telegram_quality_components(candidate)
-        episode_key = _episode_key(candidate)
+        episode_key = setup_episode_key(candidate)
         disposition, internal_reason, readiness, wait_reason = self._decision(
             candidate=candidate,
             quote=market_quote,
@@ -125,7 +137,7 @@ class EntryReadinessEngine:
             internal_disposition=disposition,
             internal_reason=internal_reason,
             signal_time=signal_time,
-            confirmation_time=confirmation_time,
+            first_confirmation_observed_at=confirmation_time,
             evaluation_time=now,
             fresh_price_time=fresh_price_time,
             signal_age_seconds=signal_age,
@@ -173,7 +185,7 @@ class EntryReadinessEngine:
         *,
         candidate: QtrSetupCandidate,
         quote: PublicPriceQuote | None,
-        confirmation_age: float,
+        confirmation_age: float | None,
         confirmation_ok: bool,
         structure_ok: bool,
         correct_side: bool | None,
@@ -215,12 +227,12 @@ class EntryReadinessEngine:
             return _suppressed(InternalReason.SPREAD_BAD)
         if not result.liquidity_ok:
             return _suppressed(InternalReason.LIQUIDITY_BAD)
-        if confirmation_age < 0 or (
+        if not confirmation_ok:
+            return _evaluated(UserReadiness.WAIT, WaitReason.CONFIRMATION_PENDING)
+        if confirmation_age is None or confirmation_age < 0 or (
             confirmation_age > self._config.max_confirmation_age_seconds
         ):
             return _suppressed(InternalReason.STALE_CONFIRMATION)
-        if not confirmation_ok:
-            return _evaluated(UserReadiness.WAIT, WaitReason.CONFIRMATION_PENDING)
         if quote is None:
             return _suppressed(InternalReason.FRESH_PRICE_MISSING)
         if not structure_ok:
@@ -261,7 +273,7 @@ def _evaluated(
     return InternalDisposition.EVALUATED, None, readiness, reason
 
 
-def _confirmation_ok(candidate: QtrSetupCandidate) -> bool:
+def confirmation_complete(candidate: QtrSetupCandidate) -> bool:
     result = candidate.result
     if result.setup_type is SetupType.RETEST:
         return result.retest_held
@@ -409,7 +421,9 @@ def _risk_bucket(value: float | None) -> RiskBucket | None:
     return RiskBucket.ABOVE_200
 
 
-def _age_bucket(value: float) -> AgeBucket:
+def _age_bucket(value: float | None) -> AgeBucket | None:
+    if value is None:
+        return None
     if value <= 30:
         return AgeBucket.ZERO_TO_30
     if value <= 60:
@@ -428,11 +442,20 @@ def _episode_time(value: str) -> datetime | None:
         return None
 
 
-def _episode_key(candidate: QtrSetupCandidate) -> str:
-    episode = candidate.episode_id
+def setup_episode_key(candidate: QtrSetupCandidate) -> str:
+    """Return a structural identity that excludes per-scan observations."""
+    trigger = _stable_number(candidate.result.trigger_level)
+    episode = candidate.episode_id.strip()
     if episode == "unassigned":
-        episode = hashlib.sha256(
-            "|".join(candidate.source_input.snapshot_ids).encode("utf-8")
+        fallback = {
+            "source": candidate.source_input.source,
+            "symbol": candidate.result.symbol,
+            "direction": candidate.result.direction.value,
+            "setup_type": candidate.result.setup_type.value,
+            "trigger": trigger,
+        }
+        episode = "struct-" + hashlib.sha256(
+            json.dumps(fallback, sort_keys=True).encode("utf-8")
         ).hexdigest()[:20]
     return "::".join(
         (
@@ -440,8 +463,15 @@ def _episode_key(candidate: QtrSetupCandidate) -> str:
             candidate.result.direction.value,
             candidate.result.setup_type.value,
             episode,
+            trigger,
         )
     )
+
+
+def _stable_number(value: float | None) -> str:
+    if value is None or not math.isfinite(value):
+        return "missing"
+    return format(value, ".15g")
 
 
 def _candidate_id(candidate: QtrSetupCandidate) -> str:

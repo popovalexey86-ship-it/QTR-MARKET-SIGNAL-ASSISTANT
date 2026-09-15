@@ -30,6 +30,8 @@ def test_audit_is_append_only_and_json_serializable(tmp_path: Path) -> None:
     assert rows[1]["quality_components"]["structure"] == 20.0
     assert rows[1]["entry_zone_low"] == 100.0
     assert rows[1]["distance_bucket"] == "0.00-0.15_ATR"
+    assert rows[1]["first_confirmation_observed_at"] == NOW.isoformat()
+    assert "confirmation_time" not in rows[1]
 
 
 def test_audit_payload_contains_no_secret_fields(tmp_path: Path) -> None:
@@ -78,3 +80,27 @@ def test_transition_fields_are_serialized(tmp_path: Path) -> None:
     assert row["previous_user_readiness"] == "WAIT"
     assert row["transition"] == "WAIT_TO_NOW"
     assert row["wait_to_now_seconds"] == 0.0
+
+
+def test_recovery_streams_valid_state_and_ignores_incomplete_tail(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "entry-readiness.jsonl"
+    store = JsonlEntryReadinessAuditStore(path)
+    store.append(
+        (
+            replace(
+                evaluate(candidate(), 100.6),
+                first_wait_at=NOW,
+            ),
+        )
+    )
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write('{"setup_episode_key":"partial"')
+
+    recovered = store.recover_episode_states(capacity=10)
+
+    assert len(recovered) == 1
+    assert recovered[0].latest_readiness is UserReadiness.WAIT
+    assert recovered[0].first_wait_at == NOW
+    assert recovered[0].first_confirmation_observed_at == NOW
