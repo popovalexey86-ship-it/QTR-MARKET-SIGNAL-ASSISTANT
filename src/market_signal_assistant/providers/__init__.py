@@ -73,7 +73,14 @@ class CsvMarketDataProvider:
 
 
 class BybitPublicProvider:
-    _INTERVALS = {"5m": "5", "15m": "15", "1h": "60", "4h": "240", "1d": "D"}
+    _INTERVALS = {
+        "1m": "1",
+        "5m": "5",
+        "15m": "15",
+        "1h": "60",
+        "4h": "240",
+        "1d": "D",
+    }
 
     def __init__(
         self,
@@ -81,10 +88,14 @@ class BybitPublicProvider:
         getter: JsonGetter = public_json_get,
         sleep: Callable[[float], None] = time.sleep,
         timeout: float = 10.0,
+        request_gate: Callable[[], None] | None = None,
+        request_observer: Callable[[], None] | None = None,
     ) -> None:
         self._getter = getter
         self._sleep = sleep
         self._timeout = timeout
+        self._request_gate = request_gate or (lambda: None)
+        self._request_observer = request_observer or (lambda: None)
 
     def load(
         self,
@@ -136,19 +147,15 @@ class BybitPublicProvider:
         )
 
     def list_instruments(self) -> tuple[CatalogInstrument, ...]:
-        info = self._request(
-            "https://api.bybit.com/v5/market/instruments-info?"
-            "category=linear&limit=1000"
-        )
+        info_rows = self._list_linear_instrument_rows()
         tickers = self._request(
             "https://api.bybit.com/v5/market/tickers?category=linear"
         )
         try:
-            if info.get("retCode") != 0 or tickers.get("retCode") != 0:
+            if tickers.get("retCode") != 0:
                 raise ValueError
-            info_rows = info["result"]["list"]
             ticker_rows = tickers["result"]["list"]
-            if not isinstance(info_rows, list) or not isinstance(ticker_rows, list):
+            if not isinstance(ticker_rows, list):
                 raise ValueError
             ticker_by_symbol = {
                 str(row["symbol"]): row
@@ -166,12 +173,48 @@ class BybitPublicProvider:
             ) from None
         return instruments
 
+    def _list_linear_instrument_rows(self) -> list[Mapping[str, Any]]:
+        rows: list[Mapping[str, Any]] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        while True:
+            parameters = {"category": "linear", "limit": 1000}
+            if cursor is not None:
+                parameters["cursor"] = cursor
+            payload = self._request(
+                "https://api.bybit.com/v5/market/instruments-info?"
+                + urlencode(parameters)
+            )
+            try:
+                if payload.get("retCode") != 0:
+                    raise ValueError
+                result = payload["result"]
+                page = result["list"]
+                next_cursor = result.get("nextPageCursor", "")
+                if not isinstance(page, list) or not isinstance(next_cursor, str):
+                    raise ValueError
+                rows.extend(item for item in page if isinstance(item, Mapping))
+            except (KeyError, TypeError, ValueError):
+                raise MarketDataError(
+                    "Malformed Bybit instrument catalog response."
+                ) from None
+            cursor = next_cursor.strip() or None
+            if cursor is None:
+                return rows
+            if cursor in seen_cursors:
+                raise MarketDataError(
+                    "Bybit instrument catalog repeated a pagination cursor."
+                )
+            seen_cursors.add(cursor)
+
     def _request(self, url: str) -> Mapping[str, Any]:
         last_error: MarketDataError | None = None
         for attempt, delay in enumerate((0.0, 0.5, 1.5), start=1):
             if delay:
                 self._sleep(delay)
             try:
+                self._request_gate()
+                self._request_observer()
                 return self._getter(url, self._timeout)
             except MarketDataError as error:
                 last_error = error
@@ -204,9 +247,24 @@ def _catalog_instrument(
             contract_type=str(row["contractType"]),
             symbol_type=str(row["symbolType"]),
             is_pre_listing=is_pre_listing,
+            launch_time=_catalog_launch_time(row.get("launchTime")),
         )
     except (KeyError, TypeError, ValueError):
         raise MarketDataError("Malformed Bybit instrument catalog response.") from None
+
+
+def _catalog_launch_time(value: object) -> datetime | None:
+    if value in (None, "", 0, "0"):
+        return None
+    try:
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            raise ValueError
+        milliseconds = int(value)
+        if milliseconds <= 0:
+            raise ValueError
+        return datetime.fromtimestamp(milliseconds / 1000, tz=UTC)
+    except (TypeError, ValueError, OSError):
+        raise MarketDataError("Malformed Bybit instrument launch time.") from None
 
 
 class YahooPublicProvider:
@@ -329,6 +387,7 @@ def _completed_candles(
     now: datetime | None = None,
 ) -> tuple[Candle, ...]:
     duration = {
+        "1m": timedelta(minutes=1),
         "5m": timedelta(minutes=5),
         "15m": timedelta(minutes=15),
         "1h": timedelta(hours=1),

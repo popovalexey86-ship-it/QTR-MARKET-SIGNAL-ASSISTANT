@@ -66,12 +66,12 @@ class UnifiedCollectorStatus:
 async def default_websocket_factory(url: str) -> AsyncWebSocket:
     """Open a socket lazily; importing or constructing collectors is offline."""
     try:
-        from websockets.asyncio.client import connect  # type: ignore[import-not-found]
+        from websockets.asyncio.client import connect
     except ImportError as exc:
         raise LiveMarketDataError(
             "Live Scalper V2 requires the optional websocket dependency."
         ) from exc
-    return await connect(url)  # type: ignore[no-any-return]
+    return await connect(url)
 
 
 class BybitPublicStream:

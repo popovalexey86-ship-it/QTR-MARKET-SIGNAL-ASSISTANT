@@ -12,3 +12,5 @@ data/
 .env
 
 .pytest_tmp*/
+.watchdog_shadow*/
+.test_tmp/

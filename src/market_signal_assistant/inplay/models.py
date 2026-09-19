@@ -36,6 +36,7 @@ class CatalogInstrument:
     contract_type: str
     symbol_type: str
     is_pre_listing: bool
+    launch_time: datetime | None = None
 
     def __post_init__(self) -> None:
         if not all(
@@ -52,6 +53,17 @@ class CatalogInstrument:
             raise ValueError("Required catalog metadata cannot be empty.")
         if not isinstance(self.is_pre_listing, bool):
             raise ValueError("Catalog pre-listing flag must be boolean.")
+        if self.launch_time is not None:
+            if (
+                self.launch_time.tzinfo is None
+                or self.launch_time.utcoffset() is None
+            ):
+                raise ValueError("Catalog launch time must be timezone-aware.")
+            object.__setattr__(
+                self,
+                "launch_time",
+                self.launch_time.astimezone(UTC),
+            )
         values = (self.turnover_24h, self.bid, self.ask)
         if any(not math.isfinite(value) or value < 0 for value in values):
             raise ValueError("Catalog market values must be finite and non-negative.")

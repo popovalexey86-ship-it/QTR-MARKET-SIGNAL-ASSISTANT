@@ -19,7 +19,14 @@ def payloads() -> dict[str, Mapping[str, Any]]:
     return {
         "funding/history": {
             "retCode": 0,
-            "result": {"list": [{"fundingRate": "0.00025"}]},
+            "result": {
+                "list": [
+                    {
+                        "fundingRate": "0.00025",
+                        "fundingRateTimestamp": "3000",
+                    }
+                ]
+            },
         },
         "open-interest": {
             "retCode": 0,
@@ -60,6 +67,10 @@ def test_collect_maps_funding_oi_price_and_volume_without_ticker() -> None:
     assert result.open_interest_change == pytest.approx(0.10)
     assert result.price_change == pytest.approx(0.05)
     assert result.volume_change == pytest.approx(0.25)
+    assert result.funding_observed_at == datetime.fromtimestamp(3, tz=UTC)
+    assert result.funding_available_at == NOW
+    assert result.open_interest_observed_at == datetime.fromtimestamp(2, tz=UTC)
+    assert result.open_interest_available_at == NOW
     assert len(urls) == 3
     assert not any("ticker" in url for url in urls)
 

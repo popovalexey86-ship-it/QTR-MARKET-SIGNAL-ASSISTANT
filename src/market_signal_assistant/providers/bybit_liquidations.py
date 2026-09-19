@@ -149,7 +149,7 @@ class BybitLiquidationStream:
 
 def _pybit_websocket_factory(**kwargs: object) -> LiquidationSocket:
     try:
-        from pybit.unified_trading import WebSocket  # type: ignore[import-not-found]
+        from pybit.unified_trading import WebSocket  # type: ignore[import-untyped]
     except ImportError:
         raise DerivativesDataError(
             "WebSocket support requires the optional 'websocket' dependency."

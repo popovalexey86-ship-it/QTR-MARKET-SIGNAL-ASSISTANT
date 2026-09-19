@@ -34,6 +34,10 @@ class DerivativesSnapshot:
     volume_change: float
     long_liquidations: float = 0.0
     short_liquidations: float = 0.0
+    funding_observed_at: datetime | None = None
+    funding_available_at: datetime | None = None
+    open_interest_observed_at: datetime | None = None
+    open_interest_available_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if not self.provider.strip() or not self.symbol.strip():
@@ -56,6 +60,34 @@ class DerivativesSnapshot:
             raise ValueError("Open interest cannot be negative.")
         if self.long_liquidations < 0 or self.short_liquidations < 0:
             raise ValueError("Liquidation notionals cannot be negative.")
+        for prefix in ("funding", "open_interest"):
+            observed = getattr(self, f"{prefix}_observed_at")
+            available = getattr(self, f"{prefix}_available_at")
+            if (observed is None) != (available is None):
+                raise ValueError(
+                    f"{prefix} provenance requires observed and available times."
+                )
+            if observed is not None and available is not None:
+                normalized_observed = _utc(observed)
+                normalized_available = _utc(available)
+                if normalized_observed > normalized_available:
+                    raise ValueError(
+                        f"{prefix} cannot be available before observation."
+                    )
+                if normalized_available > self.as_of:
+                    raise ValueError(f"{prefix} availability cannot follow as_of.")
+                object.__setattr__(
+                    self, f"{prefix}_observed_at", normalized_observed
+                )
+                object.__setattr__(
+                    self, f"{prefix}_available_at", normalized_available
+                )
+
+
+def _utc(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("Derivatives provenance time must be timezone-aware.")
+    return value.astimezone(UTC)
 
 
 @dataclass(frozen=True, slots=True)

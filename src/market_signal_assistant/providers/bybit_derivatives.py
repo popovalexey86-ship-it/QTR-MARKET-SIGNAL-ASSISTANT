@@ -34,6 +34,8 @@ class BybitDerivativesProvider:
         open_interest_interval: str = "5min",
         timeout: float = 10.0,
         clock: Callable[[], datetime] | None = None,
+        request_gate: Callable[[], None] | None = None,
+        request_observer: Callable[[], None] | None = None,
     ) -> None:
         self._liquidations = liquidations
         self._getter = getter
@@ -42,6 +44,8 @@ class BybitDerivativesProvider:
         self._open_interest_interval = open_interest_interval
         self._timeout = timeout
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._request_gate = request_gate or (lambda: None)
+        self._request_observer = request_observer or (lambda: None)
 
     def collect(self, symbol: str) -> DerivativesSnapshot:
         normalized_symbol = symbol.strip().upper()
@@ -98,6 +102,9 @@ class BybitDerivativesProvider:
             raise DerivativesDataError(
                 "Bybit derivatives clock must be timezone-aware."
             )
+        funding_observed_at = _optional_timestamp(
+            _first_mapping(funding, "funding").get("fundingRateTimestamp")
+        )
         return DerivativesSnapshot(
             provider=self.name,
             symbol=normalized_symbol,
@@ -111,6 +118,14 @@ class BybitDerivativesProvider:
             volume_change=_change(current_volume, previous_volume, "volume"),
             long_liquidations=long_liquidations,
             short_liquidations=short_liquidations,
+            funding_observed_at=funding_observed_at,
+            funding_available_at=(
+                as_of if funding_observed_at is not None else None
+            ),
+            open_interest_observed_at=_timestamp(
+                current_oi.get("timestamp"), "open interest timestamp"
+            ),
+            open_interest_available_at=as_of,
         )
 
     def _request(
@@ -120,6 +135,8 @@ class BybitDerivativesProvider:
     ) -> Mapping[str, Any]:
         query = urlencode({"category": self._category, **parameters})
         try:
+            self._request_gate()
+            self._request_observer()
             payload = self._getter(
                 f"{self._BASE_URL}/{endpoint}?{query}", self._timeout
             )
@@ -205,3 +222,12 @@ def _change(current: float, previous: float, label: str) -> float:
     if previous == 0:
         raise DerivativesDataError(f"Previous Bybit {label} cannot be zero.")
     return current / previous - 1.0
+
+
+def _timestamp(value: object, field: str) -> datetime:
+    milliseconds = _number(value, field)
+    return datetime.fromtimestamp(milliseconds / 1000.0, tz=UTC)
+
+
+def _optional_timestamp(value: object) -> datetime | None:
+    return None if value is None else _timestamp(value, "funding timestamp")
