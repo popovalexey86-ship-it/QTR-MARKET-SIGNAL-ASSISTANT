@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import math
 from collections import defaultdict, deque
 from collections.abc import Callable, Mapping, Sequence
@@ -149,12 +150,13 @@ class BybitLiquidationStream:
 
 def _pybit_websocket_factory(**kwargs: object) -> LiquidationSocket:
     try:
-        from pybit.unified_trading import WebSocket  # type: ignore[import-untyped]
+        pybit: Any = importlib.import_module("pybit.unified_trading")
     except ImportError:
         raise DerivativesDataError(
             "WebSocket support requires the optional 'websocket' dependency."
         ) from None
-    return WebSocket(**kwargs)  # type: ignore[no-any-return]
+    socket: LiquidationSocket = pybit.WebSocket(**kwargs)
+    return socket
 
 
 def _liquidation_rows(message: object) -> list[Any]:

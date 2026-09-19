@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from market_signal_assistant.watchdog.journal import JournalConflictError
 from market_signal_assistant.watchdog.runtime.baseline_report import (
     build_baseline_report,
 )
@@ -132,6 +133,57 @@ def test_long_gap_is_explicit_and_backfill_policy_is_pit_safe(tmp_path: Path) ->
     assert ledger.records()[0]["safe_backfill"] == (
         "OHLCV_BASELINE_ONLY_AT_RECOVERY_AVAILABILITY"
     )
+
+
+def test_live_ake_gap_retry_exposes_both_conflicting_payloads(
+    tmp_path: Path,
+) -> None:
+    first = datetime(2026, 9, 19, 17, 11, tzinfo=UTC)
+    last = datetime(2026, 9, 19, 18, 15, tzinfo=UTC)
+    persisted = SchedulingGap(
+        "AKEUSDT",
+        "1m",
+        first,
+        last,
+        65,
+        datetime(2026, 9, 19, 18, 16, 2, 324620, tzinfo=UTC),
+    )
+    retry = SchedulingGap(
+        "AKEUSDT",
+        "1m",
+        first,
+        last,
+        65,
+        datetime(2026, 9, 19, 18, 16, 23, 622068, tzinfo=UTC),
+    )
+    ledger = GapLedger(tmp_path / "gaps.jsonl")
+    assert persisted.gap_id == (
+        "c842ad7066ac045909417eba7f646721271987ee8e22e3d51bf5eaa8d9fede90"
+    )
+    assert retry.gap_id == persisted.gap_id
+    assert ledger.append(persisted) is True
+
+    with pytest.raises(JournalConflictError) as captured:
+        ledger.append(retry)
+
+    error = captured.value
+    assert error.journal_path == (tmp_path / "gaps.jsonl").resolve()
+    assert error.record_id == persisted.gap_id
+    assert error.existing_payload["recorded_at"] == (
+        "2026-09-19T18:16:02.324620+00:00"
+    )
+    assert error.attempted_payload["recorded_at"] == (
+        "2026-09-19T18:16:23.622068+00:00"
+    )
+    assert {
+        key: value
+        for key, value in error.existing_payload.items()
+        if key != "recorded_at"
+    } == {
+        key: value
+        for key, value in error.attempted_payload.items()
+        if key != "recorded_at"
+    }
 
 
 def test_storage_pressure_is_measured_without_deleting_evidence(

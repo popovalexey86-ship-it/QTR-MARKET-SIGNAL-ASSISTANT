@@ -14,8 +14,15 @@ from typing import Any
 from market_signal_assistant.watchdog.runtime.composition import (
     build_bybit_shadow_runtime,
 )
+from market_signal_assistant.watchdog.runtime.health import JsonRuntimeHealthStore
+from market_signal_assistant.watchdog.runtime.liveness import (
+    ConfirmedHealthyClock,
+    RuntimeLiveness,
+    SoakLivenessError,
+)
 from market_signal_assistant.watchdog.runtime.models import ShadowRuntimeConfig
 from market_signal_assistant.watchdog.runtime.operator import inspect
+from market_signal_assistant.watchdog.runtime.service import WatchdogShadowRuntime
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -25,15 +32,28 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--symbols-per-loop", type=int, default=8)
     parser.add_argument("--api-calls-per-minute", type=int, default=60)
     parser.add_argument("--checkpoint-seconds", type=float, default=30.0)
+    parser.add_argument("--probe-seconds", type=float, default=1.0)
+    parser.add_argument("--liveness-timeout-seconds", type=float, default=300.0)
     args = parser.parse_args(argv)
-    if args.duration_hours <= 0 or args.checkpoint_seconds <= 0:
-        parser.error("duration and checkpoint interval must be positive")
+    if any(
+        value <= 0
+        for value in (
+            args.duration_hours,
+            args.checkpoint_seconds,
+            args.probe_seconds,
+            args.liveness_timeout_seconds,
+        )
+    ):
+        parser.error("duration, checkpoint, probe, and liveness must be positive")
 
     checkpoint_path = args.data_root / "state" / "soak.json"
     checkpoint = _load_checkpoint(checkpoint_path)
-    accumulated = float(checkpoint.get("accumulated_seconds", 0.0))
+    confirmed = ConfirmedHealthyClock(
+        float(checkpoint.get("accumulated_seconds", 0.0)),
+        stale_after_seconds=args.liveness_timeout_seconds,
+    )
     target = args.duration_hours * 3600.0
-    if accumulated >= target:
+    if confirmed.accumulated_seconds >= target:
         print(json.dumps(inspect(args.data_root), sort_keys=True, default=str))
         return 0
 
@@ -45,10 +65,11 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     runtime = bundle.runtime
-    segment_started = time.monotonic()
     started_at = datetime.now(UTC)
     stop_requested = threading.Event()
     exit_reason = ["target_reached"]
+    exit_code = 0
+    last_checkpoint = time.monotonic()
 
     def request_stop(signum: int, _frame: object) -> None:
         exit_reason[0] = f"signal_{signum}"
@@ -58,28 +79,91 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, request_stop)
     runtime.start()
     try:
-        while accumulated + time.monotonic() - segment_started < target:
-            if stop_requested.wait(min(args.checkpoint_seconds, 30.0)):
+        while confirmed.accumulated_seconds < target:
+            if stop_requested.wait(args.probe_seconds):
                 break
-            _save_checkpoint(
-                checkpoint_path,
-                accumulated + time.monotonic() - segment_started,
-                target,
-                started_at,
-                "running",
-            )
+            monotonic_now = time.monotonic()
+            try:
+                advanced = confirmed.observe(
+                    _runtime_liveness(
+                        runtime,
+                        datetime.now(UTC),
+                        args.data_root / "state" / "health.json",
+                    ),
+                    monotonic_now=monotonic_now,
+                )
+            except SoakLivenessError as error:
+                exit_reason[0] = f"failed:{error}"
+                exit_code = 1
+                break
+            if advanced or monotonic_now - last_checkpoint >= args.checkpoint_seconds:
+                _save_checkpoint(
+                    checkpoint_path,
+                    confirmed.accumulated_seconds,
+                    target,
+                    started_at,
+                    "running",
+                )
+                last_checkpoint = monotonic_now
     finally:
-        elapsed = accumulated + time.monotonic() - segment_started
-        runtime.stop(timeout=45.0)
+        try:
+            runtime.stop(timeout=45.0)
+        except Exception as error:
+            exit_reason[0] = f"failed:stop:{type(error).__name__}"
+            exit_code = 1
         _save_checkpoint(
             checkpoint_path,
-            elapsed,
+            confirmed.accumulated_seconds,
             target,
             started_at,
             exit_reason[0],
         )
     print(json.dumps(inspect(args.data_root), sort_keys=True, default=str))
-    return 0
+    return exit_code
+
+
+def _runtime_liveness(
+    runtime: WatchdogShadowRuntime,
+    observed_at: datetime,
+    health_path: Path,
+) -> RuntimeLiveness:
+    failure = runtime.fatal_error
+    try:
+        health = JsonRuntimeHealthStore(health_path).load()
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise SoakLivenessError(
+            f"runtime health is unreadable: {type(error).__name__}"
+        ) from error
+    health = health or {}
+    return RuntimeLiveness(
+        observed_at=observed_at,
+        running=runtime.running,
+        fatal_error=type(failure).__name__ if failure is not None else None,
+        last_loop_at=_health_time(health.get("last_loop_at")),
+        last_market_progress_at=_health_time(
+            health.get("last_successful_market_update")
+        ),
+        progress_marker=(
+            health.get("last_successful_market_update"),
+            health.get("symbols_processed"),
+            health.get("api_calls"),
+        ),
+        degraded=health.get("degraded") is not False,
+    )
+
+
+def _health_time(value: object) -> datetime | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise SoakLivenessError("runtime health timestamp is invalid")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as error:
+        raise SoakLivenessError("runtime health timestamp is invalid") from error
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise SoakLivenessError("runtime health timestamp is timezone-naive")
+    return parsed.astimezone(UTC)
 
 
 def _load_checkpoint(path: Path) -> dict[str, Any]:

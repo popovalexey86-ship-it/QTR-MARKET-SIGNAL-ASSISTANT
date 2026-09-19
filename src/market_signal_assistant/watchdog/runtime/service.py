@@ -14,6 +14,7 @@ from market_signal_assistant.models import AssetClass, Candle, Instrument, Marke
 from market_signal_assistant.watchdog.engine import WatchdogDetectionEngine
 from market_signal_assistant.watchdog.events.journal import WatchdogEventJournal
 from market_signal_assistant.watchdog.events.models import WatchdogEventEvidence
+from market_signal_assistant.watchdog.journal import JournalConflictError
 from market_signal_assistant.watchdog.outcomes.models import PriceObservation
 from market_signal_assistant.watchdog.outcomes.scheduler import ForwardOutcomeScheduler
 from market_signal_assistant.watchdog.runtime.audit import (
@@ -168,10 +169,17 @@ class WatchdogShadowRuntime:
         self._rotation_offset = 0
         self._loop_durations: list[float] = []
         self._storage_snapshot: StorageSnapshot | None = None
+        self._failure_lock = Lock()
+        self._fatal_error: Exception | None = None
 
     @property
     def running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def fatal_error(self) -> Exception | None:
+        with self._failure_lock:
+            return self._fatal_error
 
     @property
     def universe_snapshot(self) -> UniverseSnapshot | None:
@@ -201,6 +209,8 @@ class WatchdogShadowRuntime:
         if self._instance_lock is not None:
             self._instance_lock.acquire()
         self._stop.clear()
+        with self._failure_lock:
+            self._fatal_error = None
         self._mark_started(self._clock())
         self._thread = Thread(
             target=self._run_forever,
@@ -293,15 +303,25 @@ class WatchdogShadowRuntime:
                     missing_count = (
                         plan.omitted_bucket_count + max(0, len(boundaries) - 1)
                     )
+                    missing_through = first + duration * (missing_count - 1)
                     self._gaps.append(
                         SchedulingGap(
                             entry.instrument.symbol,
                             rule.interval,
                             first,
-                            first + duration * (missing_count - 1),
+                            missing_through,
                             missing_count,
-                            loop_time,
+                            missing_through + duration,
                         )
+                    )
+                    # Persist acknowledgement of the intentionally skipped
+                    # historical range before processing the latest bucket.
+                    # If that latest bucket fails, the next loop retries only
+                    # it instead of emitting the same immutable gap again.
+                    self._cursors.save(
+                        entry.instrument.symbol,
+                        rule.interval,
+                        missing_through,
                     )
                     # Do not manufacture retrospective detections from candles
                     # fetched only after a long outage. Resume at the latest
@@ -438,13 +458,28 @@ class WatchdogShadowRuntime:
                 self.run_once()
                 self._stop.wait(self._config.loop_interval.total_seconds())
         except Exception as error:
-            self._audit(
-                OperationalEventType.FATAL_ERROR,
-                self._clock(),
-                (("error", type(error).__name__),),
-            )
-            self._degraded(f"fatal:{type(error).__name__}", self._clock())
-            self._write_health()
+            with self._failure_lock:
+                self._fatal_error = error
+            occurred_at = self._clock()
+            details = [("error", type(error).__name__)]
+            if isinstance(error, JournalConflictError):
+                details.extend(
+                    (
+                        ("journal", str(error.journal_path)),
+                        ("record_id", error.record_id),
+                    )
+                )
+            try:
+                self._audit(
+                    OperationalEventType.FATAL_ERROR,
+                    occurred_at,
+                    tuple(details),
+                )
+                self._degraded(f"fatal:{type(error).__name__}", occurred_at)
+                self._write_health()
+            except Exception:
+                # The original failure remains authoritative for the supervisor.
+                return
 
     def _refresh_universe(self, now: datetime) -> None:
         if (

@@ -5,6 +5,8 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from market_signal_assistant.derivatives.models import DerivativesSnapshot
 from market_signal_assistant.inplay.models import CatalogInstrument
 from market_signal_assistant.models import AssetClass, Candle, Instrument, MarketSeries
@@ -21,6 +23,7 @@ from market_signal_assistant.watchdog.detectors import (
 from market_signal_assistant.watchdog.engine import WatchdogDetectionEngine
 from market_signal_assistant.watchdog.events.journal import WatchdogEventJournal
 from market_signal_assistant.watchdog.features import WatchdogFeatureBuilder
+from market_signal_assistant.watchdog.journal import JournalConflictError
 from market_signal_assistant.watchdog.outcomes.journal import WatchdogOutcomeJournal
 from market_signal_assistant.watchdog.outcomes.price_journal import WatchdogPriceJournal
 from market_signal_assistant.watchdog.outcomes.scheduler import (
@@ -28,6 +31,7 @@ from market_signal_assistant.watchdog.outcomes.scheduler import (
     JsonOutcomeCheckpointStore,
 )
 from market_signal_assistant.watchdog.runtime.audit import OperationalAuditJournal
+from market_signal_assistant.watchdog.runtime.gaps import GapLedger
 from market_signal_assistant.watchdog.runtime.health import JsonRuntimeHealthStore
 from market_signal_assistant.watchdog.runtime.models import ShadowRuntimeConfig
 from market_signal_assistant.watchdog.runtime.schedule import JsonBucketCursorStore
@@ -252,6 +256,76 @@ def test_derivatives_failure_degrades_but_market_pipeline_continues(
     )
 
 
+def test_failed_latest_bucket_acknowledges_gap_without_reemitting_it(
+    tmp_path: Path,
+) -> None:
+    clock = MutableClock(NOW)
+    provider = FixtureProvider(clock, ("ABCUSDT",))
+    cursor_path = tmp_path / "state" / "buckets.json"
+    JsonBucketCursorStore(cursor_path).save(
+        "ABCUSDT", "5m", NOW - timedelta(minutes=30)
+    )
+    provider.failures["ABCUSDT"] = 3
+    config = ShadowRuntimeConfig(
+        maximum_catchup_buckets=3,
+        maximum_workers=1,
+        retry_jitter=0.0,
+    )
+    first = _runtime(tmp_path, provider, clock, config=config)
+
+    failed = first.run_once(now=NOW)
+
+    assert failed.symbols_failed == 1
+    assert JsonBucketCursorStore(cursor_path).get("ABCUSDT", "5m") == (
+        NOW - timedelta(minutes=5)
+    )
+    gaps = GapLedger(tmp_path / "operational" / "gaps.jsonl")
+    assert len(gaps.records()) == 1
+    assert gaps.records()[0]["recorded_at"] == NOW.isoformat()
+
+    restarted = _runtime(tmp_path, provider, clock, config=config)
+    recovered = restarted.run_once(now=NOW)
+
+    assert recovered.symbols_processed == 1
+    assert len(gaps.records()) == 1
+    assert JsonBucketCursorStore(cursor_path).get("ABCUSDT", "5m") == NOW
+
+
+@pytest.mark.parametrize("failure_type", (RuntimeError, JournalConflictError))
+def test_background_runtime_exposes_fatal_worker_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[Exception],
+) -> None:
+    clock = MutableClock(NOW)
+    provider = FixtureProvider(clock, ("ABCUSDT",))
+    runtime = _runtime(tmp_path, provider, clock)
+    failure = (
+        JournalConflictError(
+            journal_path=tmp_path / "events.jsonl",
+            record_id="event-1",
+            existing_payload={"event_id": "event-1", "value": 1},
+            attempted_payload={"event_id": "event-1", "value": 2},
+        )
+        if failure_type is JournalConflictError
+        else RuntimeError("injected market loop failure")
+    )
+
+    def explode(*, now: datetime | None = None) -> object:
+        del now
+        raise failure
+
+    monkeypatch.setattr(runtime, "run_once", explode)
+    runtime.start()
+    deadline = time.monotonic() + 2.0
+    while runtime.running and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert runtime.running is False
+    assert runtime.fatal_error is failure
+    runtime.stop(timeout=2.0)
+
+
 def _runtime(
     root: Path,
     provider: FixtureProvider,
@@ -316,6 +390,7 @@ def _runtime(
         cursors=JsonBucketCursorStore(root / "state" / "buckets.json"),
         audit=OperationalAuditJournal(root / "operational" / "runtime.jsonl"),
         health_store=JsonRuntimeHealthStore(root / "state" / "health.json"),
+        gaps=GapLedger(root / "operational" / "gaps.jsonl"),
         config=config
         or ShadowRuntimeConfig(
             universe_refresh=timedelta(minutes=15),

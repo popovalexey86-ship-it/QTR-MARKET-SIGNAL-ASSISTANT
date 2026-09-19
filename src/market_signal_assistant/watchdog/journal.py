@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
@@ -10,6 +11,22 @@ from typing import cast
 
 class JournalConflictError(RuntimeError):
     """A logical record ID was reused with different immutable evidence."""
+
+    def __init__(
+        self,
+        *,
+        journal_path: Path,
+        record_id: str,
+        existing_payload: Mapping[str, object],
+        attempted_payload: Mapping[str, object],
+    ) -> None:
+        self.journal_path = journal_path
+        self.record_id = record_id
+        self.existing_payload = dict(existing_payload)
+        self.attempted_payload = dict(attempted_payload)
+        super().__init__(
+            f"Conflicting immutable record {record_id} in {journal_path}."
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,7 +71,10 @@ class ImmutableJsonlJournal:
             if existing is not None:
                 if existing != normalized:
                     raise JournalConflictError(
-                        f"Conflicting immutable record: {record_id}."
+                        journal_path=self._path,
+                        record_id=record_id,
+                        existing_payload=existing,
+                        attempted_payload=normalized,
                     )
                 return False
             self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -100,7 +120,10 @@ class ImmutableJsonlJournal:
                     if existing is not None:
                         if existing != payload:
                             raise JournalConflictError(
-                                f"Conflicting journal history: {record_id}."
+                                journal_path=self._path,
+                                record_id=record_id,
+                                existing_payload=existing,
+                                attempted_payload=payload,
                             )
                         continue
                     payloads[record_id] = payload

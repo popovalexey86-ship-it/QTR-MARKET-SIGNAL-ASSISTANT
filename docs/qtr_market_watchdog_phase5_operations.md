@@ -23,7 +23,11 @@ rebuilt from JSONL at any time.
   boundary the loop enters explicit degraded mode and stops new market writes;
   raw evidence is never deleted to make a check pass.
 - `operator` is a read-only health/audit/state/gap/storage/index inspector.
-- `soak` is resumable through atomic `state/soak.json` checkpoints.
+- `soak` is resumable through atomic `state/soak.json` checkpoints. Its clock
+  advances only when a fresh, non-degraded runtime heartbeat and new market
+  progress jointly confirm the preceding interval. Worker death, a fatal
+  invariant error, stale health, or stalled market progress freezes the clock
+  and exits non-zero so the service enters its restart path.
 
 ## Resumable soak commands
 
@@ -42,45 +46,54 @@ python -m market_signal_assistant.watchdog.runtime.baseline_report \
   --output <report.json>
 ```
 
-Stopping and restarting the soak continues its accumulated real wall duration.
-A forced termination can lose at most the configured checkpoint interval, but
-event, price, outcome, baseline, state, gap, and cursor durability do not depend
-on the soak checkpoint.
+Stopping and restarting the soak continues only its accumulated confirmed
+healthy duration. Startup, degraded intervals, provider outages, frozen loops,
+and time after the last confirmed market progress are never backfilled into the
+acceptance clock. A forced termination loses any unconfirmed interval after the
+last atomic checkpoint; event, price, outcome, baseline, state, gap, and cursor
+durability do not depend on the soak checkpoint.
 
-## Proposed systemd configuration (not installed)
+## Phase 5 isolated systemd configuration
 
 ```ini
 [Unit]
-Description=QTR Market Watchdog Shadow
-After=network-online.target
+Description=QTR Market Watchdog Phase 5 isolated shadow soak
 Wants=network-online.target
+After=network-online.target
+ConditionPathIsDirectory=/opt/qtr/watchdog-shadow
+ConditionPathIsDirectory=/opt/qtr/watchdog-shadow-data/phase5-soak
 
 [Service]
 Type=simple
 User=qtr
 Group=qtr
-WorkingDirectory=/opt/qtr/watchdog
-EnvironmentFile=/etc/qtr/watchdog.env
-ExecStart=/opt/qtr/watchdog/.venv/bin/python -m \
+WorkingDirectory=/opt/qtr/watchdog-shadow
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/qtr/watchdog-shadow/.venv/bin/python -m \
   market_signal_assistant.watchdog.runtime.soak \
-  --data-root /var/lib/qtr/watchdog --duration-hours 24
+  --data-root /opt/qtr/watchdog-shadow-data/phase5-soak \
+  --duration-hours 24 --symbols-per-loop 8 --api-calls-per-minute 60
 Restart=on-failure
-RestartSec=15
-TimeoutStopSec=60
-KillSignal=SIGINT
+RestartSec=15s
+TimeoutStopSec=75s
+KillSignal=SIGTERM
 UMask=0027
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ReadWritePaths=/var/lib/qtr/watchdog /var/log/qtr/watchdog
+ProtectHome=true
+ReadWritePaths=/opt/qtr/watchdog-shadow-data/phase5-soak
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-Proposed environment fields are public-data operational settings only:
-`QTR_WATCHDOG_API_CALLS_PER_MINUTE`, `QTR_WATCHDOG_SYMBOLS_PER_LOOP`,
-`QTR_WATCHDOG_DATA_ROOT`, and log level. No exchange credentials are required.
+The tracked unit has no `EnvironmentFile` and requires no exchange credentials.
+`Type=simple` makes the fail-fast soak supervisor the systemd main process;
+runtime failure therefore produces a non-zero service result instead of a
+false `active (running)` state.
 
 Before any future installation, paths, qtr ownership, Python environment,
 resource limits, network policy, health command, startup recovery, and shutdown

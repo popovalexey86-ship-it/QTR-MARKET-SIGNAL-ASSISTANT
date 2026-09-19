@@ -137,9 +137,10 @@ def _windows_rss() -> int | None:
 
         counters = Counters()
         counters.cb = ctypes.sizeof(counters)
-        get_process = ctypes.windll.kernel32.GetCurrentProcess
+        windll: Any = vars(ctypes)["windll"]
+        get_process = windll.kernel32.GetCurrentProcess
         get_process.restype = wintypes.HANDLE
-        get_memory = ctypes.windll.psapi.GetProcessMemoryInfo
+        get_memory = windll.psapi.GetProcessMemoryInfo
         get_memory.argtypes = (
             wintypes.HANDLE,
             ctypes.POINTER(Counters),

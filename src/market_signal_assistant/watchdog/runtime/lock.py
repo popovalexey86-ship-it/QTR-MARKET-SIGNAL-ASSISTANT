@@ -67,8 +67,7 @@ class SingleInstanceLock:
 
 def _lock_nonblocking(stream: BinaryIO) -> None:
     if os.name == "nt":
-        import msvcrt
-
+        msvcrt: Any = importlib.import_module("msvcrt")
         msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
         return
     fcntl: Any = importlib.import_module("fcntl")
@@ -77,8 +76,7 @@ def _lock_nonblocking(stream: BinaryIO) -> None:
 
 def _unlock(stream: BinaryIO) -> None:
     if os.name == "nt":
-        import msvcrt
-
+        msvcrt: Any = importlib.import_module("msvcrt")
         msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
         return
     fcntl: Any = importlib.import_module("fcntl")
