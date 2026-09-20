@@ -17,7 +17,9 @@ def main() -> int:
     parser.add_argument("--top", type=int, default=20)
     args = parser.parse_args()
 
-    tracemalloc.start(25)
+    # A single frame is sufficient for module attribution and avoids making
+    # the diagnostic itself dominate RSS on large forensic datasets.
+    tracemalloc.start(1)
     bundle = build_bybit_shadow_runtime(args.data_root)
     current, peak = tracemalloc.get_traced_memory()
     snapshot = tracemalloc.take_snapshot()
