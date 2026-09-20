@@ -154,6 +154,14 @@ Repair:
 - Linux RSS telemetry now reads current `/proc/self/statm`, not lifetime peak
   `ru_maxrss`.
 
+Post-repair construction against the same immutable forensic dataset retained
+27,774,976 bytes RSS without tracing. With bounded one-frame tracemalloc, live
+Python allocations were 42.50 MB and the construction peak was 149.59 MB; the
+tracer-inflated process RSS is not a runtime projection. The largest retained
+Python groups were scoped baselines (16.43 MB), JSON decoder objects (12.88 MB),
+journal digest/offset indexes (7.43 MB), event recovery objects (4.52 MB), and
+the pruned outcome scheduler (0.67 MB).
+
 ## Descriptive event report (no threshold optimization)
 
 Final immutable count is 4,266 events (the earlier 4,180 was an intermediate

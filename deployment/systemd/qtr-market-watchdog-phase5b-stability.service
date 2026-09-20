@@ -1,0 +1,27 @@
+[Unit]
+Description=QTR Market Watchdog Phase 5B isolated 2h stability run
+Wants=network-online.target
+After=network-online.target
+ConditionPathIsDirectory=/opt/qtr/watchdog-shadow
+ConditionPathIsDirectory=/opt/qtr/watchdog-shadow-data/phase5b-stability-20260920T1145Z
+
+[Service]
+Type=simple
+User=qtr
+Group=qtr
+WorkingDirectory=/opt/qtr/watchdog-shadow
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/qtr/watchdog-shadow/.venv/bin/python -m market_signal_assistant.watchdog.runtime.soak --data-root /opt/qtr/watchdog-shadow-data/phase5b-stability-20260920T1145Z --duration-hours 2 --symbols-per-loop 8 --api-calls-per-minute 60
+Restart=on-failure
+RestartSec=15s
+TimeoutStopSec=75s
+KillSignal=SIGTERM
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/qtr/watchdog-shadow-data/phase5b-stability-20260920T1145Z
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
