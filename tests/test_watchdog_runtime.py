@@ -66,9 +66,7 @@ class FixtureProvider:
         self.catalog_calls += 1
         return tuple(_catalog(symbol) for symbol in self.symbols)
 
-    def load(
-        self, instrument: Instrument, interval: str, limit: int
-    ) -> MarketSeries:
+    def load(self, instrument: Instrument, interval: str, limit: int) -> MarketSeries:
         del limit
         self.market_calls.append((instrument.symbol, interval))
         remaining = self.failures.get(instrument.symbol, 0)
@@ -113,8 +111,8 @@ def test_runtime_persists_event_outcomes_and_restart_state(tmp_path: Path) -> No
         tmp_path / "outcomes" / "outcomes.jsonl"
     ).records()
 
-    assert after_horizon.pending_outcomes == 3
-    assert {item.horizon_minutes for item in outcomes} == {1, 5}
+    assert after_horizon.pending_outcomes == 4
+    assert {item.horizon_minutes for item in outcomes} == {1}
     assert any(item.lateness_seconds == 240.0 for item in outcomes)
     assert JsonRuntimeHealthStore(tmp_path / "state" / "health.json").load()
     audit = OperationalAuditJournal(
@@ -127,7 +125,7 @@ def test_runtime_persists_event_outcomes_and_restart_state(tmp_path: Path) -> No
     }
 
 
-def test_symbol_failure_is_isolated_and_runtime_is_degraded(tmp_path: Path) -> None:
+def test_symbol_failure_is_isolated_without_global_degradation(tmp_path: Path) -> None:
     clock = MutableClock(NOW)
     provider = FixtureProvider(clock, ("ABCUSDT", "BADUSDT"))
     provider.failures["BADUSDT"] = 3
@@ -139,11 +137,22 @@ def test_symbol_failure_is_isolated_and_runtime_is_degraded(tmp_path: Path) -> N
     assert health.symbols_processed == 1
     assert health.symbols_failed == 1
     assert health.provider_errors == 3
-    assert health.degraded is True
-    assert any(
-        reason.startswith("symbol:BADUSDT")
-        for reason in health.degraded_reasons
-    )
+    assert health.degraded is False
+    assert health.degraded_reasons == ()
+    assert health.acceptance_blocked is False
+    failures = [
+        item
+        for item in OperationalAuditJournal(
+            tmp_path / "operational" / "runtime.jsonl"
+        ).records()
+        if item["event_type"] == "SYMBOL_FAILURE"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["symbol"] == "BADUSDT"
+    details = failures[0]["details"]
+    assert isinstance(details, dict)
+    assert details["error_type"] == "TimeoutError"
+    assert "traceback" in details
     assert sleeps == [0.5, 1.0]
     persisted_events = WatchdogEventJournal(
         tmp_path / "events" / "events.jsonl"
@@ -249,11 +258,27 @@ def test_derivatives_failure_degrades_but_market_pipeline_continues(
     assert health.symbols_failed == 0
     assert health.provider_errors == 3
     assert health.degraded is True
+    assert health.acceptance_blocked is False
     assert health.events_today == 1
     assert any(
-        reason.startswith("derivatives:ABCUSDT")
-        for reason in health.degraded_reasons
+        reason.startswith("derivatives:ABCUSDT") for reason in health.degraded_reasons
     )
+
+
+def test_total_market_provider_outage_blocks_acceptance_without_crashing_runtime(
+    tmp_path: Path,
+) -> None:
+    clock = MutableClock(NOW)
+    provider = FixtureProvider(clock, ("BADUSDT",))
+    provider.failures["BADUSDT"] = 3
+    runtime = _runtime(tmp_path, provider, clock, sleep=lambda _delay: None)
+
+    health = runtime.run_once(now=NOW)
+
+    assert health.symbols_failed == 1
+    assert health.symbols_processed == 0
+    assert health.acceptance_blocked is True
+    assert health.acceptance_blocking_reasons == ("market:no-symbol-progress",)
 
 
 def test_failed_latest_bucket_acknowledges_gap_without_reemitting_it(
@@ -357,20 +382,13 @@ def _runtime(
         JsonWatchdogStateStore(root / "state" / "symbols.json")
     )
     events = WatchdogEventJournal(root / "events" / "events.jsonl")
-    outcome_journal = WatchdogOutcomeJournal(
-        root / "outcomes" / "outcomes.jsonl"
-    )
+    outcome_journal = WatchdogOutcomeJournal(root / "outcomes" / "outcomes.jsonl")
     outcomes = ForwardOutcomeScheduler(
         events,
         outcome_journal,
         JsonOutcomeCheckpointStore(root / "state" / "pending.json"),
-        prices=WatchdogPriceJournal(
-            root / "outcomes" / "price_observations.jsonl"
-        ),
+        prices=WatchdogPriceJournal(root / "outcomes" / "price_observations.jsonl"),
     )
-    kwargs = {}
-    if sleep is not None:
-        kwargs["sleep"] = sleep
     return WatchdogShadowRuntime(
         universe_provider=provider,
         market_provider=provider,
@@ -399,8 +417,8 @@ def _runtime(
         ),
         clock=clock,
         monotonic=time_counter(),
+        sleep=sleep or time.sleep,
         random_value=lambda: 0.5,
-        **kwargs,
     )
 
 
@@ -442,6 +460,4 @@ def _series(symbol: str, interval: str, now: datetime) -> MarketSeries:
         candles.append(
             Candle(timestamp, close, close + 0.1, close - 0.1, close, volume)
         )
-    return MarketSeries(
-        Instrument(symbol, AssetClass.CRYPTO), interval, tuple(candles)
-    )
+    return MarketSeries(Instrument(symbol, AssetClass.CRYPTO), interval, tuple(candles))

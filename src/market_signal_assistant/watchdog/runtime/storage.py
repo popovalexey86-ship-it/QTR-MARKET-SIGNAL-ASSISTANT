@@ -49,16 +49,20 @@ class StorageMonitor:
 
     def snapshot(self, *, recorded_at: datetime) -> StorageSnapshot:
         timestamp = recorded_at.astimezone(UTC)
-        files = tuple(
-            sorted(
-                (
-                    (str(path.relative_to(self._root)), path.stat().st_size)
-                    for path in self._root.rglob("*")
-                    if path.is_file()
-                ),
-                key=lambda item: item[0],
+        files = (
+            tuple(
+                sorted(
+                    (
+                        (str(path.relative_to(self._root)), path.stat().st_size)
+                        for path in self._root.rglob("*")
+                        if path.is_file()
+                    ),
+                    key=lambda item: item[0],
+                )
             )
-        ) if self._root.exists() else ()
+            if self._root.exists()
+            else ()
+        )
         usage_root = self._root if self._root.exists() else self._root.parent
         usage = shutil.disk_usage(usage_root)
         total = sum(size for _, size in files)
@@ -107,6 +111,12 @@ class StorageTelemetryJournal:
 def process_rss_bytes() -> int | None:
     if os.name == "nt":
         return _windows_rss()
+    try:
+        resident_pages = int(Path("/proc/self/statm").read_text().split()[1])
+        sysconf: Any = vars(os)["sysconf"]
+        return resident_pages * int(sysconf("SC_PAGE_SIZE"))
+    except (AttributeError, IndexError, OSError, ValueError):
+        pass
     try:
         resource: Any = importlib.import_module("resource")
         rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss

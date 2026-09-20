@@ -1,6 +1,8 @@
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from market_signal_assistant.models import AssetClass, Candle, Instrument, MarketSeries
 from market_signal_assistant.watchdog.aggregation import ExplainableAnomalyAggregator
 from market_signal_assistant.watchdog.baselines import (
@@ -120,3 +122,19 @@ def test_cold_start_builds_history_without_fake_event(tmp_path: Path) -> None:
     assert result.aggregation.anomaly_score == 0.0
     assert result.state.state is WatchdogState.NORMAL
     assert any(item.startswith("baseline:") for item in result.snapshot.missing_data)
+
+
+def test_rejected_baseline_commit_cannot_partially_advance_symbol_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = detection_engine(tmp_path, seeded=True)
+
+    def reject_commit(_snapshot: object) -> None:
+        raise ValueError("Conflicting baseline observation timestamp.")
+
+    monkeypatch.setattr(engine._feature_builder, "commit", reject_commit)
+
+    with pytest.raises(ValueError, match="Conflicting baseline"):
+        engine.evaluate(market(last_volume=200.0), detected_at=NOW)
+
+    assert not (tmp_path / "state.json").exists()

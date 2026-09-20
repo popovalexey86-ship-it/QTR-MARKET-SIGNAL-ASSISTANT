@@ -54,9 +54,7 @@ def test_descriptive_statistics_and_offline_replay_are_deterministic(
     assert dict(first.statistics.events_by_anomaly_type) == {"COMPRESSION": 1}
     assert dict(first.statistics.events_by_state) == {"WATCH": 1}
     assert dict(first.statistics.events_by_score_bucket) == {"60-079": 1}
-    assert dict(first.statistics.median_abs_return_by_horizon)[1] == pytest.approx(
-        0.01
-    )
+    assert dict(first.statistics.median_abs_return_by_horizon)[1] == pytest.approx(0.01)
     assert first.statistics.missing_outcome_rate == 0.0
     assert first.statistics.late_outcome_rate == 0.0
     assert first.statistics.expansion_rate == 1.0
@@ -87,7 +85,7 @@ def test_statistics_report_missing_and_late_rates(tmp_path: Path) -> None:
         PriceObservation(
             "ABCUSDT",
             NOW + timedelta(minutes=2),
-            NOW + timedelta(minutes=2),
+            NOW + timedelta(minutes=3),
             101.0,
         )
     )

@@ -12,7 +12,7 @@ from pathlib import Path
 from statistics import fmean, pstdev
 from typing import Any
 
-BASELINE_SCHEMA_VERSION = 1
+BASELINE_SCHEMA_VERSION = 2
 
 
 class BaselineStateError(RuntimeError):
@@ -26,9 +26,14 @@ class BaselineObservation:
     value: float
     observed_at: datetime
     available_at: datetime
+    scope: str = "default"
 
     def __post_init__(self) -> None:
-        if not self.symbol.strip() or not self.feature.strip():
+        if (
+            not self.symbol.strip()
+            or not self.feature.strip()
+            or not self.scope.strip()
+        ):
             raise ValueError("Baseline symbol and feature are required.")
         if isinstance(self.value, bool) or not math.isfinite(self.value):
             raise ValueError("Baseline observation must be finite.")
@@ -38,6 +43,7 @@ class BaselineObservation:
             raise ValueError("Baseline value cannot be available before observation.")
         object.__setattr__(self, "symbol", self.symbol.strip().upper())
         object.__setattr__(self, "feature", self.feature.strip())
+        object.__setattr__(self, "scope", self.scope.strip())
         object.__setattr__(self, "observed_at", observed_at)
         object.__setattr__(self, "available_at", available_at)
 
@@ -54,6 +60,7 @@ class BaselineSnapshot:
     standard_deviation: float | None
     minimum: float | None
     maximum: float | None
+    scope: str = "default"
 
 
 class JsonBaselineStore:
@@ -71,7 +78,7 @@ class JsonBaselineStore:
             payload: Any = json.loads(self._path.read_text(encoding="utf-8"))
             if (
                 not isinstance(payload, dict)
-                or payload.get("version") != BASELINE_SCHEMA_VERSION
+                or payload.get("version") not in {1, BASELINE_SCHEMA_VERSION}
                 or not isinstance(payload.get("observations"), list)
             ):
                 raise ValueError
@@ -146,11 +153,11 @@ class RollingBaselineEngine:
         decision_time = _utc(detected_at)
         if observation.available_at > decision_time:
             raise ValueError("Future observation cannot enter a PIT baseline.")
-        key = (observation.symbol, observation.feature)
+        key = (observation.symbol, observation.scope, observation.feature)
         previous = tuple(
             item
             for item in self._observations
-            if (item.symbol, item.feature) == key
+            if (item.symbol, item.scope, item.feature) == key
         )
         if previous and observation.available_at <= previous[-1].available_at:
             raise ValueError(
@@ -171,9 +178,11 @@ class RollingBaselineEngine:
         for observation in observations:
             if observation.available_at > decision_time:
                 raise ValueError("Future observation cannot enter a PIT baseline.")
-            key = (observation.symbol, observation.feature)
+            key = (observation.symbol, observation.scope, observation.feature)
             previous = tuple(
-                item for item in candidate if (item.symbol, item.feature) == key
+                item
+                for item in candidate
+                if (item.symbol, item.scope, item.feature) == key
             )
             if previous and observation.available_at == previous[-1].available_at:
                 if observation == previous[-1]:
@@ -193,19 +202,31 @@ class RollingBaselineEngine:
         feature: str,
         *,
         detected_at: datetime,
+        scope: str = "default",
     ) -> BaselineSnapshot:
         as_of = _utc(detected_at)
         normalized_symbol = symbol.strip().upper()
         normalized_feature = feature.strip()
-        if not normalized_symbol or not normalized_feature:
+        normalized_scope = scope.strip()
+        if not normalized_symbol or not normalized_feature or not normalized_scope:
             raise ValueError("Baseline identity cannot be empty.")
         selected = tuple(
             item.value
             for item in self._observations
             if item.symbol == normalized_symbol
+            and item.scope == normalized_scope
             and item.feature == normalized_feature
             and item.available_at <= as_of
         )[-self._maximum_samples :]
+        if not selected and normalized_scope != "default":
+            selected = tuple(
+                item.value
+                for item in self._observations
+                if item.symbol == normalized_symbol
+                and item.scope in {"default", "legacy"}
+                and item.feature == normalized_feature
+                and item.available_at <= as_of
+            )[-self._maximum_samples :]
         cold_start = len(selected) < self._minimum_samples
         if cold_start:
             mean = deviation = minimum = maximum = None
@@ -225,6 +246,7 @@ class RollingBaselineEngine:
             standard_deviation=deviation,
             minimum=minimum,
             maximum=maximum,
+            scope=normalized_scope,
         )
 
     def sample_counts(
@@ -237,25 +259,30 @@ class RollingBaselineEngine:
         normalized_feature = feature.strip()
         if not normalized_feature:
             raise ValueError("Baseline feature cannot be empty.")
-        counts: dict[str, int] = defaultdict(int)
+        counts_by_scope: dict[tuple[str, str], int] = defaultdict(int)
         for item in self._observations:
             if item.feature == normalized_feature and item.available_at <= as_of:
-                counts[item.symbol] += 1
+                counts_by_scope[(item.symbol, item.scope)] += 1
+        counts: dict[str, int] = defaultdict(int)
+        for (symbol, _scope), count in counts_by_scope.items():
+            counts[symbol] = max(counts[symbol], count)
         return dict(counts)
 
     def _bounded(
         self,
         observations: tuple[BaselineObservation, ...],
     ) -> tuple[BaselineObservation, ...]:
-        grouped: dict[tuple[str, str], list[BaselineObservation]] = defaultdict(list)
+        grouped: dict[tuple[str, str, str], list[BaselineObservation]] = defaultdict(
+            list
+        )
         for item in observations:
-            grouped[(item.symbol, item.feature)].append(item)
+            grouped[(item.symbol, item.scope, item.feature)].append(item)
         retained = tuple(
             item
             for key in sorted(grouped)
-            for item in sorted(
-                grouped[key], key=lambda value: value.available_at
-            )[-self._maximum_samples :]
+            for item in sorted(grouped[key], key=lambda value: value.available_at)[
+                -self._maximum_samples :
+            ]
         )
         return retained
 
@@ -267,6 +294,7 @@ def _observation_to_json(item: BaselineObservation) -> dict[str, object]:
         "value": item.value,
         "observed_at": item.observed_at.isoformat(),
         "available_at": item.available_at.isoformat(),
+        "scope": item.scope,
     }
 
 
@@ -279,6 +307,7 @@ def _observation_from_json(value: object) -> BaselineObservation:
         value=float(value["value"]),
         observed_at=datetime.fromisoformat(str(value["observed_at"])),
         available_at=datetime.fromisoformat(str(value["available_at"])),
+        scope=str(value.get("scope", "legacy")),
     )
 
 

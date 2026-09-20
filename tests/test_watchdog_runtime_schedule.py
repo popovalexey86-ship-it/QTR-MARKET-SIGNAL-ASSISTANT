@@ -104,7 +104,7 @@ def test_api_budget_waits_instead_of_bursting() -> None:
     budget.acquire()
 
     assert budget.total_calls == 3
-    assert waits == [60.0]
+    assert waits == [30.0, 30.0]
 
 
 def test_retry_uses_exponential_backoff_with_injected_jitter() -> None:

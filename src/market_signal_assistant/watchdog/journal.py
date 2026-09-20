@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from collections.abc import Mapping
@@ -24,9 +25,7 @@ class JournalConflictError(RuntimeError):
         self.record_id = record_id
         self.existing_payload = dict(existing_payload)
         self.attempted_payload = dict(attempted_payload)
-        super().__init__(
-            f"Conflicting immutable record {record_id} in {journal_path}."
-        )
+        super().__init__(f"Conflicting immutable record {record_id} in {journal_path}.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,8 +44,9 @@ class ImmutableJsonlJournal:
         self._path = path.resolve()
         self._id_field = id_field
         self._lock = Lock()
-        self._payloads: dict[str, dict[str, object]] = {}
-        self._records: list[dict[str, object]] = []
+        self._digests: dict[str, str] = {}
+        self._offsets: dict[str, int] = {}
+        self._record_count = 0
         self._corrupted: tuple[int, ...] = ()
         self._partial_tail = False
         self._scan()
@@ -57,9 +57,7 @@ class ImmutableJsonlJournal:
 
     @property
     def recovery(self) -> JournalRecovery:
-        return JournalRecovery(
-            len(self._records), self._corrupted, self._partial_tail
-        )
+        return JournalRecovery(self._record_count, self._corrupted, self._partial_tail)
 
     def append(self, record_id: str, payload: dict[str, object]) -> bool:
         if not record_id.strip() or payload.get(self._id_field) != record_id:
@@ -67,44 +65,54 @@ class ImmutableJsonlJournal:
         normalized = _normalize(payload)
         with self._lock:
             self._finalize_valid_tail_if_present()
-            existing = self._payloads.get(record_id)
-            if existing is not None:
-                if existing != normalized:
+            digest = _digest(normalized)
+            existing_digest = self._digests.get(record_id)
+            if existing_digest is not None:
+                if existing_digest != digest:
                     raise JournalConflictError(
                         journal_path=self._path,
                         record_id=record_id,
-                        existing_payload=existing,
+                        existing_payload=self._read_at(self._offsets[record_id]),
                         attempted_payload=normalized,
                     )
                 return False
             self._path.parent.mkdir(parents=True, exist_ok=True)
             needs_separator = self._needs_separator()
-            line = _encode(normalized)
-            with self._path.open("a", encoding="utf-8", newline="\n") as stream:
+            line = _encode(normalized).encode("utf-8")
+            with self._path.open("ab") as stream:
                 if needs_separator:
-                    stream.write("\n")
+                    stream.write(b"\n")
+                offset = stream.tell()
                 stream.write(line)
-                stream.write("\n")
+                stream.write(b"\n")
                 stream.flush()
                 os.fsync(stream.fileno())
-            self._scan()
-            persisted = self._payloads.get(record_id)
+            persisted = self._read_at(offset)
             if persisted != normalized:
                 raise OSError("Journal record was not durably recoverable.")
+            self._digests[record_id] = digest
+            self._offsets[record_id] = offset
+            self._record_count += 1
             return True
 
     def records(self) -> tuple[dict[str, object], ...]:
         with self._lock:
-            return tuple(dict(item) for item in self._records)
+            return tuple(self._iter_records())
 
     def _scan(self) -> None:
-        payloads: dict[str, dict[str, object]] = {}
-        records: list[dict[str, object]] = []
+        digests: dict[str, str] = {}
+        offsets: dict[str, int] = {}
         corrupted: list[int] = []
         partial_tail = False
         if self._path.exists():
             with self._path.open("rb") as stream:
-                for line_number, raw_line in enumerate(stream, start=1):
+                line_number = 0
+                while True:
+                    offset = stream.tell()
+                    raw_line = stream.readline()
+                    if not raw_line:
+                        break
+                    line_number += 1
                     if not raw_line.endswith(b"\n"):
                         partial_tail = True
                         continue
@@ -116,22 +124,51 @@ class ImmutableJsonlJournal:
                     if not isinstance(record_id, str) or not record_id:
                         corrupted.append(line_number)
                         continue
-                    existing = payloads.get(record_id)
-                    if existing is not None:
-                        if existing != payload:
+                    digest = _digest(payload)
+                    existing_digest = digests.get(record_id)
+                    if existing_digest is not None:
+                        if existing_digest != digest:
                             raise JournalConflictError(
                                 journal_path=self._path,
                                 record_id=record_id,
-                                existing_payload=existing,
+                                existing_payload=self._read_at(offsets[record_id]),
                                 attempted_payload=payload,
                             )
                         continue
-                    payloads[record_id] = payload
-                    records.append(payload)
-        self._payloads = payloads
-        self._records = records
+                    digests[record_id] = digest
+                    offsets[record_id] = offset
+        self._digests = digests
+        self._offsets = offsets
+        self._record_count = len(digests)
         self._corrupted = tuple(corrupted)
         self._partial_tail = partial_tail
+
+    def _iter_records(self) -> list[dict[str, object]]:
+        if not self._path.exists():
+            return []
+        records: list[dict[str, object]] = []
+        seen: set[str] = set()
+        with self._path.open("rb") as stream:
+            for raw_line in stream:
+                if not raw_line.endswith(b"\n"):
+                    continue
+                payload = _decode(raw_line)
+                if payload is None:
+                    continue
+                record_id = payload.get(self._id_field)
+                if not isinstance(record_id, str) or record_id in seen:
+                    continue
+                seen.add(record_id)
+                records.append(payload)
+        return records
+
+    def _read_at(self, offset: int) -> dict[str, object]:
+        with self._path.open("rb") as stream:
+            stream.seek(offset)
+            payload = _decode(stream.readline())
+        if payload is None:
+            raise OSError("Indexed journal record is not readable.")
+        return payload
 
     def _finalize_valid_tail_if_present(self) -> None:
         if not self._partial_tail or not self._path.exists():
@@ -179,3 +216,7 @@ def _normalize(payload: dict[str, object]) -> dict[str, object]:
     if decoded is None:
         raise ValueError("Journal payload is not JSON-compatible.")
     return decoded
+
+
+def _digest(payload: dict[str, object]) -> str:
+    return hashlib.sha256(_encode(payload).encode("utf-8")).hexdigest()

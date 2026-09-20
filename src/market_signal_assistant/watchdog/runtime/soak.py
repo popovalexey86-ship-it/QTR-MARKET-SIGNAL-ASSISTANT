@@ -9,7 +9,7 @@ import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from market_signal_assistant.watchdog.runtime.composition import (
     build_bybit_shadow_runtime,
@@ -22,7 +22,14 @@ from market_signal_assistant.watchdog.runtime.liveness import (
 )
 from market_signal_assistant.watchdog.runtime.models import ShadowRuntimeConfig
 from market_signal_assistant.watchdog.runtime.operator import inspect
-from market_signal_assistant.watchdog.runtime.service import WatchdogShadowRuntime
+
+
+class LivenessRuntime(Protocol):
+    @property
+    def running(self) -> bool: ...
+
+    @property
+    def fatal_error(self) -> Exception | None: ...
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -89,6 +96,7 @@ def main(argv: list[str] | None = None) -> int:
                         runtime,
                         datetime.now(UTC),
                         args.data_root / "state" / "health.json",
+                        expected_started_at=started_at,
                     ),
                     monotonic_now=monotonic_now,
                 )
@@ -123,9 +131,11 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _runtime_liveness(
-    runtime: WatchdogShadowRuntime,
+    runtime: LivenessRuntime,
     observed_at: datetime,
     health_path: Path,
+    *,
+    expected_started_at: datetime | None = None,
 ) -> RuntimeLiveness:
     failure = runtime.fatal_error
     try:
@@ -135,6 +145,18 @@ def _runtime_liveness(
             f"runtime health is unreadable: {type(error).__name__}"
         ) from error
     health = health or {}
+    persisted_started_at = _health_time(health.get("started_at"))
+    if expected_started_at is not None and (
+        persisted_started_at is None or persisted_started_at < expected_started_at
+    ):
+        return RuntimeLiveness(
+            observed_at=observed_at,
+            running=runtime.running,
+            fatal_error=type(failure).__name__ if failure is not None else None,
+            last_loop_at=None,
+            last_market_progress_at=None,
+            progress_marker=("startup-pending",),
+        )
     return RuntimeLiveness(
         observed_at=observed_at,
         running=runtime.running,
@@ -148,7 +170,10 @@ def _runtime_liveness(
             health.get("symbols_processed"),
             health.get("api_calls"),
         ),
-        degraded=health.get("degraded") is not False,
+        degraded=(
+            health.get("acceptance_blocked", health.get("degraded")) is not False
+        ),
+        market_progress_due_at=_health_time(health.get("next_market_update_due_at")),
     )
 
 

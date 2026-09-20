@@ -121,6 +121,7 @@ class WatchdogFeatureBuilder:
                 series.instrument.symbol,
                 name,
                 detected_at=decision_time,
+                scope=series.interval,
             )
             baseline_snapshots.append(baseline)
             normalized = _z_score(value, baseline)
@@ -163,6 +164,7 @@ class WatchdogFeatureBuilder:
                 value=item.value,
                 observed_at=item.observed_at,
                 available_at=item.available_at,
+                scope=snapshot.interval,
             )
             for item in snapshot.features
         )

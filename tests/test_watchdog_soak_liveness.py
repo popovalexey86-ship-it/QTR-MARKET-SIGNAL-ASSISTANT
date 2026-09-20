@@ -23,6 +23,7 @@ def _probe(
     last_loop_at: datetime = NOW,
     last_market_progress_at: datetime = NOW,
     degraded: bool = False,
+    market_progress_due_at: datetime | None = None,
 ) -> RuntimeLiveness:
     return RuntimeLiveness(
         observed_at=NOW,
@@ -32,6 +33,7 @@ def _probe(
         last_market_progress_at=last_market_progress_at,
         progress_marker=(marker,),
         degraded=degraded,
+        market_progress_due_at=market_progress_due_at,
     )
 
 
@@ -94,6 +96,50 @@ def test_frozen_market_loop_fails_without_advancing_acceptance_clock() -> None:
         clock.observe(_probe(marker=1), monotonic_now=61.0)
 
     assert clock.accumulated_seconds == 0.0
+
+
+def test_planned_slow_poll_does_not_trigger_false_stale_failure() -> None:
+    clock = ConfirmedHealthyClock(0.0, stale_after_seconds=60.0)
+    future_due = NOW + timedelta(minutes=15)
+    clock.observe(
+        _probe(marker=1, market_progress_due_at=future_due), monotonic_now=0.0
+    )
+
+    assert (
+        clock.observe(
+            _probe(
+                marker=1,
+                last_market_progress_at=NOW - timedelta(minutes=10),
+                market_progress_due_at=future_due,
+            ),
+            monotonic_now=600.0,
+        )
+        is False
+    )
+    assert clock.accumulated_seconds == 0.0
+
+
+def test_old_persisted_health_is_treated_as_startup_pending(tmp_path: Path) -> None:
+    health_path = tmp_path / "health.json"
+    health_path.write_text(
+        json.dumps(
+            {
+                "started_at": (NOW - timedelta(hours=1)).isoformat(),
+                "last_loop_at": (NOW - timedelta(hours=1)).isoformat(),
+                "last_successful_market_update": (NOW - timedelta(hours=1)).isoformat(),
+                "symbols_processed": 10,
+                "api_calls": 10,
+                "degraded": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    runtime = SimpleNamespace(running=True, fatal_error=None)
+
+    probe = soak._runtime_liveness(runtime, NOW, health_path, expected_started_at=NOW)
+
+    assert probe.last_loop_at is None
+    assert probe.progress_marker == ("startup-pending",)
 
 
 def test_provider_outage_freezes_then_fails_without_false_progress() -> None:

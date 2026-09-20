@@ -28,7 +28,13 @@ def snapshot(**changes: float) -> DerivativesSnapshot:
         provider="test",
         symbol="BTCUSDT",
         as_of=NOW,
-        **values,
+        funding_rate=values["funding_rate"],
+        open_interest=values["open_interest"],
+        open_interest_change=values["open_interest_change"],
+        price_change=values["price_change"],
+        volume_change=values["volume_change"],
+        long_liquidations=values["long_liquidations"],
+        short_liquidations=values["short_liquidations"],
     )
 
 
@@ -36,28 +42,41 @@ def snapshot(**changes: float) -> DerivativesSnapshot:
     ("observations", "expected"),
     [
         (
-            {"price_change": 0.01, "open_interest_change": 0.02,
-             "volume_change": 0.20},
+            {"price_change": 0.01, "open_interest_change": 0.02, "volume_change": 0.20},
             MarketPositioning.SUSTAINABLE_GROWTH,
         ),
         (
-            {"price_change": 0.01, "open_interest_change": 0.02,
-             "funding_rate": 0.0005},
+            {
+                "price_change": 0.01,
+                "open_interest_change": 0.02,
+                "funding_rate": 0.0005,
+            },
             MarketPositioning.OVERHEATED_LONG,
         ),
         (
-            {"price_change": 0.0, "open_interest_change": 0.02,
-             "funding_rate": -0.0005},
+            {
+                "price_change": 0.0,
+                "open_interest_change": 0.02,
+                "funding_rate": -0.0005,
+            },
             MarketPositioning.SHORT_ACCUMULATION,
         ),
         (
-            {"price_change": 0.01, "open_interest_change": -0.02,
-             "short_liquidations": 200.0, "long_liquidations": 100.0},
+            {
+                "price_change": 0.01,
+                "open_interest_change": -0.02,
+                "short_liquidations": 200.0,
+                "long_liquidations": 100.0,
+            },
             MarketPositioning.SHORT_SQUEEZE,
         ),
         (
-            {"price_change": -0.01, "open_interest_change": -0.02,
-             "long_liquidations": 200.0, "short_liquidations": 100.0},
+            {
+                "price_change": -0.01,
+                "open_interest_change": -0.02,
+                "long_liquidations": 200.0,
+                "short_liquidations": 100.0,
+            },
             MarketPositioning.LONG_SQUEEZE,
         ),
         (

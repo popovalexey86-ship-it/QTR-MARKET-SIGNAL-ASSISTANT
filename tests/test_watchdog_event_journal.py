@@ -6,7 +6,10 @@ import pytest
 from watchdog_evidence_helpers import evidence
 
 from market_signal_assistant.watchdog.events.journal import WatchdogEventJournal
-from market_signal_assistant.watchdog.journal import JournalConflictError
+from market_signal_assistant.watchdog.journal import (
+    ImmutableJsonlJournal,
+    JournalConflictError,
+)
 
 
 def test_event_journal_is_immutable_idempotent_and_restart_safe(tmp_path: Path) -> None:
@@ -80,3 +83,15 @@ def test_complete_valid_tail_without_newline_is_finalized_not_duplicated(
     assert journal.recovery.partial_tail is True
     assert journal.append(event) is False
     assert WatchdogEventJournal(path).records() == (event,)
+
+
+def test_journal_indexes_hashes_without_retaining_payload_copies(
+    tmp_path: Path,
+) -> None:
+    journal = ImmutableJsonlJournal(tmp_path / "bounded.jsonl", id_field="id")
+    payload: dict[str, object] = {"id": "one", "body": "x" * 100_000}
+
+    assert journal.append("one", payload) is True
+    assert not hasattr(journal, "_payloads")
+    assert not hasattr(journal, "_records")
+    assert journal.records() == (payload,)

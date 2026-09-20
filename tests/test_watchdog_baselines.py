@@ -112,3 +112,35 @@ def test_batch_commit_is_idempotent_for_same_available_observation(
     engine.observe_many((item,), detected_at=NOW)
 
     assert engine.observations == (item,)
+
+
+def test_interval_scopes_prevent_live_tier_change_timestamp_conflict(
+    tmp_path: Path,
+) -> None:
+    engine = RollingBaselineEngine(JsonBaselineStore(tmp_path / "baseline.json"))
+    available_at = NOW + timedelta(minutes=5)
+    five_minute = BaselineObservation(
+        "ABCUSDT", "volume", 2.0, NOW, available_at, scope="5m"
+    )
+    one_minute = BaselineObservation(
+        "ABCUSDT",
+        "volume",
+        3.0,
+        NOW + timedelta(minutes=4),
+        available_at,
+        scope="1m",
+    )
+
+    engine.observe_many((five_minute,), detected_at=available_at)
+    engine.observe_many((one_minute,), detected_at=available_at)
+
+    assert (
+        engine.snapshot(
+            "ABCUSDT", "volume", detected_at=available_at, scope="5m"
+        ).sample_count
+        == 1
+    )
+    assert (
+        engine.snapshot("ABCUSDT", "volume", detected_at=available_at, scope="1m").mean
+        is None
+    )

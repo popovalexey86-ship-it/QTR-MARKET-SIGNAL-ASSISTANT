@@ -25,13 +25,9 @@ BTC = Instrument("BTCUSDT", AssetClass.CRYPTO)
 
 
 class Provider:
-    def load(
-        self, instrument: Instrument, interval: str, limit: int
-    ) -> MarketSeries:
+    def load(self, instrument: Instrument, interval: str, limit: int) -> MarketSeries:
         del interval, limit
-        return MarketSeries(
-            instrument, "1h", (Candle(NOW, 100, 101, 99, 100, 10),)
-        )
+        return MarketSeries(instrument, "1h", (Candle(NOW, 100, 101, 99, 100, 10),))
 
 
 class Analyzer:
@@ -79,7 +75,18 @@ def snapshot(**changes: float) -> DerivativesSnapshot:
         "short_liquidations": 0.0,
     }
     values.update(changes)
-    return DerivativesSnapshot("test", "BTCUSDT", NOW, **values)
+    return DerivativesSnapshot(
+        "test",
+        "BTCUSDT",
+        NOW,
+        funding_rate=values["funding_rate"],
+        open_interest=values["open_interest"],
+        open_interest_change=values["open_interest_change"],
+        price_change=values["price_change"],
+        volume_change=values["volume_change"],
+        long_liquidations=values["long_liquidations"],
+        short_liquidations=values["short_liquidations"],
+    )
 
 
 def service(
@@ -118,9 +125,9 @@ def test_successful_derivatives_fusion() -> None:
 
 
 def test_derivatives_failure_preserves_technical_result() -> None:
-    report = service(
-        DerivativesDataError("context unavailable: secret=hidden")
-    ).screen(request())
+    report = service(DerivativesDataError("context unavailable: secret=hidden")).screen(
+        request()
+    )
     result = report.successful_results[0]
     assert result.technical_signal is not None
     assert result.derivatives_signal is None
@@ -136,8 +143,7 @@ def test_derivatives_failure_preserves_technical_result() -> None:
     view = present_report(report).successful_results[0]
     assert view.combined_score == view.technical_score == 80
     assert view.derivatives_context == (
-        "Данные деривативов недоступны. "
-        "Итог основан на техническом анализе."
+        "Данные деривативов недоступны. Итог основан на техническом анализе."
     )
 
 
@@ -153,9 +159,9 @@ def test_missing_derivatives_configuration_is_a_warning_not_total_failure() -> N
 
 
 def test_unconfirmed_oi_and_inactive_live_context_are_visible() -> None:
-    report = service(
-        snapshot(open_interest_change=0.0, volume_change=0.0)
-    ).screen(request())
+    report = service(snapshot(open_interest_change=0.0, volume_change=0.0)).screen(
+        request()
+    )
     codes = {warning.code for warning in report.successful_results[0].warnings}
     assert ScreeningWarningCode.OI_UNCONFIRMED in codes
     assert ScreeningWarningCode.LIVE_LIQUIDATIONS_INACTIVE in codes

@@ -22,7 +22,12 @@ class JsonRuntimeHealthStore:
 
     def save(self, snapshot: RuntimeHealthSnapshot) -> None:
         payload = asdict(snapshot)
-        for key in ("started_at", "last_loop_at", "last_successful_market_update"):
+        for key in (
+            "started_at",
+            "last_loop_at",
+            "last_successful_market_update",
+            "next_market_update_due_at",
+        ):
             value = payload[key]
             payload[key] = value.isoformat() if isinstance(value, datetime) else None
         payload["degraded_reasons"] = list(snapshot.degraded_reasons)

@@ -11,6 +11,7 @@ from market_signal_assistant.watchdog.journal import JournalConflictError
 from market_signal_assistant.watchdog.outcomes.journal import WatchdogOutcomeJournal
 from market_signal_assistant.watchdog.outcomes.models import (
     BreakoutSide,
+    ForwardOutcome,
     OutcomeDataQuality,
     PriceObservation,
 )
@@ -30,9 +31,7 @@ def scheduler(
     events = WatchdogEventJournal(root / "watchdog" / "events" / "events.jsonl")
     event = evidence()
     events.append(event)
-    outcomes = WatchdogOutcomeJournal(
-        root / "watchdog" / "outcomes" / "outcomes.jsonl"
-    )
+    outcomes = WatchdogOutcomeJournal(root / "watchdog" / "outcomes" / "outcomes.jsonl")
     result = ForwardOutcomeScheduler(
         events,
         outcomes,
@@ -53,7 +52,8 @@ def point(
     return PriceObservation(
         "ABCUSDT",
         NOW + timedelta(minutes=minutes),
-        NOW + timedelta(
+        NOW
+        + timedelta(
             minutes=available_minutes if available_minutes is not None else minutes
         ),
         price,
@@ -98,7 +98,7 @@ def test_all_horizons_and_duplicate_outcome_attempt_are_idempotent(
     tmp_path: Path,
 ) -> None:
     tracker, outcomes = scheduler(tmp_path)
-    created = []
+    created: list[ForwardOutcome] = []
     for minutes in (1, 5, 15, 30, 60):
         created.extend(tracker.observe(point(minutes, 100.0 + minutes / 10)))
 
@@ -184,18 +184,14 @@ def test_restart_with_pending_horizons_restores_price_path(tmp_path: Path) -> No
     tracker, _ = scheduler(tmp_path)
     tracker.observe(point(1, 101.0, high=102.0, low=99.0))
 
-    events = WatchdogEventJournal(
-        tmp_path / "watchdog" / "events" / "events.jsonl"
-    )
+    events = WatchdogEventJournal(tmp_path / "watchdog" / "events" / "events.jsonl")
     outcomes = WatchdogOutcomeJournal(
         tmp_path / "watchdog" / "outcomes" / "outcomes.jsonl"
     )
     restarted = ForwardOutcomeScheduler(
         events,
         outcomes,
-        JsonOutcomeCheckpointStore(
-            tmp_path / "watchdog" / "state" / "pending.json"
-        ),
+        JsonOutcomeCheckpointStore(tmp_path / "watchdog" / "state" / "pending.json"),
     )
     five = restarted.observe(point(5, 98.0))[0]
 
@@ -237,3 +233,61 @@ def test_outcome_partial_tail_is_reported_without_losing_complete_record(
 
     assert len(restarted.records()) == 1
     assert restarted.recovery.partial_tail is True
+
+
+def test_one_market_observation_cannot_close_multiple_horizons(
+    tmp_path: Path,
+) -> None:
+    tracker, _ = scheduler(tmp_path)
+
+    first = tracker.observe(
+        PriceObservation(
+            "ABCUSDT",
+            NOW + timedelta(minutes=5),
+            NOW + timedelta(minutes=5, seconds=10),
+            101.0,
+            source="bybit-public-5m",
+        )
+    )
+    second = tracker.observe(
+        PriceObservation(
+            "ABCUSDT",
+            NOW + timedelta(minutes=10),
+            NOW + timedelta(minutes=10, seconds=10),
+            102.0,
+            source="bybit-public-5m",
+        )
+    )
+
+    assert [item.horizon_minutes for item in first] == [1]
+    assert first[0].data_quality is OutcomeDataQuality.ON_TIME
+    assert [item.horizon_minutes for item in second] == [5]
+    assert first[0].observed_at != second[0].observed_at
+
+
+def test_coarser_tier_observation_cannot_regress_pending_price_path(
+    tmp_path: Path,
+) -> None:
+    tracker, _ = scheduler(tmp_path)
+    tracker.observe(
+        PriceObservation(
+            "ABCUSDT",
+            NOW + timedelta(minutes=5),
+            NOW + timedelta(minutes=5, seconds=5),
+            101.0,
+            source="bybit-public-1m",
+        )
+    )
+
+    assert (
+        tracker.observe(
+            PriceObservation(
+                "ABCUSDT",
+                NOW + timedelta(minutes=4),
+                NOW + timedelta(minutes=6),
+                99.0,
+                source="bybit-public-5m",
+            )
+        )
+        == ()
+    )

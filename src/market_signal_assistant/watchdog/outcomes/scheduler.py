@@ -138,9 +138,25 @@ class ForwardOutcomeScheduler:
         )
         self._expansion_threshold = expansion_threshold
         self._reversal_threshold = reversal_threshold
-        self._event_index = {item.event_id: item for item in events.records()}
-        self._completed = {
+        all_events = {item.event_id: item for item in events.records()}
+        completed = {
             (item.event_id, item.horizon_minutes) for item in outcomes.records()
+        }
+        self._used_observations = {
+            (item.event_id, item.observed_at)
+            for item in outcomes.records()
+            if item.data_quality is not OutcomeDataQuality.MISSING
+        }
+        self._event_index = {
+            event_id: event
+            for event_id, event in all_events.items()
+            if not all(
+                (event_id, horizon) in completed for horizon in OUTCOME_HORIZONS_MINUTES
+            )
+        }
+        self._completed = {item for item in completed if item[0] in self._event_index}
+        self._used_observations = {
+            item for item in self._used_observations if item[0] in self._event_index
         }
         loaded = checkpoint.load()
         self._points = {
@@ -155,9 +171,7 @@ class ForwardOutcomeScheduler:
         for event_id, event in self._event_index.items():
             if self._event_complete(event_id):
                 continue
-            merged = {
-                item.observation_id: item for item in self._points[event_id]
-            }
+            merged = {item.observation_id: item for item in self._points[event_id]}
             for item in raw_points:
                 if (
                     item.symbol == event.symbol
@@ -212,7 +226,11 @@ class ForwardOutcomeScheduler:
                 if point == points[-1]:
                     pass
                 else:
-                    raise ValueError("Outcome prices must arrive chronologically.")
+                    # Tier changes can switch 1m/5m/15m feeds. A coarser
+                    # candle may therefore arrive after a newer fine-grained
+                    # observation. Preserve it in the raw journal, but never
+                    # regress an event's chronological outcome path.
+                    continue
             else:
                 points = (*points, point)
                 self._points[event.event_id] = points
@@ -312,6 +330,7 @@ class ForwardOutcomeScheduler:
         volatility_persistence = _volatility_persistence(event, points)
         target = target_time(event.detected_at, horizon)
         lateness = max(0.0, (selected.available_at - target).total_seconds())
+        on_time_tolerance = _source_interval(selected.source) + timedelta(seconds=30)
         return ForwardOutcome(
             outcome_id=outcome_id(event.event_id, horizon),
             event_id=event.event_id,
@@ -344,7 +363,7 @@ class ForwardOutcomeScheduler:
             lateness_seconds=lateness,
             data_quality=(
                 OutcomeDataQuality.ON_TIME
-                if lateness == 0
+                if lateness <= on_time_tolerance.total_seconds()
                 else OutcomeDataQuality.LATE
             ),
             did_expansion_occur=expansion[0],
@@ -373,7 +392,14 @@ class ForwardOutcomeScheduler:
                 continue
             target = target_time(event.detected_at, horizon)
             selected = next(
-                (item for item in points if item.observed_at >= target), None
+                (
+                    item
+                    for item in points
+                    if item.observed_at >= target
+                    and (event.event_id, item.observed_at)
+                    not in self._used_observations
+                ),
+                None,
             )
             if selected is None:
                 continue
@@ -383,6 +409,7 @@ class ForwardOutcomeScheduler:
             outcome = self._calculate(event, horizon, path, selected)
             self._outcomes.append(outcome)
             self._completed.add(key)
+            self._used_observations.add((event.event_id, selected.observed_at))
             created.append(outcome)
         return tuple(created)
 
@@ -399,6 +426,17 @@ class ForwardOutcomeScheduler:
             if not self._event_complete(event_id)
         }
         self._checkpoint.save(retained)
+
+
+def _source_interval(source: str) -> timedelta:
+    for suffix, duration in (
+        ("-1m", timedelta(minutes=1)),
+        ("-5m", timedelta(minutes=5)),
+        ("-15m", timedelta(minutes=15)),
+    ):
+        if source.endswith(suffix):
+            return duration
+    return timedelta(minutes=1)
 
 
 def _expansion(

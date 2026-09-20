@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import random
 import time
-from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from threading import Lock
@@ -28,9 +27,9 @@ class ApiRequestBudget:
         self._monotonic = monotonic
         self._sleep = sleep
         self._on_wait = on_wait or (lambda _: None)
-        self._timestamps: deque[float] = deque()
         self._lock = Lock()
         self._total = 0
+        self._next_slot = 0.0
 
     @property
     def total_calls(self) -> int:
@@ -38,16 +37,16 @@ class ApiRequestBudget:
             return self._total
 
     def acquire(self) -> None:
-        while True:
+        # Reserve globally spaced slots. A rolling-window quota permits all
+        # workers to consume 60 calls at once; pacing prevents that burst while
+        # retaining the configured long-run calls/minute rate.
+        with self._lock:
             now = self._monotonic()
-            with self._lock:
-                while self._timestamps and now - self._timestamps[0] >= 60.0:
-                    self._timestamps.popleft()
-                if len(self._timestamps) < self._limit:
-                    self._timestamps.append(now)
-                    self._total += 1
-                    return
-                wait = max(0.001, 60.0 - (now - self._timestamps[0]))
+            scheduled = max(now, self._next_slot)
+            self._next_slot = scheduled + 60.0 / self._limit
+            self._total += 1
+            wait = max(0.0, scheduled - now)
+        if wait > 0:
             self._on_wait(wait)
             self._sleep(wait)
 

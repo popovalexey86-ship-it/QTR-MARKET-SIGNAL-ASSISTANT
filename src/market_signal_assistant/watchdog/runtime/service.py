@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import time
+import traceback
+from collections import deque
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
@@ -137,9 +139,7 @@ class WatchdogShadowRuntime:
         self._indexes = indexes
         self._storage_monitor = storage_monitor
         self._storage_telemetry = storage_telemetry
-        self._scheduler = CompletedBucketScheduler(
-            self._config.maximum_catchup_buckets
-        )
+        self._scheduler = CompletedBucketScheduler(self._config.maximum_catchup_buckets)
         self._retry = RetryPolicy(
             self._config.retry_attempts,
             self._config.retry_base_delay,
@@ -161,6 +161,11 @@ class WatchdogShadowRuntime:
         self._provider_errors = 0
         self._rate_limit_events = 0
         self._api_calls = 0
+        self._api_call_times: deque[float] = deque()
+        self._peak_api_calls_per_minute = 0
+        self._minimum_api_spacing: float | None = None
+        self._last_api_call_at: float | None = None
+        self._throttle_waits = 0
         self._loop_duration = 0.0
         self._max_symbol_latency = 0.0
         self._stale_data = 0
@@ -190,15 +195,30 @@ class WatchdogShadowRuntime:
         return tuple(self._loop_durations)
 
     def record_api_call(self) -> None:
+        now = self._monotonic()
         with self._metrics_lock:
             self._api_calls += 1
+            while self._api_call_times and now - self._api_call_times[0] >= 60.0:
+                self._api_call_times.popleft()
+            self._api_call_times.append(now)
+            self._peak_api_calls_per_minute = max(
+                self._peak_api_calls_per_minute, len(self._api_call_times)
+            )
+            if self._last_api_call_at is not None:
+                spacing = max(0.0, now - self._last_api_call_at)
+                self._minimum_api_spacing = (
+                    spacing
+                    if self._minimum_api_spacing is None
+                    else min(self._minimum_api_spacing, spacing)
+                )
+            self._last_api_call_at = now
 
-    def record_rate_limit_wait(self, wait_seconds: float) -> None:
+    def record_throttle_wait(self, wait_seconds: float) -> None:
         now = self._clock()
         with self._metrics_lock:
-            self._rate_limit_events += 1
+            self._throttle_waits += 1
         self._audit(
-            OperationalEventType.RATE_LIMIT,
+            OperationalEventType.THROTTLE_WAIT,
             now,
             (("wait_seconds", f"{wait_seconds:.6f}"),),
         )
@@ -255,10 +275,7 @@ class WatchdogShadowRuntime:
                     self._storage_telemetry.append(self._storage_snapshot)
             except OSError:
                 self._degraded("storage_telemetry_unavailable", loop_time)
-            if (
-                self._storage_snapshot is not None
-                and self._storage_snapshot.pressure
-            ):
+            if self._storage_snapshot is not None and self._storage_snapshot.pressure:
                 self._degraded("disk_pressure", loop_time)
                 self._finish_loop(loop_time, loop_started, ())
                 snapshot = self.health_snapshot()
@@ -275,9 +292,7 @@ class WatchdogShadowRuntime:
                 self._instance_lock.release()
             return snapshot
 
-        due_candidates: list[
-            tuple[UniverseEntry, str, tuple[datetime, ...]]
-        ] = []
+        due_candidates: list[tuple[UniverseEntry, str, tuple[datetime, ...]]] = []
         for entry in universe.eligible:
             state = self._states.get(entry.instrument.symbol, detected_at=loop_time)
             tier = interest_tier(entry.tier, state.symbol_state.state)
@@ -295,13 +310,11 @@ class WatchdogShadowRuntime:
             boundaries = plan.buckets
             if plan.omitted_bucket_count and self._gaps is not None:
                 duration = interval_duration(rule.interval)
-                previous = self._cursors.get(
-                    entry.instrument.symbol, rule.interval
-                )
+                previous = self._cursors.get(entry.instrument.symbol, rule.interval)
                 if previous is not None:
                     first = previous + duration
-                    missing_count = (
-                        plan.omitted_bucket_count + max(0, len(boundaries) - 1)
+                    missing_count = plan.omitted_bucket_count + max(
+                        0, len(boundaries) - 1
                     )
                     missing_through = first + duration * (missing_count - 1)
                     self._gaps.append(
@@ -336,9 +349,9 @@ class WatchdogShadowRuntime:
             limit=self._config.maximum_symbols_per_loop,
         )
         if due_candidates:
-            self._rotation_offset = (
-                self._rotation_offset + len(due)
-            ) % len(due_candidates)
+            self._rotation_offset = (self._rotation_offset + len(due)) % len(
+                due_candidates
+            )
         for entry, _interval, _boundaries in due:
             self._last_checks[entry.instrument.symbol] = loop_time
 
@@ -349,8 +362,9 @@ class WatchdogShadowRuntime:
         )
         try:
             futures: dict[Future[SymbolRunResult], str] = {
-                executor.submit(self._process_symbol, entry, interval, boundaries):
-                entry.instrument.symbol
+                executor.submit(
+                    self._process_symbol, entry, interval, boundaries
+                ): entry.instrument.symbol
                 for entry, interval, boundaries in due
             }
             done, pending = wait(
@@ -363,7 +377,14 @@ class WatchdogShadowRuntime:
                 except Exception as error:
                     results.append(
                         SymbolRunResult(
-                            futures[future], 0, 0, 0, 0, 0, 0.0, True,
+                            futures[future],
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0.0,
+                            True,
                             type(error).__name__,
                         )
                     )
@@ -371,8 +392,15 @@ class WatchdogShadowRuntime:
                 future.cancel()
                 results.append(
                     SymbolRunResult(
-                        futures[future], 0, 0, 0, 0, 0,
-                        self._config.provider_timeout, True, "TimeoutError",
+                        futures[future],
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        self._config.provider_timeout,
+                        True,
+                        "TimeoutError",
                     )
                 )
         finally:
@@ -401,6 +429,20 @@ class WatchdogShadowRuntime:
                 ),
             )
             for tier in tiers
+        )
+        blocking_reasons = tuple(
+            sorted(
+                reason
+                for reason in self._degraded_reasons
+                if reason
+                in {
+                    "disk_pressure",
+                    "market:no-symbol-progress",
+                    "storage_telemetry_unavailable",
+                    "universe_unavailable",
+                }
+                or reason.startswith("fatal:")
+            )
         )
         return RuntimeHealthSnapshot(
             started_at=self._started_at,
@@ -441,16 +483,34 @@ class WatchdogShadowRuntime:
                 if self._storage_snapshot is not None
                 else None
             ),
-            baseline_ready_symbols=sum(
-                item.baseline_samples >= 20 for item in entries
-            ),
-            cold_start_symbols=sum(
-                item.tier.value == "COLD_START" for item in entries
-            ),
+            baseline_ready_symbols=sum(item.baseline_samples >= 20 for item in entries),
+            cold_start_symbols=sum(item.tier.value == "COLD_START" for item in entries),
             readiness_by_tier=readiness,
             degraded=bool(self._degraded_reasons),
             degraded_reasons=tuple(sorted(self._degraded_reasons)),
+            next_market_update_due_at=self._next_market_update_due(now),
+            throttle_waits=self._throttle_waits,
+            api_calls_last_minute=len(self._api_call_times),
+            peak_api_calls_per_minute=self._peak_api_calls_per_minute,
+            minimum_api_spacing_seconds=self._minimum_api_spacing,
+            acceptance_blocked=bool(blocking_reasons),
+            acceptance_blocking_reasons=blocking_reasons,
         )
+
+    def _next_market_update_due(self, now: datetime) -> datetime | None:
+        if self._universe is None:
+            return None
+        due_times: list[datetime] = []
+        for entry in self._universe.eligible:
+            state = self._states.get(entry.instrument.symbol, detected_at=now)
+            rule = self._polling.rule(
+                interest_tier(entry.tier, state.symbol_state.state)
+            )
+            last_check = self._last_checks.get(entry.instrument.symbol)
+            due_times.append(
+                now if last_check is None else last_check + rule.check_every
+            )
+        return min(due_times, default=None)
 
     def _run_forever(self) -> None:
         try:
@@ -487,10 +547,11 @@ class WatchdogShadowRuntime:
             and now - self._last_universe_refresh < self._config.universe_refresh
         ):
             return
-        previous = {
-            item.instrument.symbol
-            for item in self._universe.eligible
-        } if self._universe is not None else set()
+        previous = (
+            {item.instrument.symbol for item in self._universe.eligible}
+            if self._universe is not None
+            else set()
+        )
         try:
             instruments = self._provider_call(
                 "universe", None, self._universe_provider.list_instruments
@@ -528,7 +589,8 @@ class WatchdogShadowRuntime:
         instrument = Instrument(symbol, AssetClass.CRYPTO)
         try:
             series = self._provider_call(
-                "market", symbol,
+                "market",
+                symbol,
                 lambda: self._market_provider.load(
                     instrument, interval, self._config.candle_limit
                 ),
@@ -545,7 +607,8 @@ class WatchdogShadowRuntime:
             ):
                 try:
                     derivatives = self._provider_call(
-                        "derivatives", symbol,
+                        "derivatives",
+                        symbol,
                         lambda: derivatives_provider.collect(symbol),
                     )
                 except Exception as error:
@@ -563,8 +626,7 @@ class WatchdogShadowRuntime:
                     )
                     usable_derivatives = (
                         derivatives
-                        if derivatives is not None
-                        and derivatives.as_of <= detected_at
+                        if derivatives is not None and derivatives.as_of <= detected_at
                         else None
                     )
                     result = self._engine.evaluate(
@@ -605,14 +667,37 @@ class WatchdogShadowRuntime:
                     )
                     outcome_count += len(self._outcomes.observe(point))
             return SymbolRunResult(
-                symbol, processed, event_count, outcome_count, missing, stale,
+                symbol,
+                processed,
+                event_count,
+                outcome_count,
+                missing,
+                stale,
                 self._monotonic() - started,
             )
         except Exception as error:
-            self._degraded(f"symbol:{symbol}:{type(error).__name__}", self._clock())
+            self._audit(
+                OperationalEventType.SYMBOL_FAILURE,
+                self._clock(),
+                (
+                    ("error_type", type(error).__name__),
+                    ("error_message", str(error)[:1000]),
+                    ("interval", interval),
+                    ("boundaries", ",".join(item.isoformat() for item in boundaries)),
+                    ("traceback", traceback.format_exc(limit=20)[-8000:]),
+                ),
+                symbol=symbol,
+            )
             return SymbolRunResult(
-                symbol, 0, 0, 0, 0, 0, self._monotonic() - started,
-                True, type(error).__name__,
+                symbol,
+                0,
+                0,
+                0,
+                0,
+                0,
+                self._monotonic() - started,
+                True,
+                type(error).__name__,
             )
 
     def _provider_call(
@@ -664,6 +749,8 @@ class WatchdogShadowRuntime:
         self._symbols_failed += sum(item.failed for item in results)
         self._missing_data += sum(item.missing_data for item in results)
         self._stale_data += sum(item.stale_data for item in results)
+        if results and all(item.failed for item in results):
+            self._degraded("market:no-symbol-progress", now)
         self._outcomes.recover_pending()
         if self._indexes is not None:
             self._indexes.ensure()

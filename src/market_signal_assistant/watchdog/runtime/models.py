@@ -120,9 +120,21 @@ class RuntimeHealthSnapshot:
     readiness_by_tier: tuple[tuple[str, int, int], ...]
     degraded: bool
     degraded_reasons: tuple[str, ...]
+    next_market_update_due_at: datetime | None = None
+    throttle_waits: int = 0
+    api_calls_last_minute: int = 0
+    peak_api_calls_per_minute: int = 0
+    minimum_api_spacing_seconds: float | None = None
+    acceptance_blocked: bool = False
+    acceptance_blocking_reasons: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        for field in ("started_at", "last_loop_at", "last_successful_market_update"):
+        for field in (
+            "started_at",
+            "last_loop_at",
+            "last_successful_market_update",
+            "next_market_update_due_at",
+        ):
             value = getattr(self, field)
             if value is not None:
                 if value.tzinfo is None or value.utcoffset() is None:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 
 class SoakLivenessError(RuntimeError):
@@ -18,12 +18,14 @@ class RuntimeLiveness:
     last_market_progress_at: datetime | None
     progress_marker: tuple[object, ...]
     degraded: bool = False
+    market_progress_due_at: datetime | None = None
 
     def __post_init__(self) -> None:
         for name in (
             "observed_at",
             "last_loop_at",
             "last_market_progress_at",
+            "market_progress_due_at",
         ):
             value = getattr(self, name)
             if value is not None:
@@ -76,9 +78,14 @@ class ConfirmedHealthyClock:
             return self._reject(monotonic_now, "runtime progress was not initialized")
         if _age(probe.observed_at, probe.last_loop_at) > self._stale_after:
             raise SoakLivenessError("runtime heartbeat is stale")
+        past_expected_progress = (
+            probe.market_progress_due_at is None
+            or probe.observed_at
+            > probe.market_progress_due_at + timedelta(seconds=self._stale_after)
+        )
         if (
-            _age(probe.observed_at, probe.last_market_progress_at)
-            > self._stale_after
+            _age(probe.observed_at, probe.last_market_progress_at) > self._stale_after
+            and past_expected_progress
         ):
             raise SoakLivenessError("market progress is stale")
         if probe.degraded:
@@ -90,7 +97,10 @@ class ConfirmedHealthyClock:
             self._confirmed_anchor = monotonic_now
             return False
         if probe.progress_marker == self._progress_marker:
-            if monotonic_now - self._confirmed_anchor > self._stale_after:
+            if (
+                monotonic_now - self._confirmed_anchor > self._stale_after
+                and past_expected_progress
+            ):
                 raise SoakLivenessError("market progress did not advance")
             return False
 

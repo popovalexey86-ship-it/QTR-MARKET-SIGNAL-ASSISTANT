@@ -79,7 +79,7 @@ def build_bybit_shadow_runtime(
     holder: dict[str, WatchdogShadowRuntime] = {}
     budget = ApiRequestBudget(
         settings.api_calls_per_minute,
-        on_wait=lambda delay: holder["runtime"].record_rate_limit_wait(delay),
+        on_wait=lambda delay: holder["runtime"].record_throttle_wait(delay),
     )
     def observer() -> None:
         holder["runtime"].record_api_call()

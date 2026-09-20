@@ -103,12 +103,6 @@ class WatchdogDetectionEngine:
                 reasons=aggregation.reasons,
             ),
         )
-        self._states.save(
-            WatchdogRuntimeState(
-                state_result.state,
-                aggregation.sequence_context,
-            )
-        )
         event = self._event(
             snapshot,
             detector_result.observations,
@@ -117,7 +111,15 @@ class WatchdogDetectionEngine:
             state_result.state,
         )
         candidate = WatchdogCandidate.from_event(event) if event is not None else None
+        # Validate and persist PIT history before advancing the state machine.
+        # A rejected observation must never leave partially advanced symbol state.
         self._feature_builder.commit(snapshot)
+        self._states.save(
+            WatchdogRuntimeState(
+                state_result.state,
+                aggregation.sequence_context,
+            )
+        )
         return WatchdogDetectionResult(
             snapshot=snapshot,
             aggregation=aggregation,
