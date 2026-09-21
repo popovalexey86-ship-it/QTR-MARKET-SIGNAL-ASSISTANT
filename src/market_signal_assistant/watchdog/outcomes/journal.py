@@ -33,6 +33,9 @@ class WatchdogOutcomeJournal:
     def records(self) -> tuple[ForwardOutcome, ...]:
         return tuple(_from_payload(item) for item in self._journal.records())
 
+    def contains(self, outcome_id: str) -> bool:
+        return self._journal.contains(outcome_id)
+
 
 def _payload(item: ForwardOutcome) -> dict[str, object]:
     return {

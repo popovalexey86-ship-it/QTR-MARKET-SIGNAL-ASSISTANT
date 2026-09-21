@@ -21,6 +21,7 @@ class OperationalEventType(StrEnum):
     DEGRADED_MODE = "DEGRADED_MODE"
     RECOVERY = "RECOVERY"
     FATAL_ERROR = "FATAL_ERROR"
+    CURSOR_REALIGNMENT = "CURSOR_REALIGNMENT"
 
 
 @dataclass(frozen=True, slots=True)

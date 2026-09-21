@@ -106,6 +106,13 @@ class WatchdogStateRepository:
             WatchdogSymbolState.initial(normalized, detected_at=detected_at)
         )
 
+    def persisted(self, symbol: str) -> WatchdogRuntimeState | None:
+        """Return only durable state; do not manufacture an initial timestamp."""
+        normalized = symbol.strip().upper()
+        if not normalized:
+            raise ValueError("Watchdog state symbol cannot be empty.")
+        return self._states.get(normalized)
+
     def save(self, state: WatchdogRuntimeState) -> None:
         updated = {**self._states, state.symbol_state.symbol: state}
         ordered = tuple(updated[key] for key in sorted(updated))

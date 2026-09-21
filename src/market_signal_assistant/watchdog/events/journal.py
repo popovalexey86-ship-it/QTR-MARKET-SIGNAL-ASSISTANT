@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import cast
 
@@ -22,6 +22,7 @@ from market_signal_assistant.watchdog.models import (
 class WatchdogEventJournal:
     def __init__(self, path: Path) -> None:
         self._journal = ImmutableJsonlJournal(path, id_field="event_id")
+        self._daily_counts: dict[date, int] | None = None
 
     @property
     def path(self) -> Path:
@@ -32,10 +33,27 @@ class WatchdogEventJournal:
         return self._journal.recovery
 
     def append(self, event: WatchdogEventEvidence) -> bool:
-        return self._journal.append(event.event_id, _event_payload(event))
+        created = self._journal.append(event.event_id, _event_payload(event))
+        if created and self._daily_counts is not None:
+            day = event.detected_at.date()
+            self._daily_counts[day] = self._daily_counts.get(day, 0) + 1
+        return created
 
     def records(self) -> tuple[WatchdogEventEvidence, ...]:
         return tuple(_event_from_payload(item) for item in self._journal.records())
+
+    def get(self, event_id: str) -> WatchdogEventEvidence | None:
+        payload = self._journal.get(event_id)
+        return None if payload is None else _event_from_payload(payload)
+
+    def count_detected_on(self, day: date) -> int:
+        if self._daily_counts is None:
+            counts: dict[date, int] = {}
+            for event in self.records():
+                detected_day = event.detected_at.date()
+                counts[detected_day] = counts.get(detected_day, 0) + 1
+            self._daily_counts = counts
+        return self._daily_counts.get(day, 0)
 
 
 def _event_payload(event: WatchdogEventEvidence) -> dict[str, object]:

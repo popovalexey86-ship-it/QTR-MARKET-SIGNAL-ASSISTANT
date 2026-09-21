@@ -75,3 +75,7 @@ class GapLedger:
 
     def records(self) -> tuple[dict[str, object], ...]:
         return self._journal.records()
+
+    @property
+    def record_count(self) -> int:
+        return self._journal.recovery.record_count

@@ -4,6 +4,7 @@ import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Event
 
 import pytest
 
@@ -24,6 +25,7 @@ from market_signal_assistant.watchdog.engine import WatchdogDetectionEngine
 from market_signal_assistant.watchdog.events.journal import WatchdogEventJournal
 from market_signal_assistant.watchdog.features import WatchdogFeatureBuilder
 from market_signal_assistant.watchdog.journal import JournalConflictError
+from market_signal_assistant.watchdog.models import WatchdogState
 from market_signal_assistant.watchdog.outcomes.journal import WatchdogOutcomeJournal
 from market_signal_assistant.watchdog.outcomes.price_journal import WatchdogPriceJournal
 from market_signal_assistant.watchdog.outcomes.scheduler import (
@@ -36,9 +38,13 @@ from market_signal_assistant.watchdog.runtime.health import JsonRuntimeHealthSto
 from market_signal_assistant.watchdog.runtime.models import ShadowRuntimeConfig
 from market_signal_assistant.watchdog.runtime.schedule import JsonBucketCursorStore
 from market_signal_assistant.watchdog.runtime.service import WatchdogShadowRuntime
-from market_signal_assistant.watchdog.state_machine import WatchdogStateMachine
+from market_signal_assistant.watchdog.state_machine import (
+    WatchdogStateMachine,
+    WatchdogSymbolState,
+)
 from market_signal_assistant.watchdog.state_store import (
     JsonWatchdogStateStore,
+    WatchdogRuntimeState,
     WatchdogStateRepository,
 )
 from market_signal_assistant.watchdog.universe import DynamicUniverse
@@ -80,6 +86,17 @@ class FailingDerivativesProvider:
     def collect(self, symbol: str) -> DerivativesSnapshot:
         del symbol
         raise TimeoutError("derivatives unavailable")
+
+
+class BlockingProvider(FixtureProvider):
+    def __init__(self, clock: MutableClock, symbols: tuple[str, ...]) -> None:
+        super().__init__(clock, symbols)
+        self.release = Event()
+
+    def load(self, instrument: Instrument, interval: str, limit: int) -> MarketSeries:
+        self.market_calls.append((instrument.symbol, interval))
+        self.release.wait(timeout=2.0)
+        return _series(instrument.symbol, interval, self.clock.now)
 
 
 def test_runtime_persists_event_outcomes_and_restart_state(tmp_path: Path) -> None:
@@ -314,6 +331,151 @@ def test_failed_latest_bucket_acknowledges_gap_without_reemitting_it(
     assert recovered.symbols_processed == 1
     assert len(gaps.records()) == 1
     assert JsonBucketCursorStore(cursor_path).get("ABCUSDT", "5m") == NOW
+
+
+def test_interval_transition_realigns_cursor_to_global_symbol_chronology(
+    tmp_path: Path,
+) -> None:
+    """Reproduce the live chronology -> retry backlog -> gap causal chain."""
+    previous_detection = NOW - timedelta(seconds=30)
+    states = WatchdogStateRepository(
+        JsonWatchdogStateStore(tmp_path / "state" / "symbols.json")
+    )
+    states.save(
+        WatchdogRuntimeState(
+            WatchdogSymbolState(
+                symbol="ABCUSDT",
+                state=WatchdogState.NORMAL,
+                changed_at=previous_detection,
+                last_detected_at=previous_detection,
+                last_score=0.0,
+            )
+        )
+    )
+    cursor_path = tmp_path / "state" / "buckets.json"
+    JsonBucketCursorStore(cursor_path).save(
+        "ABCUSDT", "5m", NOW - timedelta(minutes=30)
+    )
+    clock = MutableClock(NOW)
+    provider = FixtureProvider(clock, ("ABCUSDT",))
+    runtime = _runtime(
+        tmp_path,
+        provider,
+        clock,
+        config=ShadowRuntimeConfig(
+            maximum_catchup_buckets=2,
+            maximum_workers=1,
+            retry_jitter=0.0,
+        ),
+    )
+
+    health = runtime.run_once(now=NOW)
+
+    assert health.symbols_failed == 0
+    assert health.symbols_processed == 1
+    assert health.scheduling_gaps == 0
+    assert JsonBucketCursorStore(cursor_path).get("ABCUSDT", "5m") == NOW
+    audits = OperationalAuditJournal(
+        tmp_path / "operational" / "runtime.jsonl"
+    ).records()
+    realignments = [
+        item for item in audits if item["event_type"] == "CURSOR_REALIGNMENT"
+    ]
+    assert len(realignments) == 1
+    assert realignments[0]["details"] == {
+        "chronology_floor": (NOW - timedelta(minutes=5)).isoformat(),
+        "interval": "5m",
+        "last_detected_at": previous_detection.isoformat(),
+        "previous_cursor": (NOW - timedelta(minutes=30)).isoformat(),
+        "reason": "state_ahead_of_interval_cursor",
+    }
+    assert not any(item["event_type"] == "SYMBOL_FAILURE" for item in audits)
+
+
+def test_timed_out_worker_prevents_overlapping_stale_symbol_plan(
+    tmp_path: Path,
+) -> None:
+    clock = MutableClock(NOW)
+    provider = BlockingProvider(clock, ("ABCUSDT",))
+    runtime = _runtime(
+        tmp_path,
+        provider,
+        clock,
+        config=ShadowRuntimeConfig(
+            provider_timeout=0.01,
+            retry_attempts=1,
+            maximum_workers=1,
+            retry_jitter=0.0,
+        ),
+    )
+
+    first = runtime.run_once(now=NOW)
+    assert first.symbols_failed == 1
+    assert provider.market_calls == [("ABCUSDT", "5m")]
+
+    clock.now = NOW + timedelta(minutes=5)
+    second = runtime.run_once(now=clock.now)
+    assert second.symbols_failed == 1
+    assert provider.market_calls == [("ABCUSDT", "5m")]
+
+    provider.release.set()
+    deadline = time.monotonic() + 2.0
+    cursor_path = tmp_path / "state" / "buckets.json"
+    while (
+        JsonBucketCursorStore(cursor_path).get("ABCUSDT", "5m") is None
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.01)
+
+    audits = OperationalAuditJournal(
+        tmp_path / "operational" / "runtime.jsonl"
+    ).records()
+    assert not any(
+        item["event_type"] == "SYMBOL_FAILURE"
+        and "State evaluations must be chronological." in str(item["details"])
+        for item in audits
+    )
+
+
+def test_tier_interval_transition_starts_after_global_chronology_floor(
+    tmp_path: Path,
+) -> None:
+    previous_detection = NOW - timedelta(seconds=20)
+    states = WatchdogStateRepository(
+        JsonWatchdogStateStore(tmp_path / "state" / "symbols.json")
+    )
+    states.save(
+        WatchdogRuntimeState(
+            WatchdogSymbolState(
+                symbol="ABCUSDT",
+                state=WatchdogState.NORMAL,
+                changed_at=previous_detection,
+                last_detected_at=previous_detection,
+                last_score=0.0,
+            )
+        )
+    )
+    # The prior STANDARD tier used 15m. The fresh universe snapshot promotes
+    # the baseline-ready symbol to ACTIVE/5m, for which no cursor exists yet.
+    JsonBucketCursorStore(tmp_path / "state" / "buckets.json").save(
+        "ABCUSDT", "15m", NOW - timedelta(minutes=15)
+    )
+    clock = MutableClock(NOW)
+    provider = FixtureProvider(clock, ("ABCUSDT",))
+
+    health = _runtime(tmp_path, provider, clock).run_once(now=NOW)
+
+    assert health.symbols_failed == 0
+    assert provider.market_calls == [("ABCUSDT", "5m")]
+    audit = OperationalAuditJournal(
+        tmp_path / "operational" / "runtime.jsonl"
+    ).records()
+    transition_alignment = next(
+        item for item in audit if item["event_type"] == "CURSOR_REALIGNMENT"
+    )
+    details = transition_alignment["details"]
+    assert isinstance(details, dict)
+    assert details["previous_cursor"] == "none"
 
 
 @pytest.mark.parametrize("failure_type", (RuntimeError, JournalConflictError))

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import tracemalloc
 from pathlib import Path
@@ -21,13 +22,33 @@ def main() -> int:
     # the diagnostic itself dominate RSS on large forensic datasets.
     tracemalloc.start(1)
     bundle = build_bybit_shadow_runtime(args.data_root)
+    gc.collect()
     current, peak = tracemalloc.get_traced_memory()
     snapshot = tracemalloc.take_snapshot()
+    runtime = bundle.runtime
+    baselines = runtime._engine._feature_builder._baselines
+    outcomes = runtime._outcomes
     payload = {
         "data_root": str(args.data_root.resolve()),
         "traced_current_bytes": current,
         "traced_peak_bytes": peak,
         "process_rss_bytes": process_rss_bytes(),
+        "retained_structure_counts": {
+            "baseline_observations": len(baselines.observations),
+            "symbol_states": len(runtime._states._states),
+            "scheduler": {
+                "pending_events": outcomes.retained_counts[0],
+                "price_points": outcomes.retained_counts[1],
+                "completed_keys": outcomes.retained_counts[2],
+                "used_observation_keys": outcomes.retained_counts[3],
+            },
+            "bounded": {
+                "baseline_per_symbol_scope_feature": 240,
+                "loop_durations": 10_000,
+                "api_call_window_seconds": 60,
+                "scheduler_completed_event_graphs": 0,
+            },
+        },
         "top_allocations": [
             {
                 "location": str(stat.traceback[0]),

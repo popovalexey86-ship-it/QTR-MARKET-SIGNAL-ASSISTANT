@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 from threading import Event, Lock, Thread
 from typing import Protocol, TypeVar
 
@@ -42,6 +43,7 @@ from market_signal_assistant.watchdog.runtime.retry import (
 from market_signal_assistant.watchdog.runtime.schedule import (
     CompletedBucketScheduler,
     JsonBucketCursorStore,
+    completed_boundary,
     interval_duration,
 )
 from market_signal_assistant.watchdog.runtime.storage import (
@@ -150,6 +152,9 @@ class WatchdogShadowRuntime:
         self._thread: Thread | None = None
         self._pipeline_lock = Lock()
         self._metrics_lock = Lock()
+        self._inflight_lock = Lock()
+        self._inflight_symbols: set[str] = set()
+        self._inflight_futures: set[Future[SymbolRunResult]] = set()
         self._started_at: datetime | None = None
         self._last_loop_at: datetime | None = None
         self._last_market_update: datetime | None = None
@@ -246,6 +251,12 @@ class WatchdogShadowRuntime:
             thread.join(timeout)
             if thread.is_alive():
                 raise TimeoutError("Watchdog runtime did not stop cleanly.")
+        with self._inflight_lock:
+            inflight = tuple(self._inflight_futures)
+        if inflight:
+            _done, pending = wait(inflight, timeout=timeout)
+            if pending:
+                raise TimeoutError("Watchdog symbol workers did not stop cleanly.")
         self._thread = None
         if self._started_at is not None:
             self._audit(
@@ -294,23 +305,53 @@ class WatchdogShadowRuntime:
 
         due_candidates: list[tuple[UniverseEntry, str, tuple[datetime, ...]]] = []
         for entry in universe.eligible:
-            state = self._states.get(entry.instrument.symbol, detected_at=loop_time)
+            symbol = entry.instrument.symbol
+            with self._inflight_lock:
+                if symbol in self._inflight_symbols:
+                    continue
+            state = self._states.get(symbol, detected_at=loop_time)
             tier = interest_tier(entry.tier, state.symbol_state.state)
             rule = self._polling.rule(tier)
-            last_check = self._last_checks.get(entry.instrument.symbol)
+            last_check = self._last_checks.get(symbol)
             if last_check is not None and loop_time - last_check < rule.check_every:
                 continue
+            cursor = self._cursors.get(symbol, rule.interval)
+            persisted = self._states.persisted(symbol)
+            if persisted is not None:
+                chronology_floor = completed_boundary(
+                    persisted.symbol_state.last_detected_at,
+                    rule.interval,
+                )
+                if cursor is None or cursor < chronology_floor:
+                    self._cursors.save(symbol, rule.interval, chronology_floor)
+                    self._audit(
+                        OperationalEventType.CURSOR_REALIGNMENT,
+                        loop_time,
+                        (
+                            ("interval", rule.interval),
+                            (
+                                "previous_cursor",
+                                cursor.isoformat() if cursor is not None else "none",
+                            ),
+                            ("chronology_floor", chronology_floor.isoformat()),
+                            (
+                                "last_detected_at",
+                                persisted.symbol_state.last_detected_at.isoformat(),
+                            ),
+                            ("reason", "state_ahead_of_interval_cursor"),
+                        ),
+                        symbol=symbol,
+                    )
+                    cursor = chronology_floor
             plan = self._scheduler.plan(
                 now=loop_time,
                 interval=rule.interval,
-                last_completed=self._cursors.get(
-                    entry.instrument.symbol, rule.interval
-                ),
+                last_completed=cursor,
             )
             boundaries = plan.buckets
             if plan.omitted_bucket_count and self._gaps is not None:
                 duration = interval_duration(rule.interval)
-                previous = self._cursors.get(entry.instrument.symbol, rule.interval)
+                previous = self._cursors.get(symbol, rule.interval)
                 if previous is not None:
                     first = previous + duration
                     missing_count = plan.omitted_bucket_count + max(
@@ -319,7 +360,7 @@ class WatchdogShadowRuntime:
                     missing_through = first + duration * (missing_count - 1)
                     self._gaps.append(
                         SchedulingGap(
-                            entry.instrument.symbol,
+                            symbol,
                             rule.interval,
                             first,
                             missing_through,
@@ -332,7 +373,7 @@ class WatchdogShadowRuntime:
                     # If that latest bucket fails, the next loop retries only
                     # it instead of emitting the same immutable gap again.
                     self._cursors.save(
-                        entry.instrument.symbol,
+                        symbol,
                         rule.interval,
                         missing_through,
                     )
@@ -352,21 +393,31 @@ class WatchdogShadowRuntime:
             self._rotation_offset = (self._rotation_offset + len(due)) % len(
                 due_candidates
             )
-        for entry, _interval, _boundaries in due:
-            self._last_checks[entry.instrument.symbol] = loop_time
-
         results: list[SymbolRunResult] = []
         executor = ThreadPoolExecutor(
             max_workers=self._config.maximum_workers,
             thread_name_prefix="watchdog-symbol",
         )
         try:
-            futures: dict[Future[SymbolRunResult], str] = {
-                executor.submit(
-                    self._process_symbol, entry, interval, boundaries
-                ): entry.instrument.symbol
-                for entry, interval, boundaries in due
-            }
+            futures: dict[Future[SymbolRunResult], str] = {}
+            for entry, interval, boundaries in due:
+                symbol = entry.instrument.symbol
+                if not self._claim_symbol(symbol):
+                    continue
+                try:
+                    future = executor.submit(
+                        self._process_symbol, entry, interval, boundaries
+                    )
+                except Exception:
+                    self._release_symbol(symbol)
+                    raise
+                with self._inflight_lock:
+                    self._inflight_futures.add(future)
+                future.add_done_callback(
+                    partial(self._release_work, symbol=symbol)
+                )
+                futures[future] = symbol
+                self._last_checks[symbol] = loop_time
             done, pending = wait(
                 futures,
                 timeout=self._config.provider_timeout * self._config.retry_attempts,
@@ -414,9 +465,7 @@ class WatchdogShadowRuntime:
     def health_snapshot(self) -> RuntimeHealthSnapshot:
         now = self._last_loop_at or self._clock()
         today = _utc(now).date()
-        events_today = sum(
-            1 for item in self._events.records() if item.detected_at.date() == today
-        )
+        events_today = self._events.count_detected_on(today)
         entries = self._universe.eligible if self._universe is not None else ()
         tiers = sorted({item.tier.value for item in entries})
         readiness = tuple(
@@ -454,7 +503,7 @@ class WatchdogShadowRuntime:
             symbols_processed=self._symbols_processed,
             symbols_failed=self._symbols_failed,
             events_today=events_today,
-            pending_outcomes=len(self._outcomes.pending_horizons()),
+            pending_outcomes=self._outcomes.pending_horizon_count(),
             provider_errors=self._provider_errors,
             rate_limit_events=self._rate_limit_events,
             loop_duration_seconds=self._loop_duration,
@@ -462,7 +511,7 @@ class WatchdogShadowRuntime:
             stale_data_count=self._stale_data,
             missing_data_count=self._missing_data,
             api_calls=self._api_calls,
-            scheduling_gaps=(len(self._gaps.records()) if self._gaps else 0),
+            scheduling_gaps=(self._gaps.record_count if self._gaps else 0),
             storage_bytes=(
                 self._storage_snapshot.total_bytes
                 if self._storage_snapshot is not None
@@ -732,6 +781,27 @@ class WatchdogShadowRuntime:
             on_error=on_error,
         )
 
+    def _claim_symbol(self, symbol: str) -> bool:
+        with self._inflight_lock:
+            if symbol in self._inflight_symbols:
+                return False
+            self._inflight_symbols.add(symbol)
+            return True
+
+    def _release_symbol(self, symbol: str) -> None:
+        with self._inflight_lock:
+            self._inflight_symbols.discard(symbol)
+
+    def _release_work(
+        self,
+        future: Future[SymbolRunResult],
+        *,
+        symbol: str,
+    ) -> None:
+        with self._inflight_lock:
+            self._inflight_futures.discard(future)
+            self._inflight_symbols.discard(symbol)
+
     def _finish_loop(
         self,
         now: datetime,
@@ -751,10 +821,14 @@ class WatchdogShadowRuntime:
         self._stale_data += sum(item.stale_data for item in results)
         if results and all(item.failed for item in results):
             self._degraded("market:no-symbol-progress", now)
-        self._outcomes.recover_pending()
-        if self._indexes is not None:
-            self._indexes.ensure()
-        self._write_health()
+        # Timed-out provider futures may still finish. Serialize recovery and
+        # indexing with their evidence transaction instead of racing mutable
+        # outcome indexes or observing a half-finished journal append.
+        with self._pipeline_lock:
+            self._outcomes.recover_pending()
+            if self._indexes is not None:
+                self._indexes.ensure()
+            self._write_health()
 
     def _mark_started(self, now: datetime) -> None:
         if self._started_at is not None:
@@ -770,8 +844,8 @@ class WatchdogShadowRuntime:
             OperationalEventType.RECOVERY,
             self._started_at,
             (
-                ("events", str(len(self._events.records()))),
-                ("pending", str(len(self._outcomes.pending_horizons()))),
+                ("events", str(self._events.recovery.record_count)),
+                ("pending", str(self._outcomes.pending_horizon_count())),
                 ("outcomes_recovered", str(recovered)),
             ),
         )

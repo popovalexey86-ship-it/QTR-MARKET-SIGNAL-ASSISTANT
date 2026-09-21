@@ -139,12 +139,13 @@ class ForwardOutcomeScheduler:
         self._expansion_threshold = expansion_threshold
         self._reversal_threshold = reversal_threshold
         all_events = {item.event_id: item for item in events.records()}
+        persisted_outcomes = outcomes.records()
         completed = {
-            (item.event_id, item.horizon_minutes) for item in outcomes.records()
+            (item.event_id, item.horizon_minutes) for item in persisted_outcomes
         }
         self._used_observations = {
             (item.event_id, item.observed_at)
-            for item in outcomes.records()
+            for item in persisted_outcomes
             if item.data_quality is not OutcomeDataQuality.MISSING
         }
         self._event_index = {
@@ -183,16 +184,11 @@ class ForwardOutcomeScheduler:
             )
 
     def register(self, event: WatchdogEventEvidence) -> None:
-        persisted = next(
-            (
-                item
-                for item in self._events.records()
-                if item.event_id == event.event_id
-            ),
-            None,
-        )
+        persisted = self._events.get(event.event_id)
         if persisted != event:
             raise ValueError("Outcome scheduling requires persisted event evidence.")
+        if self._persisted_event_complete(event.event_id):
+            return
         self._event_index[event.event_id] = event
         if not self._event_complete(event.event_id):
             self._points.setdefault(event.event_id, ())
@@ -211,6 +207,23 @@ class ForwardOutcomeScheduler:
             )
             for horizon in OUTCOME_HORIZONS_MINUTES
             if (event.event_id, horizon) not in self._completed
+        )
+
+    def pending_horizon_count(self) -> int:
+        return sum(
+            (event.event_id, horizon) not in self._completed
+            for event in self._event_index.values()
+            for horizon in OUTCOME_HORIZONS_MINUTES
+        )
+
+    @property
+    def retained_counts(self) -> tuple[int, int, int, int]:
+        """Pending event, point, completion and observation index cardinalities."""
+        return (
+            len(self._event_index),
+            sum(len(points) for points in self._points.values()),
+            len(self._completed),
+            len(self._used_observations),
         )
 
     def observe(self, point: PriceObservation) -> tuple[ForwardOutcome, ...]:
@@ -236,7 +249,7 @@ class ForwardOutcomeScheduler:
                 self._points[event.event_id] = points
             created.extend(self._recover_event_due(event, points))
             if self._event_complete(event.event_id):
-                self._points.pop(event.event_id, None)
+                self._release_complete_event(event.event_id)
         self._persist_checkpoint()
         return tuple(created)
 
@@ -247,7 +260,7 @@ class ForwardOutcomeScheduler:
             points = self._points.get(event.event_id, ())
             created.extend(self._recover_event_due(event, points))
             if self._event_complete(event.event_id):
-                self._points.pop(event.event_id, None)
+                self._release_complete_event(event.event_id)
         self._persist_checkpoint()
         return tuple(created)
 
@@ -292,7 +305,7 @@ class ForwardOutcomeScheduler:
                 self._completed.add(key)
                 created.append(outcome)
             if self._event_complete(event.event_id):
-                self._points.pop(event.event_id, None)
+                self._release_complete_event(event.event_id)
         self._persist_checkpoint()
         return tuple(created)
 
@@ -418,6 +431,23 @@ class ForwardOutcomeScheduler:
             (event_id, horizon) in self._completed
             for horizon in OUTCOME_HORIZONS_MINUTES
         )
+
+    def _persisted_event_complete(self, event_id: str) -> bool:
+        return all(
+            self._outcomes.contains(outcome_id(event_id, horizon))
+            for horizon in OUTCOME_HORIZONS_MINUTES
+        )
+
+    def _release_complete_event(self, event_id: str) -> None:
+        """Retain immutable evidence on disk, not completed event object graphs."""
+        self._event_index.pop(event_id, None)
+        self._points.pop(event_id, None)
+        self._completed = {
+            item for item in self._completed if item[0] != event_id
+        }
+        self._used_observations = {
+            item for item in self._used_observations if item[0] != event_id
+        }
 
     def _persist_checkpoint(self) -> None:
         retained = {

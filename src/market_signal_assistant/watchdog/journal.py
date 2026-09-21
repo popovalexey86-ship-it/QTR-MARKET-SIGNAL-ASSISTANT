@@ -44,8 +44,9 @@ class ImmutableJsonlJournal:
         self._path = path.resolve()
         self._id_field = id_field
         self._lock = Lock()
-        self._digests: dict[str, str] = {}
-        self._offsets: dict[str, int] = {}
+        # One compact index preserves full-history conflict detection without
+        # retaining two hash tables or hexadecimal digest strings per record.
+        self._index: dict[str, tuple[bytes, int]] = {}
         self._record_count = 0
         self._corrupted: tuple[int, ...] = ()
         self._partial_tail = False
@@ -66,13 +67,13 @@ class ImmutableJsonlJournal:
         with self._lock:
             self._finalize_valid_tail_if_present()
             digest = _digest(normalized)
-            existing_digest = self._digests.get(record_id)
-            if existing_digest is not None:
-                if existing_digest != digest:
+            existing = self._index.get(record_id)
+            if existing is not None:
+                if existing[0] != digest:
                     raise JournalConflictError(
                         journal_path=self._path,
                         record_id=record_id,
-                        existing_payload=self._read_at(self._offsets[record_id]),
+                        existing_payload=self._read_at(existing[1]),
                         attempted_payload=normalized,
                     )
                 return False
@@ -90,8 +91,7 @@ class ImmutableJsonlJournal:
             persisted = self._read_at(offset)
             if persisted != normalized:
                 raise OSError("Journal record was not durably recoverable.")
-            self._digests[record_id] = digest
-            self._offsets[record_id] = offset
+            self._index[record_id] = (digest, offset)
             self._record_count += 1
             return True
 
@@ -99,9 +99,17 @@ class ImmutableJsonlJournal:
         with self._lock:
             return tuple(self._iter_records())
 
+    def contains(self, record_id: str) -> bool:
+        with self._lock:
+            return record_id in self._index
+
+    def get(self, record_id: str) -> dict[str, object] | None:
+        with self._lock:
+            indexed = self._index.get(record_id)
+            return None if indexed is None else self._read_at(indexed[1])
+
     def _scan(self) -> None:
-        digests: dict[str, str] = {}
-        offsets: dict[str, int] = {}
+        index: dict[str, tuple[bytes, int]] = {}
         corrupted: list[int] = []
         partial_tail = False
         if self._path.exists():
@@ -125,21 +133,19 @@ class ImmutableJsonlJournal:
                         corrupted.append(line_number)
                         continue
                     digest = _digest(payload)
-                    existing_digest = digests.get(record_id)
-                    if existing_digest is not None:
-                        if existing_digest != digest:
+                    existing = index.get(record_id)
+                    if existing is not None:
+                        if existing[0] != digest:
                             raise JournalConflictError(
                                 journal_path=self._path,
                                 record_id=record_id,
-                                existing_payload=self._read_at(offsets[record_id]),
+                                existing_payload=self._read_at(existing[1]),
                                 attempted_payload=payload,
                             )
                         continue
-                    digests[record_id] = digest
-                    offsets[record_id] = offset
-        self._digests = digests
-        self._offsets = offsets
-        self._record_count = len(digests)
+                    index[record_id] = (digest, offset)
+        self._index = index
+        self._record_count = len(index)
         self._corrupted = tuple(corrupted)
         self._partial_tail = partial_tail
 
@@ -218,5 +224,5 @@ def _normalize(payload: dict[str, object]) -> dict[str, object]:
     return decoded
 
 
-def _digest(payload: dict[str, object]) -> str:
-    return hashlib.sha256(_encode(payload).encode("utf-8")).hexdigest()
+def _digest(payload: dict[str, object]) -> bytes:
+    return hashlib.sha256(_encode(payload).encode("utf-8")).digest()

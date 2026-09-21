@@ -8,6 +8,7 @@ from watchdog_evidence_helpers import NOW, evidence
 
 from market_signal_assistant.watchdog.events.journal import WatchdogEventJournal
 from market_signal_assistant.watchdog.journal import JournalConflictError
+from market_signal_assistant.watchdog.models import watchdog_event_id
 from market_signal_assistant.watchdog.outcomes.journal import WatchdogOutcomeJournal
 from market_signal_assistant.watchdog.outcomes.models import (
     BreakoutSide,
@@ -291,3 +292,41 @@ def test_coarser_tier_observation_cannot_regress_pending_price_path(
         )
         == ()
     )
+
+
+def test_completed_event_runtime_indexes_remain_bounded(tmp_path: Path) -> None:
+    events = WatchdogEventJournal(tmp_path / "events.jsonl")
+    outcomes = WatchdogOutcomeJournal(tmp_path / "outcomes.jsonl")
+    tracker = ForwardOutcomeScheduler(
+        events,
+        outcomes,
+        JsonOutcomeCheckpointStore(tmp_path / "pending.json"),
+    )
+
+    for index in range(100):
+        detected_at = NOW + timedelta(hours=index * 2)
+        event = replace(
+            evidence(),
+            event_id=watchdog_event_id("ABCUSDT", detected_at),
+            event_time=detected_at,
+            detected_at=detected_at,
+            available_at=detected_at,
+        )
+        events.append(event)
+        tracker.register(event)
+        tracker.mark_missing(
+            as_of=detected_at + timedelta(minutes=70),
+            grace=timedelta(minutes=5),
+        )
+        assert tracker.retained_counts == (0, 0, 0, 0)
+
+    assert tracker.pending_horizons() == ()
+    assert len(outcomes.records()) == 500
+    # Idempotent replay consults immutable evidence without rebuilding
+    # completed in-memory event/point indexes.
+    replay = events.get(
+        watchdog_event_id("ABCUSDT", NOW + timedelta(hours=99 * 2))
+    )
+    assert replay is not None
+    tracker.register(replay)
+    assert tracker.retained_counts == (0, 0, 0, 0)
