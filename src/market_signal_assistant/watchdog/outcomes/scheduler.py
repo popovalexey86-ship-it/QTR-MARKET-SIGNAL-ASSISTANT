@@ -40,6 +40,34 @@ class PendingHorizon:
     target_time: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class _PendingEvent:
+    event_id: str
+    symbol: str
+    detected_at: datetime
+    price_at_detection: float
+    anomaly_types: tuple[AnomalyType, ...]
+    volatility_baseline: float | None
+
+    @classmethod
+    def from_evidence(cls, event: WatchdogEventEvidence) -> _PendingEvent:
+        return cls(
+            event.event_id,
+            event.symbol,
+            event.detected_at,
+            event.price_at_detection,
+            event.anomaly_types,
+            next(
+                (
+                    item.baseline_value
+                    for item in event.features
+                    if item.name == "realized_volatility_5"
+                ),
+                None,
+            ),
+        )
+
+
 class JsonOutcomeCheckpointStore:
     def __init__(self, path: Path) -> None:
         self._path = path
@@ -138,27 +166,23 @@ class ForwardOutcomeScheduler:
         )
         self._expansion_threshold = expansion_threshold
         self._reversal_threshold = reversal_threshold
-        all_events = {item.event_id: item for item in events.records()}
-        persisted_outcomes = outcomes.records()
-        completed = {
-            (item.event_id, item.horizon_minutes) for item in persisted_outcomes
-        }
-        self._used_observations = {
-            (item.event_id, item.observed_at)
-            for item in persisted_outcomes
-            if item.data_quality is not OutcomeDataQuality.MISSING
-        }
-        self._event_index = {
-            event_id: event
-            for event_id, event in all_events.items()
-            if not all(
-                (event_id, horizon) in completed for horizon in OUTCOME_HORIZONS_MINUTES
+        self._event_index: dict[str, _PendingEvent] = {}
+        self._completed: set[tuple[str, int]] = set()
+        self._used_observations: set[tuple[str, datetime]] = set()
+        for evidence in events.iter_records():
+            persisted = tuple(
+                item
+                for horizon in OUTCOME_HORIZONS_MINUTES
+                if (item := outcomes.get(outcome_id(evidence.event_id, horizon)))
+                is not None
             )
-        }
-        self._completed = {item for item in completed if item[0] in self._event_index}
-        self._used_observations = {
-            item for item in self._used_observations if item[0] in self._event_index
-        }
+            if len(persisted) == len(OUTCOME_HORIZONS_MINUTES):
+                continue
+            self._event_index[evidence.event_id] = _PendingEvent.from_evidence(evidence)
+            for item in persisted:
+                self._completed.add((item.event_id, item.horizon_minutes))
+                if item.data_quality is not OutcomeDataQuality.MISSING:
+                    self._used_observations.add((item.event_id, item.observed_at))
         loaded = checkpoint.load()
         self._points = {
             event_id: points
@@ -168,19 +192,20 @@ class ForwardOutcomeScheduler:
         for event_id in self._event_index:
             if not self._event_complete(event_id):
                 self._points.setdefault(event_id, ())
-        raw_points = self._prices.records()
-        for event_id, event in self._event_index.items():
-            if self._event_complete(event_id):
-                continue
-            merged = {item.observation_id: item for item in self._points[event_id]}
-            for item in raw_points:
-                if (
-                    item.symbol == event.symbol
-                    and item.observed_at >= event.detected_at
-                ):
-                    merged[item.observation_id] = item
+        pending_by_symbol: dict[str, list[_PendingEvent]] = {}
+        for event in self._event_index.values():
+            pending_by_symbol.setdefault(event.symbol, []).append(event)
+        merged = {
+            event_id: {item.observation_id: item for item in points}
+            for event_id, points in self._points.items()
+        }
+        for price_point in self._prices.iter_records():
+            for event in pending_by_symbol.get(price_point.symbol, ()):
+                if price_point.observed_at >= event.detected_at:
+                    merged[event.event_id][price_point.observation_id] = price_point
+        for event_id, points in merged.items():
             self._points[event_id] = tuple(
-                sorted(merged.values(), key=lambda item: item.observed_at)
+                sorted(points.values(), key=lambda item: item.observed_at)
             )
 
     def register(self, event: WatchdogEventEvidence) -> None:
@@ -189,7 +214,7 @@ class ForwardOutcomeScheduler:
             raise ValueError("Outcome scheduling requires persisted event evidence.")
         if self._persisted_event_complete(event.event_id):
             return
-        self._event_index[event.event_id] = event
+        self._event_index[event.event_id] = _PendingEvent.from_evidence(event)
         if not self._event_complete(event.event_id):
             self._points.setdefault(event.event_id, ())
         self._persist_checkpoint()
@@ -224,6 +249,13 @@ class ForwardOutcomeScheduler:
             sum(len(points) for points in self._points.values()),
             len(self._completed),
             len(self._used_observations),
+        )
+
+    @property
+    def journal_retained_counts(self) -> tuple[int, int]:
+        return (
+            self._outcomes.retained_index_entries,
+            self._prices.retained_index_entries,
         )
 
     def observe(self, point: PriceObservation) -> tuple[ForwardOutcome, ...]:
@@ -311,7 +343,7 @@ class ForwardOutcomeScheduler:
 
     def _calculate(
         self,
-        event: WatchdogEventEvidence,
+        event: _PendingEvent,
         horizon: int,
         points: tuple[PriceObservation, ...],
         selected: PriceObservation,
@@ -395,7 +427,7 @@ class ForwardOutcomeScheduler:
 
     def _recover_event_due(
         self,
-        event: WatchdogEventEvidence,
+        event: _PendingEvent,
         points: tuple[PriceObservation, ...],
     ) -> tuple[ForwardOutcome, ...]:
         created: list[ForwardOutcome] = []
@@ -470,7 +502,7 @@ def _source_interval(source: str) -> timedelta:
 
 
 def _expansion(
-    event: WatchdogEventEvidence,
+    event: _PendingEvent,
     points: tuple[PriceObservation, ...],
     reference: float,
     threshold: float,
@@ -517,19 +549,12 @@ def _expansion(
 
 
 def _volatility_persistence(
-    event: WatchdogEventEvidence,
+    event: _PendingEvent,
     points: tuple[PriceObservation, ...],
 ) -> float | None:
     if AnomalyType.VOLATILITY_EXPANSION not in event.anomaly_types or len(points) < 2:
         return None
-    baseline = next(
-        (
-            item.baseline_value
-            for item in event.features
-            if item.name == "realized_volatility_5"
-        ),
-        None,
-    )
+    baseline = event.volatility_baseline
     if baseline is None or baseline <= 0:
         return None
     moves = tuple(

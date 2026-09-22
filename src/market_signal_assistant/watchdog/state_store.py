@@ -119,6 +119,10 @@ class WatchdogStateRepository:
         self._store.save(ordered)
         self._states = updated
 
+    @property
+    def retained_count(self) -> int:
+        return len(self._states)
+
 
 def _runtime_to_json(item: WatchdogRuntimeState) -> dict[str, object]:
     state = item.symbol_state

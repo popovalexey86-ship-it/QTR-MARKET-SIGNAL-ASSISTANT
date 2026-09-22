@@ -11,6 +11,7 @@ import pytest
 from market_signal_assistant.derivatives.models import DerivativesSnapshot
 from market_signal_assistant.inplay.models import CatalogInstrument
 from market_signal_assistant.models import AssetClass, Candle, Instrument, MarketSeries
+from market_signal_assistant.providers import MarketDataError
 from market_signal_assistant.watchdog.aggregation import ExplainableAnomalyAggregator
 from market_signal_assistant.watchdog.baselines import (
     BaselineObservation,
@@ -99,6 +100,30 @@ class BlockingProvider(FixtureProvider):
         return _series(instrument.symbol, interval, self.clock.now)
 
 
+class SlowProvider(FixtureProvider):
+    def __init__(
+        self,
+        clock: MutableClock,
+        symbols: tuple[str, ...],
+        delay: float,
+    ) -> None:
+        super().__init__(clock, symbols)
+        self.delay = delay
+
+    def load(self, instrument: Instrument, interval: str, limit: int) -> MarketSeries:
+        del limit
+        self.market_calls.append((instrument.symbol, interval))
+        time.sleep(self.delay)
+        return _series(instrument.symbol, interval, self.clock.now)
+
+
+class RateLimitedProvider(FixtureProvider):
+    def load(self, instrument: Instrument, interval: str, limit: int) -> MarketSeries:
+        del limit
+        self.market_calls.append((instrument.symbol, interval))
+        raise MarketDataError("Bybit public API error code 10006.")
+
+
 def test_runtime_persists_event_outcomes_and_restart_state(tmp_path: Path) -> None:
     clock = MutableClock(NOW)
     provider = FixtureProvider(clock, ("ABCUSDT",))
@@ -154,6 +179,7 @@ def test_symbol_failure_is_isolated_without_global_degradation(tmp_path: Path) -
     assert health.symbols_processed == 1
     assert health.symbols_failed == 1
     assert health.provider_errors == 3
+    assert health.provider_failures == 3
     assert health.degraded is False
     assert health.degraded_reasons == ()
     assert health.acceptance_blocked is False
@@ -171,6 +197,26 @@ def test_symbol_failure_is_isolated_without_global_degradation(tmp_path: Path) -
     assert details["error_type"] == "TimeoutError"
     assert "traceback" in details
     assert sleeps == [0.5, 1.0]
+    rollups = OperationalAuditJournal(
+        tmp_path / "operational" / "runtime.jsonl"
+    ).rollups()
+    provider_rollup = next(
+        item
+        for item in rollups
+        if str(item["signature"]).startswith("provider:failure")
+    )
+    assert provider_rollup["count"] == 3
+    assert provider_rollup["affected_symbols"] == ["BADUSDT"]
+    latest = provider_rollup["latest_details"]
+    assert isinstance(latest, dict)
+    assert latest == {
+        "endpoint_class": "market",
+        "attempt": "3",
+        "error": "TimeoutError",
+        "http_status": "unknown",
+        "ret_code": "unknown",
+        "backoff_seconds": "0.000000",
+    }
     persisted_events = WatchdogEventJournal(
         tmp_path / "events" / "events.jsonl"
     ).records()
@@ -298,6 +344,33 @@ def test_total_market_provider_outage_blocks_acceptance_without_crashing_runtime
     assert health.acceptance_blocking_reasons == ("market:no-symbol-progress",)
 
 
+def test_provider_rollup_preserves_safe_rate_limit_evidence(tmp_path: Path) -> None:
+    clock = MutableClock(NOW)
+    provider = RateLimitedProvider(clock, ("ABCUSDT",))
+    runtime = _runtime(tmp_path, provider, clock, sleep=lambda _delay: None)
+
+    health = runtime.run_once(now=NOW)
+
+    assert health.provider_errors == 3
+    assert health.provider_failures == 0
+    assert health.rate_limit_events == 3
+    rate_rollup = next(
+        item
+        for item in OperationalAuditJournal(
+            tmp_path / "operational" / "runtime.jsonl"
+        ).rollups()
+        if str(item["signature"]).startswith("provider:rate_limit")
+    )
+    assert rate_rollup["count"] == 3
+    details = rate_rollup["latest_details"]
+    assert isinstance(details, dict)
+    assert details["endpoint_class"] == "market"
+    assert details["ret_code"] == "10006"
+    assert details["http_status"] == "unknown"
+    assert details["attempt"] == "3"
+    assert details["backoff_seconds"] == "0.000000"
+
+
 def test_failed_latest_bucket_acknowledges_gap_without_reemitting_it(
     tmp_path: Path,
 ) -> None:
@@ -410,12 +483,14 @@ def test_timed_out_worker_prevents_overlapping_stale_symbol_plan(
     )
 
     first = runtime.run_once(now=NOW)
-    assert first.symbols_failed == 1
+    assert first.symbols_failed == 0
+    assert first.scheduler_timeouts == 1
+    assert first.late_worker_completions == 0
     assert provider.market_calls == [("ABCUSDT", "5m")]
 
     clock.now = NOW + timedelta(minutes=5)
     second = runtime.run_once(now=clock.now)
-    assert second.symbols_failed == 1
+    assert second.symbols_failed == 0
     assert provider.market_calls == [("ABCUSDT", "5m")]
 
     provider.release.set()
@@ -427,6 +502,12 @@ def test_timed_out_worker_prevents_overlapping_stale_symbol_plan(
     ):
         time.sleep(0.01)
 
+    health = runtime.health_snapshot()
+    assert health.symbols_processed == 1
+    assert health.symbols_failed == 0
+    assert health.late_worker_completions == 1
+    assert health.committed_after_timeout == 1
+
     audits = OperationalAuditJournal(
         tmp_path / "operational" / "runtime.jsonl"
     ).records()
@@ -435,6 +516,69 @@ def test_timed_out_worker_prevents_overlapping_stale_symbol_plan(
         and "State evaluations must be chronological." in str(item["details"])
         for item in audits
     )
+    assert {item["event_type"] for item in audits} >= {
+        "SCHEDULER_TIMEOUT",
+        "SCHEDULER_RECONCILIATION",
+    }
+
+
+def test_queued_worker_gets_its_own_running_deadline(tmp_path: Path) -> None:
+    clock = MutableClock(NOW)
+    provider = SlowProvider(clock, ("ABCUSDT", "XYZUSDT"), 0.04)
+    runtime = _runtime(
+        tmp_path,
+        provider,
+        clock,
+        config=ShadowRuntimeConfig(
+            provider_timeout=0.06,
+            retry_attempts=1,
+            maximum_workers=1,
+            maximum_symbols_per_loop=2,
+            retry_jitter=0.0,
+        ),
+    )
+
+    health = runtime.run_once(now=NOW)
+
+    assert health.symbols_processed == 2
+    assert health.symbols_failed == 0
+    assert health.scheduler_timeouts == 0
+    assert health.cancelled_before_start == 0
+    assert provider.market_calls == [("ABCUSDT", "5m"), ("XYZUSDT", "5m")]
+
+
+def test_queued_work_is_cancelled_separately_from_running_timeout(
+    tmp_path: Path,
+) -> None:
+    clock = MutableClock(NOW)
+    provider = BlockingProvider(clock, ("ABCUSDT", "XYZUSDT"))
+    runtime = _runtime(
+        tmp_path,
+        provider,
+        clock,
+        config=ShadowRuntimeConfig(
+            provider_timeout=0.01,
+            retry_attempts=1,
+            maximum_workers=1,
+            maximum_symbols_per_loop=2,
+            retry_jitter=0.0,
+        ),
+    )
+
+    health = runtime.run_once(now=NOW)
+
+    assert health.scheduler_timeouts == 1
+    assert health.cancelled_before_start == 1
+    assert health.symbols_failed == 1
+    assert provider.market_calls == [("ABCUSDT", "5m")]
+    rollups = OperationalAuditJournal(
+        tmp_path / "operational" / "runtime.jsonl"
+    ).rollups()
+    assert {item["signature"] for item in rollups} >= {
+        "scheduler_timeout:running",
+        "scheduler_cancelled:before_start",
+    }
+    provider.release.set()
 
 
 def test_tier_interval_transition_starts_after_global_chronology_floor(

@@ -65,6 +65,10 @@ class JsonBucketCursorStore:
     def get(self, symbol: str, interval: str) -> datetime | None:
         return self._cursors.get((symbol.strip().upper(), interval))
 
+    @property
+    def retained_count(self) -> int:
+        return len(self._cursors)
+
     def save(self, symbol: str, interval: str, boundary: datetime) -> None:
         key = (symbol.strip().upper(), interval)
         value = _utc(boundary)

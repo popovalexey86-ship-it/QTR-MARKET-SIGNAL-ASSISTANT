@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from datetime import datetime
 from pathlib import Path
 
@@ -30,6 +30,14 @@ class WatchdogPriceJournal:
 
     def records(self) -> tuple[PriceObservation, ...]:
         return tuple(_from_payload(item) for item in self._journal.records())
+
+    def iter_records(self) -> Iterator[PriceObservation]:
+        for item in self._journal.iter_records():
+            yield _from_payload(item)
+
+    @property
+    def retained_index_entries(self) -> int:
+        return self._journal.retained_index_entries
 
 
 def _payload(item: PriceObservation) -> dict[str, object]:

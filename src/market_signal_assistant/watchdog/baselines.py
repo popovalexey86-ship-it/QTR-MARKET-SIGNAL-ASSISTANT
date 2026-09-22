@@ -4,7 +4,7 @@ import json
 import math
 import os
 import tempfile
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -66,6 +66,7 @@ class BaselineSnapshot:
 class JsonBaselineStore:
     def __init__(self, path: Path) -> None:
         self._path = path
+        self._updates_path = path.with_name(f"{path.stem}.updates.jsonl")
 
     @property
     def path(self) -> Path:
@@ -73,26 +74,30 @@ class JsonBaselineStore:
 
     def load(self) -> tuple[BaselineObservation, ...]:
         if not self._path.exists():
-            return ()
-        try:
-            payload: Any = json.loads(self._path.read_text(encoding="utf-8"))
-            if (
-                not isinstance(payload, dict)
-                or payload.get("version") not in {1, BASELINE_SCHEMA_VERSION}
-                or not isinstance(payload.get("observations"), list)
-            ):
-                raise ValueError
-            return tuple(
-                _observation_from_json(item) for item in payload["observations"]
-            )
-        except (
-            OSError,
-            TypeError,
-            ValueError,
-            KeyError,
-            json.JSONDecodeError,
-        ) as error:
-            raise BaselineStateError("Watchdog baseline state is invalid.") from error
+            snapshot: tuple[BaselineObservation, ...] = ()
+        else:
+            try:
+                payload: Any = json.loads(self._path.read_text(encoding="utf-8"))
+                if (
+                    not isinstance(payload, dict)
+                    or payload.get("version") not in {1, BASELINE_SCHEMA_VERSION}
+                    or not isinstance(payload.get("observations"), list)
+                ):
+                    raise ValueError
+                snapshot = tuple(
+                    _observation_from_json(item) for item in payload["observations"]
+                )
+            except (
+                OSError,
+                TypeError,
+                ValueError,
+                KeyError,
+                json.JSONDecodeError,
+            ) as error:
+                raise BaselineStateError(
+                    "Watchdog baseline state is invalid."
+                ) from error
+        return self._merge_updates(snapshot)
 
     def save(self, observations: tuple[BaselineObservation, ...]) -> None:
         payload = {
@@ -115,12 +120,78 @@ class JsonBaselineStore:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, self._path)
+            # The compact snapshot is durable before the replay log is reset.
+            self._updates_path.unlink(missing_ok=True)
         except OSError as error:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
             raise BaselineStateError(
                 "Watchdog baseline state cannot be saved."
             ) from error
+
+    def append_many(self, observations: tuple[BaselineObservation, ...]) -> None:
+        if not observations:
+            return
+        try:
+            self._updates_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._updates_path.open("a", encoding="utf-8") as stream:
+                for item in observations:
+                    json.dump(
+                        _observation_to_json(item),
+                        stream,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+        except OSError as error:
+            raise BaselineStateError(
+                "Watchdog baseline update cannot be appended."
+            ) from error
+
+    @property
+    def pending_update_count(self) -> int:
+        if not self._updates_path.exists():
+            return 0
+        with self._updates_path.open("rb") as stream:
+            return sum(1 for line in stream if line.endswith(b"\n"))
+
+    def _merge_updates(
+        self, snapshot: tuple[BaselineObservation, ...]
+    ) -> tuple[BaselineObservation, ...]:
+        if not self._updates_path.exists():
+            return snapshot
+        merged = list(snapshot)
+        identities = {
+            (item.symbol, item.scope, item.feature, item.available_at): item
+            for item in snapshot
+        }
+        try:
+            with self._updates_path.open("r", encoding="utf-8") as stream:
+                for raw in stream:
+                    if not raw.endswith("\n"):
+                        continue
+                    item = _observation_from_json(json.loads(raw))
+                    key = (item.symbol, item.scope, item.feature, item.available_at)
+                    existing = identities.get(key)
+                    if existing is not None:
+                        if existing != item:
+                            raise ValueError
+                        continue
+                    identities[key] = item
+                    merged.append(item)
+        except (
+            OSError,
+            ValueError,
+            TypeError,
+            KeyError,
+            json.JSONDecodeError,
+        ) as error:
+            raise BaselineStateError(
+                "Watchdog baseline updates are invalid."
+            ) from error
+        return tuple(merged)
 
 
 class RollingBaselineEngine:
@@ -138,11 +209,30 @@ class RollingBaselineEngine:
         self._store = store
         self._minimum_samples = minimum_samples
         self._maximum_samples = maximum_samples
-        self._observations = self._bounded(store.load())
+        self._rings: dict[
+            tuple[str, str, str], deque[BaselineObservation]
+        ] = {}
+        for item in sorted(store.load(), key=lambda value: value.available_at):
+            self._ring_for(item).append(item)
+        self._pending_updates = store.pending_update_count
+        if self._pending_updates >= maximum_samples * 4:
+            store.save(self.observations)
+            self._pending_updates = 0
 
     @property
     def observations(self) -> tuple[BaselineObservation, ...]:
-        return self._observations
+        return tuple(
+            item for key in sorted(self._rings) for item in self._rings[key]
+        )
+
+    @property
+    def retained_counts(self) -> tuple[int, int, int]:
+        """Key count, observation count and configured per-key bound."""
+        return (
+            len(self._rings),
+            sum(len(items) for items in self._rings.values()),
+            self._maximum_samples,
+        )
 
     def observe(
         self,
@@ -153,18 +243,15 @@ class RollingBaselineEngine:
         decision_time = _utc(detected_at)
         if observation.available_at > decision_time:
             raise ValueError("Future observation cannot enter a PIT baseline.")
-        key = (observation.symbol, observation.scope, observation.feature)
-        previous = tuple(
-            item
-            for item in self._observations
-            if (item.symbol, item.scope, item.feature) == key
-        )
+        previous = self._ring_for(observation)
         if previous and observation.available_at <= previous[-1].available_at:
             raise ValueError(
                 "Baseline observations must arrive in chronological order."
             )
-        self._observations = self._bounded((*self._observations, observation))
-        self._store.save(self._observations)
+        self._store.append_many((observation,))
+        previous.append(observation)
+        self._pending_updates += 1
+        self._compact_if_due()
 
     def observe_many(
         self,
@@ -174,27 +261,30 @@ class RollingBaselineEngine:
     ) -> None:
         """Validate a PIT batch and persist it with one atomic replacement."""
         decision_time = _utc(detected_at)
-        candidate = self._observations
+        pending: list[BaselineObservation] = []
+        last_by_key = {
+            key: items[-1] for key, items in self._rings.items() if items
+        }
         for observation in observations:
             if observation.available_at > decision_time:
                 raise ValueError("Future observation cannot enter a PIT baseline.")
-            key = (observation.symbol, observation.scope, observation.feature)
-            previous = tuple(
-                item
-                for item in candidate
-                if (item.symbol, item.scope, item.feature) == key
-            )
-            if previous and observation.available_at == previous[-1].available_at:
-                if observation == previous[-1]:
+            key = self._key(observation)
+            previous = last_by_key.get(key)
+            if previous and observation.available_at == previous.available_at:
+                if observation == previous:
                     continue
                 raise ValueError("Conflicting baseline observation timestamp.")
-            if previous and observation.available_at < previous[-1].available_at:
+            if previous and observation.available_at < previous.available_at:
                 raise ValueError(
                     "Baseline observations must arrive in chronological order."
                 )
-            candidate = self._bounded((*candidate, observation))
-        self._store.save(candidate)
-        self._observations = candidate
+            last_by_key[key] = observation
+            pending.append(observation)
+        self._store.append_many(tuple(pending))
+        for observation in pending:
+            self._ring_for(observation).append(observation)
+        self._pending_updates += len(pending)
+        self._compact_if_due()
 
     def snapshot(
         self,
@@ -212,20 +302,19 @@ class RollingBaselineEngine:
             raise ValueError("Baseline identity cannot be empty.")
         selected = tuple(
             item.value
-            for item in self._observations
-            if item.symbol == normalized_symbol
-            and item.scope == normalized_scope
-            and item.feature == normalized_feature
-            and item.available_at <= as_of
-        )[-self._maximum_samples :]
+            for item in self._rings.get(
+                (normalized_symbol, normalized_scope, normalized_feature), ()
+            )
+            if item.available_at <= as_of
+        )
         if not selected and normalized_scope != "default":
             selected = tuple(
                 item.value
-                for item in self._observations
-                if item.symbol == normalized_symbol
-                and item.scope in {"default", "legacy"}
-                and item.feature == normalized_feature
-                and item.available_at <= as_of
+                for fallback_scope in ("default", "legacy")
+                for item in self._rings.get(
+                    (normalized_symbol, fallback_scope, normalized_feature), ()
+                )
+                if item.available_at <= as_of
             )[-self._maximum_samples :]
         cold_start = len(selected) < self._minimum_samples
         if cold_start:
@@ -260,31 +349,31 @@ class RollingBaselineEngine:
         if not normalized_feature:
             raise ValueError("Baseline feature cannot be empty.")
         counts_by_scope: dict[tuple[str, str], int] = defaultdict(int)
-        for item in self._observations:
-            if item.feature == normalized_feature and item.available_at <= as_of:
-                counts_by_scope[(item.symbol, item.scope)] += 1
+        for (symbol, scope, item_feature), items in self._rings.items():
+            if item_feature == normalized_feature:
+                counts_by_scope[(symbol, scope)] = sum(
+                    item.available_at <= as_of for item in items
+                )
         counts: dict[str, int] = defaultdict(int)
         for (symbol, _scope), count in counts_by_scope.items():
             counts[symbol] = max(counts[symbol], count)
         return dict(counts)
 
-    def _bounded(
-        self,
-        observations: tuple[BaselineObservation, ...],
-    ) -> tuple[BaselineObservation, ...]:
-        grouped: dict[tuple[str, str, str], list[BaselineObservation]] = defaultdict(
-            list
+    @staticmethod
+    def _key(observation: BaselineObservation) -> tuple[str, str, str]:
+        return observation.symbol, observation.scope, observation.feature
+
+    def _ring_for(
+        self, observation: BaselineObservation
+    ) -> deque[BaselineObservation]:
+        return self._rings.setdefault(
+            self._key(observation), deque(maxlen=self._maximum_samples)
         )
-        for item in observations:
-            grouped[(item.symbol, item.scope, item.feature)].append(item)
-        retained = tuple(
-            item
-            for key in sorted(grouped)
-            for item in sorted(grouped[key], key=lambda value: value.available_at)[
-                -self._maximum_samples :
-            ]
-        )
-        return retained
+
+    def _compact_if_due(self) -> None:
+        if self._pending_updates >= self._maximum_samples * 4:
+            self._store.save(self.observations)
+            self._pending_updates = 0
 
 
 def _observation_to_json(item: BaselineObservation) -> dict[str, object]:

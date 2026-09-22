@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from datetime import datetime
 from pathlib import Path
 
@@ -33,8 +33,20 @@ class WatchdogOutcomeJournal:
     def records(self) -> tuple[ForwardOutcome, ...]:
         return tuple(_from_payload(item) for item in self._journal.records())
 
+    def iter_records(self) -> Iterator[ForwardOutcome]:
+        for item in self._journal.iter_records():
+            yield _from_payload(item)
+
     def contains(self, outcome_id: str) -> bool:
         return self._journal.contains(outcome_id)
+
+    def get(self, outcome_id: str) -> ForwardOutcome | None:
+        payload = self._journal.get(outcome_id)
+        return None if payload is None else _from_payload(payload)
+
+    @property
+    def retained_index_entries(self) -> int:
+        return self._journal.retained_index_entries
 
 
 def _payload(item: ForwardOutcome) -> dict[str, object]:

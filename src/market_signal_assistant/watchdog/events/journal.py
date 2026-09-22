@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from datetime import date, datetime
 from pathlib import Path
 from typing import cast
@@ -41,6 +41,14 @@ class WatchdogEventJournal:
 
     def records(self) -> tuple[WatchdogEventEvidence, ...]:
         return tuple(_event_from_payload(item) for item in self._journal.records())
+
+    def iter_records(self) -> Iterator[WatchdogEventEvidence]:
+        for item in self._journal.iter_records():
+            yield _event_from_payload(item)
+
+    @property
+    def retained_index_entries(self) -> int:
+        return self._journal.retained_index_entries
 
     def get(self, event_id: str) -> WatchdogEventEvidence | None:
         payload = self._journal.get(event_id)

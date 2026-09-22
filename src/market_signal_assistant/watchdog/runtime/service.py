@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import re
 import time
 import traceback
 from collections import deque
 from collections.abc import Callable, Mapping
-from concurrent.futures import Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from functools import partial
 from threading import Event, Lock, Thread
@@ -88,6 +90,22 @@ class SymbolRunResult:
     failure: str | None = None
 
 
+@dataclass(slots=True)
+class _ScheduledSymbolWork:
+    entry: UniverseEntry
+    interval: str
+    boundaries: tuple[datetime, ...]
+    submitted_at: float
+    started_at: float | None = None
+    timed_out: bool = False
+    cancelled_before_start: bool = False
+    lock: Lock = field(default_factory=Lock)
+
+    @property
+    def symbol(self) -> str:
+        return self.entry.instrument.symbol
+
+
 class WatchdogShadowRuntime:
     """Explicit, bounded, shadow-only orchestration over Phase 1-3 services."""
 
@@ -117,6 +135,7 @@ class WatchdogShadowRuntime:
         indexes: WatchdogIndexManager | None = None,
         storage_monitor: StorageMonitor | None = None,
         storage_telemetry: StorageTelemetryJournal | None = None,
+        baseline_retained_counts: Callable[[], tuple[int, int, int]] | None = None,
     ) -> None:
         self._universe_provider = universe_provider
         self._market_provider = market_provider
@@ -141,6 +160,7 @@ class WatchdogShadowRuntime:
         self._indexes = indexes
         self._storage_monitor = storage_monitor
         self._storage_telemetry = storage_telemetry
+        self._baseline_retained_counts = baseline_retained_counts
         self._scheduler = CompletedBucketScheduler(self._config.maximum_catchup_buckets)
         self._retry = RetryPolicy(
             self._config.retry_attempts,
@@ -164,6 +184,7 @@ class WatchdogShadowRuntime:
         self._symbols_processed = 0
         self._symbols_failed = 0
         self._provider_errors = 0
+        self._provider_failures = 0
         self._rate_limit_events = 0
         self._api_calls = 0
         self._api_call_times: deque[float] = deque()
@@ -171,6 +192,10 @@ class WatchdogShadowRuntime:
         self._minimum_api_spacing: float | None = None
         self._last_api_call_at: float | None = None
         self._throttle_waits = 0
+        self._scheduler_timeouts = 0
+        self._cancelled_before_start = 0
+        self._late_worker_completions = 0
+        self._committed_after_timeout = 0
         self._loop_duration = 0.0
         self._max_symbol_latency = 0.0
         self._stale_data = 0
@@ -226,6 +251,7 @@ class WatchdogShadowRuntime:
             OperationalEventType.THROTTLE_WAIT,
             now,
             (("wait_seconds", f"{wait_seconds:.6f}"),),
+            rollup_signature="throttle_wait:global_api_budget",
         )
 
     def start(self) -> None:
@@ -399,63 +425,77 @@ class WatchdogShadowRuntime:
             thread_name_prefix="watchdog-symbol",
         )
         try:
-            futures: dict[Future[SymbolRunResult], str] = {}
+            futures: dict[Future[SymbolRunResult], _ScheduledSymbolWork] = {}
             for entry, interval, boundaries in due:
                 symbol = entry.instrument.symbol
                 if not self._claim_symbol(symbol):
                     continue
+                work = _ScheduledSymbolWork(
+                    entry,
+                    interval,
+                    boundaries,
+                    self._monotonic(),
+                )
                 try:
-                    future = executor.submit(
-                        self._process_symbol, entry, interval, boundaries
-                    )
+                    future = executor.submit(self._execute_work, work)
                 except Exception:
                     self._release_symbol(symbol)
                     raise
                 with self._inflight_lock:
                     self._inflight_futures.add(future)
-                future.add_done_callback(
-                    partial(self._release_work, symbol=symbol)
-                )
-                futures[future] = symbol
+                future.add_done_callback(partial(self._complete_work, work=work))
+                futures[future] = work
                 self._last_checks[symbol] = loop_time
-            done, pending = wait(
-                futures,
-                timeout=self._config.provider_timeout * self._config.retry_attempts,
-            )
-            for future in done:
-                try:
-                    results.append(future.result())
-                except Exception as error:
-                    results.append(
-                        SymbolRunResult(
-                            futures[future],
-                            0,
-                            0,
-                            0,
-                            0,
-                            0,
-                            0.0,
-                            True,
-                            type(error).__name__,
+            pending = set(futures)
+            timeout = self._config.provider_timeout * self._config.retry_attempts
+            while pending:
+                done, _ = wait(pending, timeout=min(0.01, timeout))
+                for future in done:
+                    pending.discard(future)
+                    results.append(self._resolved_result(future, futures[future]))
+                now_monotonic = self._monotonic()
+                for future in tuple(pending):
+                    work = futures[future]
+                    with work.lock:
+                        completed_now = future.done()
+                        started_at = work.started_at
+                        should_timeout = (
+                            not completed_now
+                            and started_at is not None
+                            and now_monotonic - started_at >= timeout
                         )
-                    )
-            for future in pending:
-                future.cancel()
-                results.append(
-                    SymbolRunResult(
-                        futures[future],
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        self._config.provider_timeout,
-                        True,
-                        "TimeoutError",
-                    )
+                        if should_timeout:
+                            work.timed_out = True
+                    if completed_now:
+                        pending.discard(future)
+                        results.append(self._resolved_result(future, work))
+                        continue
+                    if not should_timeout:
+                        continue
+                    pending.discard(future)
+                    cancelled = future.cancel()
+                    with self._metrics_lock:
+                        self._scheduler_timeouts += 1
+                    self._audit_scheduler_timeout(work, cancelled=cancelled)
+                    if cancelled:
+                        self._record_cancelled_before_start(work, results)
+                running_detached = sum(
+                    work.timed_out and not future.done()
+                    for future, work in futures.items()
                 )
+                queued = tuple(
+                    (future, futures[future])
+                    for future in pending
+                    if futures[future].started_at is None
+                )
+                if queued and running_detached >= self._config.maximum_workers:
+                    for future, work in queued:
+                        if not future.cancel():
+                            continue
+                        pending.discard(future)
+                        self._record_cancelled_before_start(work, results)
         finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+            executor.shutdown(wait=False, cancel_futures=False)
         self._finish_loop(loop_time, loop_started, tuple(results))
         snapshot = self.health_snapshot()
         if acquired_here and self._instance_lock is not None:
@@ -544,6 +584,52 @@ class WatchdogShadowRuntime:
             minimum_api_spacing_seconds=self._minimum_api_spacing,
             acceptance_blocked=bool(blocking_reasons),
             acceptance_blocking_reasons=blocking_reasons,
+            scheduler_timeouts=self._scheduler_timeouts,
+            cancelled_before_start=self._cancelled_before_start,
+            late_worker_completions=self._late_worker_completions,
+            committed_after_timeout=self._committed_after_timeout,
+            retained_counts=self._retained_counts(),
+            provider_failures=self._provider_failures,
+        )
+
+    def _retained_counts(self) -> tuple[tuple[str, int], ...]:
+        pending_events, pending_points, completed, used = (
+            self._outcomes.retained_counts
+        )
+        outcome_journal_index, price_journal_index = (
+            self._outcomes.journal_retained_counts
+        )
+        baseline_keys = baseline_observations = baseline_bound = 0
+        if self._baseline_retained_counts is not None:
+            baseline_keys, baseline_observations, baseline_bound = (
+                self._baseline_retained_counts()
+            )
+        with self._inflight_lock:
+            inflight_symbols = len(self._inflight_symbols)
+            inflight_futures = len(self._inflight_futures)
+        return (
+            ("baseline_keys", baseline_keys),
+            ("baseline_observations", baseline_observations),
+            ("baseline_per_key_bound", baseline_bound),
+            ("pending_events", pending_events),
+            ("pending_price_points", pending_points),
+            ("pending_completed_horizons", completed),
+            ("pending_used_observations", used),
+            ("state_symbols", self._states.retained_count),
+            ("scheduler_cursors", self._cursors.retained_count),
+            ("scheduler_last_checks", len(self._last_checks)),
+            ("inflight_symbols", inflight_symbols),
+            ("inflight_futures", inflight_futures),
+            ("event_journal_ram_index", self._events.retained_index_entries),
+            ("outcome_journal_ram_index", outcome_journal_index),
+            ("price_journal_ram_index", price_journal_index),
+            ("audit_journal_ram_index", self._audit_journal.retained_index_entries),
+            (
+                "storage_journal_ram_index",
+                self._storage_telemetry.retained_index_entries
+                if self._storage_telemetry is not None
+                else 0,
+            ),
         )
 
     def _next_market_update_due(self, now: datetime) -> datetime | None:
@@ -615,6 +701,11 @@ class WatchdogShadowRuntime:
             return
         current = {item.instrument.symbol for item in snapshot.eligible}
         self._universe = snapshot
+        self._last_checks = {
+            symbol: checked_at
+            for symbol, checked_at in self._last_checks.items()
+            if symbol in current
+        }
         self._last_universe_refresh = now
         self._audit(
             OperationalEventType.UNIVERSE_REFRESH,
@@ -736,6 +827,10 @@ class WatchdogShadowRuntime:
                     ("traceback", traceback.format_exc(limit=20)[-8000:]),
                 ),
                 symbol=symbol,
+                rollup_signature=(
+                    f"symbol_pipeline:{type(error).__name__}:"
+                    f"{_safe_error_signature(error)}"
+                ),
             )
             return SymbolRunResult(
                 symbol,
@@ -749,28 +844,116 @@ class WatchdogShadowRuntime:
                 type(error).__name__,
             )
 
+    def _execute_work(self, work: _ScheduledSymbolWork) -> SymbolRunResult:
+        with work.lock:
+            work.started_at = self._monotonic()
+        return self._process_symbol(work.entry, work.interval, work.boundaries)
+
+    @staticmethod
+    def _resolved_result(
+        future: Future[SymbolRunResult], work: _ScheduledSymbolWork
+    ) -> SymbolRunResult:
+        try:
+            return future.result()
+        except (CancelledError, Exception) as error:
+            return SymbolRunResult(
+                work.symbol,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0.0,
+                True,
+                type(error).__name__,
+            )
+
+    def _audit_scheduler_timeout(
+        self, work: _ScheduledSymbolWork, *, cancelled: bool
+    ) -> None:
+        self._audit(
+            OperationalEventType.SCHEDULER_TIMEOUT,
+            self._clock(),
+            (
+                ("stage", "running"),
+                ("interval", work.interval),
+                ("boundaries", ",".join(item.isoformat() for item in work.boundaries)),
+                ("cancel_requested", "true"),
+                ("cancel_succeeded", str(cancelled).lower()),
+            ),
+            symbol=work.symbol,
+            rollup_signature="scheduler_timeout:running",
+        )
+
+    def _record_cancelled_before_start(
+        self,
+        work: _ScheduledSymbolWork,
+        results: list[SymbolRunResult],
+    ) -> None:
+        with work.lock:
+            work.cancelled_before_start = True
+        with self._metrics_lock:
+            self._cancelled_before_start += 1
+        self._audit(
+            OperationalEventType.SCHEDULER_TIMEOUT,
+            self._clock(),
+            (
+                ("stage", "queued"),
+                ("interval", work.interval),
+                ("boundaries", ",".join(item.isoformat() for item in work.boundaries)),
+                ("cancel_requested", "true"),
+                ("cancel_succeeded", "true"),
+            ),
+            symbol=work.symbol,
+            rollup_signature="scheduler_cancelled:before_start",
+        )
+        results.append(
+            SymbolRunResult(
+                work.symbol,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0.0,
+                True,
+                "CancelledBeforeStart",
+            )
+        )
+
     def _provider_call(
         self,
         operation: str,
         symbol: str | None,
         callback: Callable[[], T],
     ) -> T:
-        def on_error(error: Exception, attempt: int) -> None:
+        def on_error(error: Exception, attempt: int, backoff: float) -> None:
+            rate_limited = is_rate_limit_error(error)
             with self._metrics_lock:
                 self._provider_errors += 1
-                if is_rate_limit_error(error):
+                if rate_limited:
                     self._rate_limit_events += 1
+                else:
+                    self._provider_failures += 1
+            status, ret_code = _provider_codes(error)
             self._audit(
                 OperationalEventType.RATE_LIMIT
-                if is_rate_limit_error(error)
+                if rate_limited
                 else OperationalEventType.PROVIDER_FAILURE,
                 self._clock(),
                 (
-                    ("operation", operation),
+                    ("endpoint_class", operation),
                     ("attempt", str(attempt)),
                     ("error", type(error).__name__),
+                    ("http_status", status),
+                    ("ret_code", ret_code),
+                    ("backoff_seconds", f"{backoff:.6f}"),
                 ),
                 symbol=symbol,
+                rollup_signature=(
+                    f"provider:{'rate_limit' if rate_limited else 'failure'}:"
+                    f"{operation}:{type(error).__name__}:{status}:{ret_code}"
+                ),
             )
 
         return retry_call(
@@ -792,15 +975,61 @@ class WatchdogShadowRuntime:
         with self._inflight_lock:
             self._inflight_symbols.discard(symbol)
 
-    def _release_work(
+    def _complete_work(
         self,
         future: Future[SymbolRunResult],
         *,
-        symbol: str,
+        work: _ScheduledSymbolWork,
     ) -> None:
         with self._inflight_lock:
             self._inflight_futures.discard(future)
-            self._inflight_symbols.discard(symbol)
+            self._inflight_symbols.discard(work.symbol)
+        with work.lock:
+            reconcile = work.timed_out and not work.cancelled_before_start
+        if not reconcile:
+            return
+        try:
+            result = future.result()
+        except CancelledError:
+            return
+        except Exception as error:
+            result = SymbolRunResult(
+                work.symbol,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0.0,
+                True,
+                type(error).__name__,
+            )
+        committed = result.processed_buckets > 0
+        with self._metrics_lock:
+            self._late_worker_completions += 1
+            self._committed_after_timeout += int(committed)
+            self._symbols_processed += int(not result.failed)
+            self._symbols_failed += int(result.failed)
+            self._missing_data += result.missing_data
+            self._stale_data += result.stale_data
+        self._audit(
+            OperationalEventType.SCHEDULER_RECONCILIATION,
+            self._clock(),
+            (
+                ("interval", work.interval),
+                ("boundaries", ",".join(item.isoformat() for item in work.boundaries)),
+                ("status", "failed" if result.failed else "completed"),
+                ("committed_after_timeout", str(committed).lower()),
+                ("failure", result.failure or "none"),
+            ),
+            symbol=work.symbol,
+            rollup_signature=(
+                "scheduler_reconciliation:failed"
+                if result.failed
+                else "scheduler_reconciliation:completed"
+            ),
+        )
+        self._write_health()
 
     def _finish_loop(
         self,
@@ -867,10 +1096,13 @@ class WatchdogShadowRuntime:
         details: tuple[tuple[str, str], ...],
         *,
         symbol: str | None = None,
+        rollup_signature: str | None = None,
     ) -> None:
-        self._audit_journal.append(
-            OperationalEvent(event_type, _utc(occurred_at), details, symbol)
-        )
+        event = OperationalEvent(event_type, _utc(occurred_at), details, symbol)
+        if rollup_signature is None:
+            self._audit_journal.append(event)
+        else:
+            self._audit_journal.append_rollup(event, signature=rollup_signature)
 
     def _write_health(self) -> None:
         self._health_store.save(self.health_snapshot())
@@ -890,6 +1122,23 @@ def _utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("Runtime time must be timezone-aware.")
     return value.astimezone(UTC)
+
+
+def _provider_codes(error: Exception) -> tuple[str, str]:
+    status_value = getattr(error, "status_code", None)
+    status = str(status_value) if isinstance(status_value, int) else "unknown"
+    match = re.search(r"(?:retcode|error code)\s*[:=]?\s*(-?\d+)", str(error), re.I)
+    ret_code = match.group(1) if match is not None else "unknown"
+    if status == "unknown":
+        http_match = re.search(r"\b(?:http\s*)?(4\d\d|5\d\d)\b", str(error), re.I)
+        if http_match is not None:
+            status = http_match.group(1)
+    return status, ret_code
+
+
+def _safe_error_signature(error: Exception) -> str:
+    message = " ".join(str(error).split()).lower()
+    return hashlib.sha256(message.encode("utf-8")).hexdigest()[:16]
 
 
 def _rotating_batch(

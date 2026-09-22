@@ -65,21 +65,23 @@ def retry_call(
     policy: RetryPolicy,
     sleep: Callable[[float], None] = time.sleep,
     random_value: Callable[[], float] = random.random,
-    on_error: Callable[[Exception, int], None] | None = None,
+    on_error: Callable[[Exception, int, float], None] | None = None,
 ) -> T:
-    callback = on_error or (lambda _error, _attempt: None)
+    callback = on_error or (lambda _error, _attempt, _backoff: None)
     last_error: Exception | None = None
     for attempt in range(1, policy.attempts + 1):
         try:
             return operation()
         except Exception as error:
             last_error = error
-            callback(error, attempt)
             if attempt == policy.attempts:
+                callback(error, attempt, 0.0)
                 break
             exponential = min(policy.max_delay, policy.base_delay * 2 ** (attempt - 1))
             multiplier = 1.0 + policy.jitter * (2.0 * random_value() - 1.0)
-            sleep(max(0.0, exponential * multiplier))
+            backoff = max(0.0, exponential * multiplier)
+            callback(error, attempt, backoff)
+            sleep(backoff)
     assert last_error is not None
     raise last_error
 

@@ -127,6 +127,12 @@ class RuntimeHealthSnapshot:
     minimum_api_spacing_seconds: float | None = None
     acceptance_blocked: bool = False
     acceptance_blocking_reasons: tuple[str, ...] = ()
+    scheduler_timeouts: int = 0
+    cancelled_before_start: int = 0
+    late_worker_completions: int = 0
+    committed_after_timeout: int = 0
+    retained_counts: tuple[tuple[str, int], ...] = ()
+    provider_failures: int = 0
 
     def __post_init__(self) -> None:
         for field in (

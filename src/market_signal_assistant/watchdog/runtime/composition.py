@@ -159,6 +159,7 @@ def build_bybit_shadow_runtime(
         storage_telemetry=StorageTelemetryJournal(
             data_root / "operational" / "storage.jsonl"
         ),
+        baseline_retained_counts=lambda: baselines.retained_counts,
     )
     holder["runtime"] = runtime
     return ShadowRuntimeBundle(runtime, budget)

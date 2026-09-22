@@ -107,6 +107,10 @@ class StorageTelemetryJournal:
     def records(self) -> tuple[dict[str, object], ...]:
         return self._journal.records()
 
+    @property
+    def retained_index_entries(self) -> int:
+        return self._journal.retained_index_entries
+
 
 def process_rss_bytes() -> int | None:
     if os.name == "nt":
