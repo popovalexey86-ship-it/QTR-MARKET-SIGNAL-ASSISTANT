@@ -65,6 +65,7 @@ from market_signal_assistant.telegram.qtr_setup_pilot import (
     QtrSetupSender,
     QtrSetupShadowObserver,
 )
+from market_signal_assistant.telegram.qtr_trader import QtrTraderTelegramController
 from market_signal_assistant.telegram.trader_transport import TraderTelegramTransport
 
 _LOGGER = logging.getLogger(__name__)
@@ -275,6 +276,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     qtr_setup_notifier: QtrSetupPilotNotifier | None = None
     qtr_micro_runtime: QtrMicroRuntime | None = None
+    trader_controller: QtrTraderTelegramController | None = None
     entry_readiness_observer: QtrSetupShadowObserver | None = None
     entry_readiness_busy_observer: QtrSetupShadowObserver | None = None
     effective_qtr_setup_settings = QtrSetupTelegramSettings(
@@ -356,6 +358,18 @@ def main(argv: Sequence[str] | None = None) -> None:
                     else frozenset()
                 ),
             )
+            if trader_transport is not None and trader_settings.configured:
+                trader_controller = QtrTraderTelegramController(
+                    qtr_micro_runtime,
+                    trader_transport,
+                    trader_settings.allowed_chat_ids,
+                )
+                qtr_micro_runtime.set_position_event_handler(
+                    trader_controller.handle_position_event
+                )
+                trader_transport.set_callback_handler(
+                    trader_controller.handle_callback
+                )
         qtr_setup_notifier = QtrSetupPilotNotifier(
             scanner=QtrSetupScanService(v2_service),
             notification_service=QtrSetupNotificationService(
@@ -373,9 +387,13 @@ def main(argv: Sequence[str] | None = None) -> None:
                 _micro_candidate_handler(
                     qtr_micro_runtime.handle_candidates,
                     (
-                        trader_transport.send
-                        if trader_transport is not None
-                        else _discard_trader_message
+                        _discard_trader_message
+                        if trader_controller is not None
+                        else (
+                            trader_transport.send
+                            if trader_transport is not None
+                            else _discard_trader_message
+                        )
                     ),
                 )
                 if qtr_micro_runtime is not None
