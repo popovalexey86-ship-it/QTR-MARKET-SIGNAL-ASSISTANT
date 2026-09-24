@@ -1107,6 +1107,7 @@ def _position_from_plan(plan: EntryPlan, now: datetime) -> MicroPosition:
         signal_price=plan.signal_price,
         pre_submit_price=plan.pre_submit_price,
         planned_notional=plan.notional,
+        scanner_level=plan.scanner_level,
     )
 
 
