@@ -34,6 +34,7 @@ from market_signal_assistant.settings import (
     NewsSettings,
     QtrSetupTelegramSettings,
     TelegramSettings,
+    TraderTelegramSettings,
 )
 from market_signal_assistant.telegram.formatting import (
     NEWS_ERROR_MESSAGE,
@@ -58,10 +59,14 @@ from market_signal_assistant.telegram.inplay_timing_audit import (
 from market_signal_assistant.telegram.news_auto import NewsAutoLoop, NewsAutoNotifier
 from market_signal_assistant.telegram.parsing import ParsedCommand, parse_command
 from market_signal_assistant.telegram.qtr_setup_pilot import (
+    QtrSetupCandidateHandler,
     QtrSetupPilotLoop,
     QtrSetupPilotNotifier,
+    QtrSetupSender,
     QtrSetupShadowObserver,
 )
+from market_signal_assistant.telegram.qtr_trader import QtrTraderTelegramController
+from market_signal_assistant.telegram.trader_transport import TraderTelegramTransport
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -235,6 +240,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     qtr_setup_settings = QtrSetupTelegramSettings.from_environment()
     entry_readiness_settings = EntryReadinessShadowSettings.from_environment()
     qtr_micro_settings = QtrMicroSettings.from_environment()
+    trader_transport: TraderTelegramTransport | None = None
+    trader_settings = TraderTelegramSettings()
+    if qtr_micro_settings.enabled:
+        try:
+            trader_settings = TraderTelegramSettings.from_environment()
+        except ValueError:
+            _LOGGER.warning("QTR Trader Telegram config invalid; delivery disabled.")
+        if trader_settings.configured:
+            trader_transport = TraderTelegramTransport(trader_settings.bot_token)
+        else:
+            _LOGGER.warning("QTR Trader Telegram config missing; delivery disabled.")
     news_settings = NewsSettings.from_environment()
     news_auto_settings = NewsAutoSettings.from_environment()
     sdk = _load_telegram_sdk()
@@ -260,6 +276,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     qtr_setup_notifier: QtrSetupPilotNotifier | None = None
     qtr_micro_runtime: QtrMicroRuntime | None = None
+    trader_controller: QtrTraderTelegramController | None = None
     entry_readiness_observer: QtrSetupShadowObserver | None = None
     entry_readiness_busy_observer: QtrSetupShadowObserver | None = None
     effective_qtr_setup_settings = QtrSetupTelegramSettings(
@@ -335,8 +352,24 @@ def main(argv: Sequence[str] | None = None) -> None:
                 settings=qtr_micro_settings,
                 client=demo_client,
                 state_store=JsonQtrMicroStateStore(),
-                allowed_chat_ids=telegram_settings.allowed_chat_ids,
+                allowed_chat_ids=(
+                    trader_settings.allowed_chat_ids
+                    if trader_settings.configured
+                    else frozenset()
+                ),
             )
+            if trader_transport is not None and trader_settings.configured:
+                trader_controller = QtrTraderTelegramController(
+                    qtr_micro_runtime,
+                    trader_transport,
+                    trader_settings.allowed_chat_ids,
+                )
+                qtr_micro_runtime.set_position_event_handler(
+                    trader_controller.handle_position_event
+                )
+                trader_transport.set_callback_handler(
+                    trader_controller.handle_callback
+                )
         qtr_setup_notifier = QtrSetupPilotNotifier(
             scanner=QtrSetupScanService(v2_service),
             notification_service=QtrSetupNotificationService(
@@ -351,7 +384,18 @@ def main(argv: Sequence[str] | None = None) -> None:
             audit_store=JsonlQtrSetupTelegramAuditStore(),
             allowed_chat_ids=telegram_settings.allowed_chat_ids,
             candidate_handler=(
-                qtr_micro_runtime.handle_candidates
+                _micro_candidate_handler(
+                    qtr_micro_runtime.handle_candidates,
+                    (
+                        _discard_trader_message
+                        if trader_controller is not None
+                        else (
+                            trader_transport.send
+                            if trader_transport is not None
+                            else _discard_trader_message
+                        )
+                    ),
+                )
                 if qtr_micro_runtime is not None
                 else None
             ),
@@ -386,6 +430,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             qtr_setup_interval_minutes=early_discovery_v2_settings.interval_minutes,
             qtr_setup_notifier=qtr_setup_notifier,
             qtr_micro_runtime=qtr_micro_runtime,
+            trader_transport=trader_transport,
             sdk=sdk,
         )
     finally:
@@ -411,6 +456,7 @@ def _run_sdk_bot(
     qtr_setup_interval_minutes: int = 5,
     qtr_setup_notifier: QtrSetupPilotNotifier | None = None,
     qtr_micro_runtime: QtrMicroRuntime | None = None,
+    trader_transport: TraderTelegramTransport | None = None,
     sdk: TelegramSdk | None = None,
 ) -> None:
     ApplicationBuilder, MessageHandler, filters = sdk or _load_telegram_sdk()
@@ -435,6 +481,7 @@ def _run_sdk_bot(
         qtr_setup_interval_minutes=qtr_setup_interval_minutes,
         qtr_setup_notifier=qtr_setup_notifier,
         qtr_micro_runtime=qtr_micro_runtime,
+        trader_transport=trader_transport,
     )
 
 
@@ -450,6 +497,23 @@ def _load_telegram_sdk() -> TelegramSdk:
             "Для Telegram требуется optional dependency 'telegram'."
         ) from None
     return ApplicationBuilder, MessageHandler, filters
+
+
+async def _discard_trader_message(chat_id: int, text: str) -> None:
+    del chat_id, text
+
+
+def _micro_candidate_handler(
+    handle_candidates: QtrSetupCandidateHandler,
+    trader_send: QtrSetupSender,
+) -> QtrSetupCandidateHandler:
+    async def route(
+        candidates: tuple[QtrSetupCandidate, ...], scanner_send: QtrSetupSender
+    ) -> None:
+        del scanner_send
+        await handle_candidates(candidates, trader_send)
+
+    return route
 
 
 def _run_sdk_bot_handlers(
@@ -473,6 +537,7 @@ def _run_sdk_bot_handlers(
     qtr_setup_interval_minutes: int = 5,
     qtr_setup_notifier: QtrSetupPilotNotifier | None = None,
     qtr_micro_runtime: QtrMicroRuntime | None = None,
+    trader_transport: TraderTelegramTransport | None = None,
 ) -> None:
     resolved_news_auto = news_auto_settings or NewsAutoSettings()
     resolved_timing_audit = timing_audit_settings or InPlayTimingAuditSettings()
@@ -531,6 +596,8 @@ def _run_sdk_bot_handlers(
         async def send(chat_id: int, text: str) -> None:
             await application.bot.send_message(chat_id=chat_id, text=text)
 
+        if trader_transport is not None:
+            await trader_transport.start()
         if qtr_micro_runtime is not None:
             await qtr_micro_runtime.initialize()
 
@@ -584,16 +651,20 @@ def _run_sdk_bot_handlers(
 
     async def stop_auto(application: Any) -> None:
         del application
-        if qtr_setup_loop is not None:
-            await qtr_setup_loop.stop()
-        if timing_audit_loop is not None:
-            await timing_audit_loop.stop()
-        if early_discovery_loop is not None:
-            await early_discovery_loop.stop()
-        if news_auto_loop is not None:
-            await news_auto_loop.stop()
-        if auto_loop is not None:
-            await auto_loop.stop()
+        try:
+            if qtr_setup_loop is not None:
+                await qtr_setup_loop.stop()
+            if timing_audit_loop is not None:
+                await timing_audit_loop.stop()
+            if early_discovery_loop is not None:
+                await early_discovery_loop.stop()
+            if news_auto_loop is not None:
+                await news_auto_loop.stop()
+            if auto_loop is not None:
+                await auto_loop.stop()
+        finally:
+            if trader_transport is not None:
+                await trader_transport.close()
 
     builder = ApplicationBuilder().token(settings.bot_token)
     lifecycle_enabled = False

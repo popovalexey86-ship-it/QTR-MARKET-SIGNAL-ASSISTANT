@@ -32,6 +32,7 @@ class MicroExitReason(StrEnum):
     TIME_EXIT = "TIME_EXIT"
     RUNNER_TIME_EXIT = "RUNNER_TIME_EXIT"
     STRUCTURE_EXIT = "STRUCTURE_EXIT"
+    HUMAN_CLOSE = "HUMAN_CLOSE"
     STOP_PROTECTION_FAILED = "STOP_PROTECTION_FAILED"
 
 
@@ -115,6 +116,7 @@ class EntryPlan:
     notional: float = 0.0
     estimated_round_trip_fees: float = 0.0
     estimated_fees_r_pct: float = 0.0
+    scanner_level: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,6 +253,7 @@ class MicroPosition:
     exit_fees: float = 0.0
     funding: float | None = None
     journaled: bool = False
+    scanner_level: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

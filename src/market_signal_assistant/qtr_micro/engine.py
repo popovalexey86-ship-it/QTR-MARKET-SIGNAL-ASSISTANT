@@ -212,6 +212,7 @@ class QtrMicroEntryEngine:
             notional=notional,
             estimated_round_trip_fees=estimated_fees,
             estimated_fees_r_pct=estimated_fees_r_pct,
+            scanner_level=result.trigger_level,
         )
         return EntryDecision(plan, None)
 

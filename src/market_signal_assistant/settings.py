@@ -51,6 +51,49 @@ class TelegramSettings:
         return cls(token, allowed, allow_all)
 
 
+class TraderTelegramSettings:
+    """Outbound-only QTR Micro notification credentials, separate from Scanner."""
+
+    __slots__ = ("_bot_token", "allowed_chat_ids")
+
+    def __init__(
+        self,
+        bot_token: str = "",
+        allowed_chat_ids: frozenset[int] = frozenset(),
+    ) -> None:
+        self._bot_token = bot_token.strip()
+        self.allowed_chat_ids = allowed_chat_ids
+
+    @property
+    def bot_token(self) -> str:
+        return self._bot_token
+
+    @property
+    def configured(self) -> bool:
+        return bool(self._bot_token and self.allowed_chat_ids)
+
+    def __repr__(self) -> str:
+        return (
+            "TraderTelegramSettings(bot_token=<redacted>, "
+            f"allowed_chat_ids={self.allowed_chat_ids!r})"
+        )
+
+    @classmethod
+    def from_environment(cls) -> TraderTelegramSettings:
+        token = os.getenv("QTR_TRADER_TELEGRAM_BOT_TOKEN", "").strip()
+        raw_ids = os.getenv("QTR_TRADER_TELEGRAM_ALLOWED_CHAT_IDS", "").strip()
+        try:
+            allowed = frozenset(
+                int(value.strip()) for value in raw_ids.split(",") if value.strip()
+            )
+        except ValueError:
+            raise ValueError(
+                "QTR_TRADER_TELEGRAM_ALLOWED_CHAT_IDS должна содержать "
+                "целые числа через запятую."
+            ) from None
+        return cls(token, allowed)
+
+
 @dataclass(frozen=True, slots=True)
 class LiveDerivativesSettings:
     enabled: bool = False

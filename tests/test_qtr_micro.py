@@ -74,7 +74,10 @@ from market_signal_assistant.setup_engine import (
     SetupType,
     analyze_setup,
 )
-from market_signal_assistant.telegram.bot import execute_command
+from market_signal_assistant.telegram.bot import (
+    _micro_candidate_handler,
+    execute_command,
+)
 from market_signal_assistant.telegram.parsing import parse_command
 from market_signal_assistant.telegram.qtr_micro import (
     format_micro_closed,
@@ -787,6 +790,41 @@ def test_runtime_uses_setup_symbol_end_to_end_without_btc_substitution(
     assert "BTCUSDT" not in str(client.orders[0]) or symbol == "BTCUSDT"
 
 
+def test_runtime_entry_notification_is_routed_only_to_trader(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    client.auto_fill = True
+    runtime = QtrMicroRuntime(
+        settings=settings(),
+        client=client,
+        state_store=JsonQtrMicroStateStore(tmp_path / "state.json"),
+        allowed_chat_ids=frozenset({201}),
+        clock=lambda: NOW,
+        decision_audit=JsonlQtrMicroDecisionAudit(tmp_path / "decision.jsonl"),
+        runtime_audit=JsonlQtrMicroRuntimeAudit(tmp_path / "runtime.jsonl"),
+    )
+    scanner_messages: list[tuple[int, str]] = []
+    trader_messages: list[tuple[int, str]] = []
+
+    async def scanner_send(chat_id: int, text: str) -> None:
+        scanner_messages.append((chat_id, text))
+
+    async def trader_send(chat_id: int, text: str) -> None:
+        trader_messages.append((chat_id, text))
+
+    async def exercise() -> None:
+        assert (await runtime.initialize()).ready
+        routed = _micro_candidate_handler(runtime.handle_candidates, trader_send)
+        await routed((candidate(),), scanner_send)
+
+    asyncio.run(exercise())
+    assert scanner_messages == []
+    assert len(trader_messages) == 1
+    assert trader_messages[0][0] == 201
+    assert "QTR MICRO — DEMO ВХОД" in trader_messages[0][1]
+
+
 @pytest.mark.parametrize(
     ("symbol", "universe_status"),
     (
@@ -1094,6 +1132,7 @@ def position_from_plan(plan: Any, **changes: Any) -> MicroPosition:
         stage=MicroStage.OPEN,
         signal_at=NOW,
         signal_price=plan.signal_price,
+        scanner_level=plan.scanner_level,
     )
     return replace(baseline, **changes)
 
@@ -1130,6 +1169,66 @@ def runtime_management_decision(
     assert len(spy.decisions) == 1
     assert len(spy.flags) == 1
     return spy.decisions[0], spy.flags[0]
+
+
+@pytest.mark.parametrize(
+    ("stage", "price_field", "expected_text", "expected_action"),
+    (
+        (MicroStage.OPEN, "tp1_price", "QTR MICRO — TP1", MicroExitReason.TP1),
+        (MicroStage.TP1_FILLED, "tp2_price", "QTR MICRO — TP2", MicroExitReason.TP2),
+        (
+            MicroStage.OPEN,
+            "entry_price",
+            "QTR MICRO — СДЕЛКА ЗАКРЫТА",
+            MicroExitReason.TIME_EXIT,
+        ),
+    ),
+)
+def test_micro_management_notifications_use_injected_trader_sender(
+    tmp_path: Path,
+    stage: MicroStage,
+    price_field: str,
+    expected_text: str,
+    expected_action: MicroExitReason,
+) -> None:
+    plan = decision().plan
+    assert plan is not None
+    position = position_from_plan(plan, stage=stage)
+    store = JsonQtrMicroStateStore(tmp_path / "state.json")
+    store.save(state(positions={plan.trade_id: position}))
+    client = FakeClient()
+    client.market_prices[plan.symbol] = getattr(plan, price_field)
+    runtime = QtrMicroRuntime(
+        settings=settings(),
+        client=client,
+        state_store=store,
+        allowed_chat_ids=frozenset({201}),
+        clock=lambda: NOW,
+    )
+    spy = ManagementExecutionSpy(position, QtrMicroEntryEngine(settings()))
+    runtime._execution = spy  # type: ignore[assignment]  # noqa: SLF001
+    trader_messages: list[tuple[int, str]] = []
+
+    async def trader_send(chat_id: int, text: str) -> None:
+        trader_messages.append((chat_id, text))
+
+    observed_at = (
+        NOW + timedelta(minutes=45)
+        if expected_action is MicroExitReason.TIME_EXIT
+        else NOW
+    )
+    asyncio.run(
+        runtime._manage_open(  # noqa: SLF001
+            store.load(today=NOW.date(), trading_enabled=True),
+            {},
+            trader_send,
+            observed_at,
+        )
+    )
+    assert len(trader_messages) == 1
+    assert trader_messages[0][0] == 201
+    assert expected_text in trader_messages[0][1]
+    assert spy.decisions[0].action is expected_action
 
 
 def test_management_tp_breakeven_and_time_structure_exits() -> None:
@@ -2664,3 +2763,199 @@ def test_completion_reconciliation_never_invents_protective_stop(
     assert reconciled.blocked_reason is not None
     assert reconciled.positions[plan.trade_id].stage is MicroStage.CLOSED
     assert not journal_path.exists()
+
+
+def test_trader_scanner_level_propagates_and_old_state_is_compatible(
+    tmp_path: Path,
+) -> None:
+    item = candidate(result_changes={"trigger_level": 100.75})
+    plan = decision(item).plan
+    assert plan is not None
+    assert plan.scanner_level == 100.75
+    position = position_from_plan(plan)
+    assert position.scanner_level == 100.75
+
+    path = tmp_path / "state.json"
+    store = JsonQtrMicroStateStore(path)
+    store.save(state(positions={position.trade_id: position}))
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    del payload["positions"][position.trade_id]["scanner_level"]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    loaded = store.load(today=NOW.date(), trading_enabled=True)
+    assert loaded.positions[position.trade_id].scanner_level is None
+
+
+def test_human_close_is_reduce_only_and_idempotent(tmp_path: Path) -> None:
+    plan = decision().plan
+    assert plan is not None
+    position = position_from_plan(plan)
+    store = JsonQtrMicroStateStore(tmp_path / "human-close-state.json")
+    store.save(state(positions={position.trade_id: position}))
+    client = FakeClient()
+    service = QtrMicroExecutionService(
+        settings=settings(),
+        client=client,
+        state_store=store,
+        engine=QtrMicroEntryEngine(settings()),
+    )
+
+    pending = service.request_human_close(position.trade_id, NOW)
+    assert pending is not None
+    assert pending.stage is MicroStage.EXIT_ACKNOWLEDGED
+    assert pending.pending_exit_reason is MicroExitReason.HUMAN_CLOSE
+    assert len(client.orders) == 1
+    assert client.orders[0]["reduce_only"] is True
+    assert client.orders[0]["qty"] == position.current_qty
+    assert str(client.orders[0]["order_link_id"]).endswith("-HC")
+
+    repeated = service.request_human_close(position.trade_id, NOW)
+    assert repeated is not None
+    assert repeated.pending_exit_order_id == pending.pending_exit_order_id
+    assert len(client.orders) == 1
+
+
+@pytest.mark.parametrize("stage", (MicroStage.CLOSED, MicroStage.BLOCKED))
+def test_human_close_is_noop_for_closed_or_blocked(
+    tmp_path: Path, stage: MicroStage
+) -> None:
+    plan = decision().plan
+    assert plan is not None
+    position = position_from_plan(plan, stage=stage)
+    store = JsonQtrMicroStateStore(tmp_path / f"{stage.value}.json")
+    store.save(state(positions={position.trade_id: position}))
+    client = FakeClient()
+    service = QtrMicroExecutionService(
+        settings=settings(),
+        client=client,
+        state_store=store,
+        engine=QtrMicroEntryEngine(settings()),
+    )
+    result = service.request_human_close(position.trade_id, NOW)
+    assert result is not None and result.stage is stage
+    assert client.orders == []
+
+
+def test_human_close_does_not_replace_pending_automatic_exit(
+    tmp_path: Path,
+) -> None:
+    plan = decision().plan
+    assert plan is not None
+    position = position_from_plan(
+        plan,
+        stage=MicroStage.EXIT_ACKNOWLEDGED,
+        pending_exit_order_id="automatic-exit",
+        pending_exit_order_link_id=f"{plan.trade_id}-TM",
+        pending_exit_reason=MicroExitReason.TIME_EXIT,
+        pending_exit_qty=plan.qty,
+    )
+    store = JsonQtrMicroStateStore(tmp_path / "pending-auto.json")
+    store.save(state(positions={position.trade_id: position}))
+    client = FakeClient()
+    service = QtrMicroExecutionService(
+        settings=settings(),
+        client=client,
+        state_store=store,
+        engine=QtrMicroEntryEngine(settings()),
+    )
+    result = service.request_human_close(position.trade_id, NOW)
+    assert result is not None
+    assert result.pending_exit_reason is MicroExitReason.TIME_EXIT
+    assert client.orders == []
+
+
+def test_human_close_waits_for_fill_and_journals_exactly_once(
+    tmp_path: Path,
+) -> None:
+    plan = decision().plan
+    assert plan is not None
+    position = position_from_plan(
+        plan,
+        actual_risk_at_fill=plan.risk_amount,
+        entry_fees=0.1,
+        fees=0.1,
+    )
+    store = JsonQtrMicroStateStore(tmp_path / "fill-state.json")
+    store.save(state(positions={position.trade_id: position}))
+    client = FakeClient()
+    journal_path = tmp_path / "human-close.jsonl"
+    service = QtrMicroExecutionService(
+        settings=settings(),
+        client=client,
+        state_store=store,
+        engine=QtrMicroEntryEngine(settings()),
+        journal=JsonlQtrMicroTradeJournal(journal_path),
+    )
+
+    pending = service.request_human_close(position.trade_id, NOW)
+    assert pending is not None and pending.pending_exit_order_id is not None
+    assert pending.stage is MicroStage.EXIT_ACKNOWLEDGED
+    assert not journal_path.exists()
+
+    fill = ExecutionFill(
+        pending.pending_exit_order_id,
+        position.average_fill + 1.0 if position.average_fill is not None else 102.0,
+        position.current_qty,
+        0.1,
+        NOW + timedelta(seconds=2),
+    )
+    client.fills_by_order[pending.pending_exit_order_id] = fill
+    confirmed = service.manage_position(
+        position.trade_id,
+        current_price=fill.average_price,
+        now=NOW + timedelta(seconds=2),
+    )
+    assert confirmed.action is MicroExitReason.HUMAN_CLOSE
+    loaded = store.load(today=NOW.date(), trading_enabled=True)
+    closed = loaded.positions[position.trade_id]
+    assert closed.stage is MicroStage.CLOSED
+    assert closed.runner_exit_price == fill.average_price
+    rows = journal_path.read_text(encoding="utf-8").splitlines()
+    assert len(rows) == 1
+    assert json.loads(rows[0])["exit_reason"] == "HUMAN_CLOSE"
+
+    service.request_human_close(position.trade_id, NOW + timedelta(seconds=3))
+    service.reconcile(NOW + timedelta(seconds=3))
+    assert len(journal_path.read_text(encoding="utf-8").splitlines()) == 1
+    assert len(client.orders) == 1
+
+
+def test_position_snapshot_uses_actual_risk_and_existing_excursions(
+    tmp_path: Path,
+) -> None:
+    plan = decision().plan
+    assert plan is not None
+    position = position_from_plan(
+        plan,
+        average_fill=100.0,
+        structural_stop=99.0,
+        current_stop=99.0,
+        initial_qty=2.0,
+        current_qty=2.0,
+        filled_qty=2.0,
+        actual_risk_at_fill=2.0,
+        realised_partial_pnl=0.0,
+        fees=0.2,
+        max_favorable_price=102.0,
+        max_adverse_price=99.5,
+        opened_at=NOW,
+    )
+    store = JsonQtrMicroStateStore(tmp_path / "snapshot.json")
+    store.save(state(positions={position.trade_id: position}))
+    client = FakeClient()
+    client.market_prices[position.symbol] = 101.5
+    runtime = QtrMicroRuntime(
+        settings=settings(),
+        client=client,
+        state_store=store,
+        allowed_chat_ids=frozenset(),
+        clock=lambda: NOW + timedelta(minutes=5),
+    )
+
+    snapshot = asyncio.run(runtime.get_position_snapshot(position.trade_id))
+    assert snapshot is not None
+    assert snapshot.current_pnl_est == pytest.approx(2.8)
+    assert snapshot.current_r == pytest.approx(1.4)
+    assert snapshot.mfe_r == pytest.approx(2.0)
+    assert snapshot.mae_r == pytest.approx(-0.5)
+    assert snapshot.max_r == pytest.approx(2.0)
+    assert snapshot.duration_seconds == 300

@@ -558,6 +558,52 @@ class QtrMicroExecutionService:
         self._save_position(state, pending, timestamp)
         return ManagementDecision(None, 0)
 
+    def request_human_close(
+        self,
+        trade_id: str,
+        now: datetime,
+    ) -> MicroPosition | None:
+        """Submit one idempotent human-requested reduce-only full close."""
+        timestamp = _utc(now)
+        state = self._state_store.load(
+            today=timestamp.date(), trading_enabled=self._settings.enabled
+        )
+        position = state.positions.get(trade_id)
+        if position is None:
+            return None
+        if (
+            position.stage in {MicroStage.CLOSED, MicroStage.BLOCKED}
+            or position.pending_exit_order_id is not None
+            or position.stage is MicroStage.EXIT_ACKNOWLEDGED
+        ):
+            return position
+        if position.stage not in {
+            MicroStage.OPEN,
+            MicroStage.TP1_FILLED,
+            MicroStage.TP2_FILLED,
+            MicroStage.RUNNER,
+        }:
+            return position
+        if position.current_qty <= 0:
+            return position
+        acknowledgement = self._reduce(
+            position,
+            position.current_qty,
+            MicroExitReason.HUMAN_CLOSE,
+        )
+        pending = replace(
+            position,
+            pending_exit_order_id=acknowledgement.order_id,
+            pending_exit_order_link_id=acknowledgement.order_link_id,
+            pending_exit_reason=MicroExitReason.HUMAN_CLOSE,
+            pending_exit_qty=position.current_qty,
+            pending_new_stop=None,
+            stage=MicroStage.EXIT_ACKNOWLEDGED,
+            last_updated=timestamp,
+        )
+        self._save_position(state, pending, timestamp)
+        return pending
+
     def reconcile(self, now: datetime) -> MicroState:
         from market_signal_assistant.qtr_micro.reconciliation import (
             reconcile_demo_state,
@@ -732,6 +778,7 @@ class QtrMicroExecutionService:
             MicroExitReason.TIME_EXIT: "TM",
             MicroExitReason.RUNNER_TIME_EXIT: "RT",
             MicroExitReason.STRUCTURE_EXIT: "SX",
+            MicroExitReason.HUMAN_CLOSE: "HC",
         }.get(reason, "CL")
         return self._client.create_market_order(
             symbol=position.symbol,
@@ -1060,6 +1107,7 @@ def _position_from_plan(plan: EntryPlan, now: datetime) -> MicroPosition:
         signal_price=plan.signal_price,
         pre_submit_price=plan.pre_submit_price,
         planned_notional=plan.notional,
+        scanner_level=plan.scanner_level,
     )
 
 

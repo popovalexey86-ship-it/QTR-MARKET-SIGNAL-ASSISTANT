@@ -248,6 +248,11 @@ def _position_from_json(raw: dict[str, Any]) -> MicroPosition:
         exit_fees=float(raw.get("exit_fees", 0.0)),
         funding=(float(raw["funding"]) if raw.get("funding") is not None else None),
         journaled=bool(raw.get("journaled", False)),
+        scanner_level=(
+            float(raw["scanner_level"])
+            if raw.get("scanner_level") is not None
+            else None
+        ),
     )
 
 
