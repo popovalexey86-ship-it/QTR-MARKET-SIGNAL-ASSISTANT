@@ -106,7 +106,7 @@ class QtrTraderTelegramController:
             await query.answer("Некорректная команда.", show_alert=True)
             return
         action, trade_id = parsed
-        message_id = int(getattr(message, "message_id"))
+        message_id = int(message.message_id)
         key = (chat_id, trade_id)
 
         if action == "hold":
