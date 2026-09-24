@@ -637,6 +637,7 @@ class QtrMicroExecutionService:
                 )
         records = dict(reconciled.positions)
         changed = False
+        recovery_blocked = False
         for trade_id, position in tuple(records.items()):
             if (
                 position.stage is MicroStage.CLOSED
@@ -697,15 +698,25 @@ class QtrMicroExecutionService:
                         MicroStage.RUNNER,
                     }
                 ):
+                    opened_at = prior_position.opened_at or prior_position.signal_at
                     fill = self._client.protective_stop_fill(
                         symbol=prior_position.symbol,
-                        opened_at=(
-                            prior_position.opened_at or prior_position.signal_at
-                        ),
+                        opened_at=opened_at,
                         direction=prior_position.direction,
                         expected_qty=prior_position.current_qty,
                     )
                     if fill is not None:
+                        reason = MicroExitReason.STOP
+                    else:
+                        fill = self._client.external_manual_close_fill(
+                            symbol=prior_position.symbol,
+                            opened_at=opened_at,
+                            direction=prior_position.direction,
+                            expected_qty=prior_position.current_qty,
+                        )
+                        if fill is not None:
+                            reason = MicroExitReason.EXTERNAL_MANUAL_CLOSE
+                    if fill is not None and reason is not None:
                         closed_qty = min(fill.filled_qty, prior_position.current_qty)
                         if closed_qty >= prior_position.current_qty:
                             gross = _realised_pnl(prior_position, fill, closed_qty)
@@ -727,7 +738,6 @@ class QtrMicroExecutionService:
                                 runner_exit_price=fill.average_price,
                             )
                             records[trade_id] = position
-                            reason = MicroExitReason.STOP
                             reconciled = record_trade_result(
                                 reconciled,
                                 pnl=position.realised_partial_pnl - position.fees,
@@ -736,6 +746,43 @@ class QtrMicroExecutionService:
                             )
                         else:
                             fill = None
+                elif (
+                    prior_position is not None
+                    and prior_position.stage is MicroStage.CLOSED
+                    and prior_position.opened_at is not None
+                    and prior_position.current_qty == 0
+                    and prior_position.initial_qty > 0
+                    and prior_position.realised_partial_pnl == 0
+                    and prior_position.tp1_fill_price is None
+                    and prior_position.tp2_fill_price is None
+                    and prior_position.runner_exit_price is None
+                ):
+                    fill = self._client.external_manual_close_fill(
+                        symbol=prior_position.symbol,
+                        opened_at=prior_position.opened_at,
+                        direction=prior_position.direction,
+                        expected_qty=prior_position.initial_qty,
+                    )
+                    if fill is not None:
+                        reason = MicroExitReason.EXTERNAL_MANUAL_CLOSE
+                        gross = _realised_pnl(
+                            prior_position, fill, prior_position.initial_qty
+                        )
+                        position = replace(
+                            prior_position,
+                            realised_partial_pnl=gross,
+                            fees=prior_position.fees + fill.fee,
+                            exit_fees=prior_position.exit_fees + fill.fee,
+                            last_updated=fill.filled_at,
+                            runner_exit_price=fill.average_price,
+                        )
+                        records[trade_id] = position
+                        reconciled = record_trade_result(
+                            reconciled,
+                            pnl=position.realised_partial_pnl - position.fees,
+                            now=timestamp,
+                            settings=self._settings,
+                        )
                 elif position.runner_exit_price is not None:
                     fill = ExecutionFill(
                         order_id="durable-exit-fill",
@@ -746,6 +793,7 @@ class QtrMicroExecutionService:
                     )
                     reason = reason or MicroExitReason.STRUCTURE_EXIT
                 if fill is None or reason is None:
+                    recovery_blocked = True
                     reconciled = replace(
                         reconciled,
                         trading_enabled=False,
@@ -760,6 +808,17 @@ class QtrMicroExecutionService:
                 ):
                     records[trade_id] = replace(position, journaled=True)
                     changed = True
+        if (
+            self._journal is not None
+            and not recovery_blocked
+            and reconciled.blocked_reason == JOURNAL_RECOVERY_BLOCK
+        ):
+            reconciled = replace(
+                reconciled,
+                trading_enabled=self._settings.enabled,
+                blocked_reason=None,
+            )
+            changed = True
         if changed:
             reconciled = replace(reconciled, positions=records, updated_at=timestamp)
         self._state_store.save(reconciled)
