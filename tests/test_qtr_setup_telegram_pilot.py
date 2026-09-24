@@ -67,6 +67,7 @@ from market_signal_assistant.telegram.qtr_setup_pilot import (
     format_qtr_setup_event,
     select_qtr_setup_decisions,
 )
+from market_signal_assistant.telegram.trader_transport import TraderTelegramTransport
 
 NOW = datetime(2026, 8, 10, 9, 0, tzinfo=UTC)
 
@@ -842,6 +843,19 @@ def test_setup_scan_reuses_exactly_one_v2_report() -> None:
 
 
 def test_qtr_pilot_uses_existing_telegram_lifecycle(tmp_path: Path) -> None:
+    class FakeTraderBot:
+        started = False
+        closed = False
+
+        async def initialize(self) -> None:
+            self.started = True
+
+        async def shutdown(self) -> None:
+            self.closed = True
+
+        async def send_message(self, *, chat_id: int, text: str) -> object:
+            raise AssertionError((chat_id, text))
+
     class Screening:
         def screen(self, request: object) -> object:
             raise AssertionError(request)
@@ -872,11 +886,13 @@ def test_qtr_pilot_uses_existing_telegram_lifecycle(tmp_path: Path) -> None:
         def __init__(self, builder: FakeBuilder) -> None:
             self._builder = builder
             self.bot = FakeBot()
+            self.polling_calls = 0
 
         def add_handler(self, handler: object) -> None:
             del handler
 
         def run_polling(self) -> None:
+            self.polling_calls += 1
             async def lifecycle() -> None:
                 assert self._builder.on_start is not None
                 assert self._builder.on_stop is not None
@@ -913,6 +929,10 @@ def test_qtr_pilot_uses_existing_telegram_lifecycle(tmp_path: Path) -> None:
 
     notifier = Notifier()
     builder = FakeBuilder()
+    trader_bot = FakeTraderBot()
+    trader_transport = TraderTelegramTransport(
+        "trader-token", bot_factory=lambda token: trader_bot
+    )
     _run_sdk_bot_handlers(
         TelegramSettings("token", frozenset((100,))),
         Screening(),  # type: ignore[arg-type]
@@ -928,7 +948,10 @@ def test_qtr_pilot_uses_existing_telegram_lifecycle(tmp_path: Path) -> None:
         qtr_setup_settings=QtrSetupTelegramSettings(enabled=True),
         qtr_setup_interval_minutes=5,
         qtr_setup_notifier=notifier,  # type: ignore[arg-type]
+        trader_transport=trader_transport,
     )
     assert builder.application is not None
     assert builder.application.bot.messages == [(100, "пилот")]
     assert notifier.calls == 1
+    assert trader_bot.started and trader_bot.closed
+    assert builder.application.polling_calls == 1

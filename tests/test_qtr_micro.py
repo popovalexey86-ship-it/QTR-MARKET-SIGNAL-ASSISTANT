@@ -74,7 +74,10 @@ from market_signal_assistant.setup_engine import (
     SetupType,
     analyze_setup,
 )
-from market_signal_assistant.telegram.bot import execute_command
+from market_signal_assistant.telegram.bot import (
+    _micro_candidate_handler,
+    execute_command,
+)
 from market_signal_assistant.telegram.parsing import parse_command
 from market_signal_assistant.telegram.qtr_micro import (
     format_micro_closed,
@@ -787,6 +790,41 @@ def test_runtime_uses_setup_symbol_end_to_end_without_btc_substitution(
     assert "BTCUSDT" not in str(client.orders[0]) or symbol == "BTCUSDT"
 
 
+def test_runtime_entry_notification_is_routed_only_to_trader(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    client.auto_fill = True
+    runtime = QtrMicroRuntime(
+        settings=settings(),
+        client=client,
+        state_store=JsonQtrMicroStateStore(tmp_path / "state.json"),
+        allowed_chat_ids=frozenset({201}),
+        clock=lambda: NOW,
+        decision_audit=JsonlQtrMicroDecisionAudit(tmp_path / "decision.jsonl"),
+        runtime_audit=JsonlQtrMicroRuntimeAudit(tmp_path / "runtime.jsonl"),
+    )
+    scanner_messages: list[tuple[int, str]] = []
+    trader_messages: list[tuple[int, str]] = []
+
+    async def scanner_send(chat_id: int, text: str) -> None:
+        scanner_messages.append((chat_id, text))
+
+    async def trader_send(chat_id: int, text: str) -> None:
+        trader_messages.append((chat_id, text))
+
+    async def exercise() -> None:
+        assert (await runtime.initialize()).ready
+        routed = _micro_candidate_handler(runtime.handle_candidates, trader_send)
+        await routed((candidate(),), scanner_send)
+
+    asyncio.run(exercise())
+    assert scanner_messages == []
+    assert len(trader_messages) == 1
+    assert trader_messages[0][0] == 201
+    assert "QTR MICRO — DEMO ВХОД" in trader_messages[0][1]
+
+
 @pytest.mark.parametrize(
     ("symbol", "universe_status"),
     (
@@ -1130,6 +1168,66 @@ def runtime_management_decision(
     assert len(spy.decisions) == 1
     assert len(spy.flags) == 1
     return spy.decisions[0], spy.flags[0]
+
+
+@pytest.mark.parametrize(
+    ("stage", "price_field", "expected_text", "expected_action"),
+    (
+        (MicroStage.OPEN, "tp1_price", "QTR MICRO — TP1", MicroExitReason.TP1),
+        (MicroStage.TP1_FILLED, "tp2_price", "QTR MICRO — TP2", MicroExitReason.TP2),
+        (
+            MicroStage.OPEN,
+            "entry_price",
+            "QTR MICRO — СДЕЛКА ЗАКРЫТА",
+            MicroExitReason.TIME_EXIT,
+        ),
+    ),
+)
+def test_micro_management_notifications_use_injected_trader_sender(
+    tmp_path: Path,
+    stage: MicroStage,
+    price_field: str,
+    expected_text: str,
+    expected_action: MicroExitReason,
+) -> None:
+    plan = decision().plan
+    assert plan is not None
+    position = position_from_plan(plan, stage=stage)
+    store = JsonQtrMicroStateStore(tmp_path / "state.json")
+    store.save(state(positions={plan.trade_id: position}))
+    client = FakeClient()
+    client.market_prices[plan.symbol] = getattr(plan, price_field)
+    runtime = QtrMicroRuntime(
+        settings=settings(),
+        client=client,
+        state_store=store,
+        allowed_chat_ids=frozenset({201}),
+        clock=lambda: NOW,
+    )
+    spy = ManagementExecutionSpy(position, QtrMicroEntryEngine(settings()))
+    runtime._execution = spy  # type: ignore[assignment]  # noqa: SLF001
+    trader_messages: list[tuple[int, str]] = []
+
+    async def trader_send(chat_id: int, text: str) -> None:
+        trader_messages.append((chat_id, text))
+
+    observed_at = (
+        NOW + timedelta(minutes=45)
+        if expected_action is MicroExitReason.TIME_EXIT
+        else NOW
+    )
+    asyncio.run(
+        runtime._manage_open(  # noqa: SLF001
+            store.load(today=NOW.date(), trading_enabled=True),
+            {},
+            trader_send,
+            observed_at,
+        )
+    )
+    assert len(trader_messages) == 1
+    assert trader_messages[0][0] == 201
+    assert expected_text in trader_messages[0][1]
+    assert spy.decisions[0].action is expected_action
 
 
 def test_management_tp_breakeven_and_time_structure_exits() -> None:
