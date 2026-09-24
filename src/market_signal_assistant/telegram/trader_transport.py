@@ -27,8 +27,9 @@ def _build_application(
 
     application = ApplicationBuilder().token(token).build()
     if callback_handler is not None:
+        callback: Any = callback_handler
         application.add_handler(
-            CallbackQueryHandler(callback_handler, pattern=r"^qtrt:")
+            CallbackQueryHandler(callback, pattern=r"^qtrt:")
         )
     return application
 
