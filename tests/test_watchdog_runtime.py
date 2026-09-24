@@ -509,15 +509,41 @@ def test_timed_out_worker_prevents_overlapping_stale_symbol_plan(
     ):
         time.sleep(0.01)
 
+    journal = OperationalAuditJournal(tmp_path / "operational" / "runtime.jsonl")
+    audits = journal.records()
+    reconciliations = tuple(
+        item
+        for item in audits
+        if item["event_type"] == "SCHEDULER_RECONCILIATION"
+        and item["symbol"] == "ABCUSDT"
+    )
+    while not reconciliations and time.monotonic() < deadline:
+        time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+        audits = journal.records()
+        reconciliations = tuple(
+            item
+            for item in audits
+            if item["event_type"] == "SCHEDULER_RECONCILIATION"
+            and item["symbol"] == "ABCUSDT"
+        )
+    assert len(reconciliations) == 1, (
+        "Durable scheduler reconciliation was not recorded."
+    )
+    assert reconciliations[0]["occurred_at"] == clock.now.isoformat()
+    assert reconciliations[0]["details"] == {
+        "interval": "5m",
+        "boundaries": NOW.isoformat(),
+        "status": "completed",
+        "committed_after_timeout": "true",
+        "failure": "none",
+    }
+
     health = runtime.health_snapshot()
     assert health.symbols_processed == 1
     assert health.symbols_failed == 0
     assert health.late_worker_completions == 1
     assert health.committed_after_timeout == 1
 
-    audits = OperationalAuditJournal(
-        tmp_path / "operational" / "runtime.jsonl"
-    ).records()
     assert not any(
         item["event_type"] == "SYMBOL_FAILURE"
         and "State evaluations must be chronological." in str(item["details"])
