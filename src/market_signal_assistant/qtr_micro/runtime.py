@@ -42,6 +42,51 @@ MicroSender = Callable[[int, str], Awaitable[None]]
 
 
 @dataclass(frozen=True, slots=True)
+class QtrMicroPositionSnapshot:
+    trade_id: str
+    symbol: str
+    direction: str
+    setup: str
+    scanner_level: float | None
+    actual_entry: float | None
+    current_price: float | None
+    initial_qty: float
+    current_qty: float
+    notional: float
+    leverage: int
+    initial_sl: float
+    current_sl: float
+    tp1: float
+    tp2: float
+    runner_target: float
+    initial_risk_usdt: float | None
+    current_pnl_est: float
+    current_r: float | None
+    mfe_r: float | None
+    mae_r: float | None
+    max_r: float | None
+    opened_at: datetime | None
+    duration_seconds: int
+    stage: MicroStage
+    exit_price: float | None
+    gross_pnl: float
+    fees: float
+    net_pnl: float
+
+
+@dataclass(frozen=True, slots=True)
+class QtrMicroPositionEvent:
+    event_type: str
+    snapshot: QtrMicroPositionSnapshot
+    exit_reason: MicroExitReason | None = None
+
+
+QtrMicroPositionEventHandler = Callable[
+    [QtrMicroPositionEvent], Awaitable[None]
+]
+
+
+@dataclass(frozen=True, slots=True)
 class QtrMicroRuntimeStatus:
     enabled: bool
     demo_api_ready: bool
@@ -99,6 +144,7 @@ class QtrMicroRuntime:
         clock: Callable[[], datetime] | None = None,
         decision_audit: JsonlQtrMicroDecisionAudit | None = None,
         runtime_audit: JsonlQtrMicroRuntimeAudit | None = None,
+        position_event_handler: QtrMicroPositionEventHandler | None = None,
     ) -> None:
         self._settings = settings
         self._client = client
@@ -127,6 +173,7 @@ class QtrMicroRuntime:
             clock=self._clock,
         )
         self._preflight_result = PreflightResult(False, "Preflight ещё не выполнен.")
+        self._position_event_handler = position_event_handler
         self._lock = asyncio.Lock()
 
     @property
@@ -148,6 +195,11 @@ class QtrMicroRuntime:
             kill_switch=self._settings.kill_switch,
         )
 
+    def set_position_event_handler(
+        self, handler: QtrMicroPositionEventHandler | None
+    ) -> None:
+        self._position_event_handler = handler
+
     async def initialize(self) -> PreflightResult:
         async with self._lock:
             result = await asyncio.to_thread(self._preflight.run, None)
@@ -168,8 +220,65 @@ class QtrMicroRuntime:
                         updated_at=self._clock(),
                     )
                 )
-            await asyncio.to_thread(self._execution.reconcile, self._clock())
+            reconciled = await asyncio.to_thread(
+                self._execution.reconcile, self._clock()
+            )
+            if self._position_event_handler is not None:
+                for position in reconciled.positions.values():
+                    if position.stage not in {
+                        MicroStage.OPEN,
+                        MicroStage.TP1_FILLED,
+                        MicroStage.TP2_FILLED,
+                        MicroStage.RUNNER,
+                        MicroStage.EXIT_ACKNOWLEDGED,
+                    }:
+                        continue
+                    price = await self._price_for_position(position)
+                    await self._emit_position_event(
+                        "POSITION_RECOVERED", position, price, self._clock()
+                    )
             return result
+
+    async def get_position_snapshot(
+        self, trade_id: str
+    ) -> QtrMicroPositionSnapshot | None:
+        async with self._lock:
+            now = self._clock()
+            state = self._state_store.load(
+                today=now.date(), trading_enabled=self._settings.enabled
+            )
+            position = state.positions.get(trade_id)
+            if position is None:
+                return None
+            price = await self._price_for_position(position)
+            return _position_snapshot(position, price, now)
+
+    async def request_human_close(
+        self, trade_id: str
+    ) -> QtrMicroPositionSnapshot | None:
+        if self._execution is None:
+            return None
+        async with self._lock:
+            now = self._clock()
+            position = await asyncio.to_thread(
+                self._execution.request_human_close, trade_id, now
+            )
+            if position is None:
+                return None
+            price = await self._price_for_position(position)
+            snapshot = _position_snapshot(position, price, now)
+            if (
+                position.stage is MicroStage.EXIT_ACKNOWLEDGED
+                and position.pending_exit_reason is MicroExitReason.HUMAN_CLOSE
+            ):
+                await self._emit_position_event(
+                    "CLOSE_PENDING",
+                    position,
+                    price,
+                    now,
+                    exit_reason=MicroExitReason.HUMAN_CLOSE,
+                )
+            return snapshot
 
     async def handle_candidates(
         self,
@@ -337,9 +446,18 @@ class QtrMicroRuntime:
                         rules,
                     )
                     if confirmed.stage is MicroStage.OPEN:
-                        await self._broadcast(
-                            send, format_micro_entry(_plan_from_position(confirmed))
-                        )
+                        if self._position_event_handler is not None:
+                            await self._emit_position_event(
+                                "POSITION_OPENED",
+                                confirmed,
+                                confirmed.average_fill,
+                                now,
+                            )
+                        else:
+                            await self._broadcast(
+                                send,
+                                format_micro_entry(_plan_from_position(confirmed)),
+                            )
                 except Exception as error:
                     _LOGGER.warning(
                         "QTR Micro entry пропущен для %s (%s): %s.",
@@ -385,8 +503,16 @@ class QtrMicroRuntime:
             )
             if confirmed is None or confirmed.stage is not MicroStage.OPEN:
                 continue
-            plan = _plan_from_position(confirmed)
-            await self._broadcast(send, format_micro_entry(plan))
+            if self._position_event_handler is not None:
+                await self._emit_position_event(
+                    "POSITION_OPENED",
+                    confirmed,
+                    confirmed.average_fill,
+                    now,
+                )
+            else:
+                plan = _plan_from_position(confirmed)
+                await self._broadcast(send, format_micro_entry(plan))
 
     async def _manage_open(
         self,
@@ -434,7 +560,31 @@ class QtrMicroRuntime:
                 opposite_structure=management_flags.opposite_structure,
                 structure_degraded=management_flags.structure_degraded,
             )
-            if decision.action in {MicroExitReason.TP1, MicroExitReason.TP2}:
+            if decision.action is not None and self._position_event_handler is not None:
+                refreshed = self._state_store.load(
+                    today=now.date(), trading_enabled=self._settings.enabled
+                )
+                updated = refreshed.positions.get(position.trade_id)
+                if updated is not None:
+                    event_type = (
+                        "POSITION_CLOSED"
+                        if updated.stage is MicroStage.CLOSED
+                        else "POSITION_UPDATED"
+                    )
+                    event_price = (
+                        updated.runner_exit_price
+                        if updated.stage is MicroStage.CLOSED
+                        and updated.runner_exit_price is not None
+                        else current_price
+                    )
+                    await self._emit_position_event(
+                        event_type,
+                        updated,
+                        event_price,
+                        now,
+                        exit_reason=decision.action,
+                    )
+            elif decision.action in {MicroExitReason.TP1, MicroExitReason.TP2}:
                 result_r = 1.0 if decision.action is MicroExitReason.TP1 else 2.0
                 await self._broadcast(
                     send, format_micro_tp(position.symbol, decision.action, result_r)
@@ -450,6 +600,49 @@ class QtrMicroRuntime:
                         hold_minutes=_hold_minutes(position, now),
                     ),
                 )
+
+    async def _price_for_position(self, position: MicroPosition) -> float | None:
+        if position.stage is MicroStage.CLOSED and position.runner_exit_price is not None:
+            return position.runner_exit_price
+        if self._client is None:
+            return position.average_fill
+        try:
+            return await asyncio.to_thread(
+                self._client.current_market_price, position.symbol
+            )
+        except Exception as error:
+            _LOGGER.warning(
+                "QTR Trader snapshot price unavailable for %s (%s).",
+                position.symbol,
+                type(error).__name__,
+            )
+            return position.average_fill
+
+    async def _emit_position_event(
+        self,
+        event_type: str,
+        position: MicroPosition,
+        current_price: float | None,
+        now: datetime,
+        *,
+        exit_reason: MicroExitReason | None = None,
+    ) -> None:
+        handler = self._position_event_handler
+        if handler is None:
+            return
+        try:
+            await handler(
+                QtrMicroPositionEvent(
+                    event_type=event_type,
+                    snapshot=_position_snapshot(position, current_price, now),
+                    exit_reason=exit_reason,
+                )
+            )
+        except Exception as error:
+            _LOGGER.warning(
+                "QTR Trader position event delivery failed (%s).",
+                type(error).__name__,
+            )
 
     async def _broadcast(self, send: MicroSender, text: str) -> None:
         for chat_id in sorted(self._allowed_chat_ids):
@@ -482,6 +675,80 @@ def _plan_from_position(position: MicroPosition) -> EntryPlan:
         runner_qty=position.runner_qty,
         initial_r=position.initial_r,
         order_link_id=position.entry_order_link_id,
+        scanner_level=position.scanner_level,
+    )
+
+
+def _position_snapshot(
+    position: MicroPosition,
+    current_price: float | None,
+    now: datetime,
+) -> QtrMicroPositionSnapshot:
+    entry = position.average_fill
+    effective_price = current_price if current_price is not None else entry
+    sign = 1.0 if position.direction.value == "LONG" else -1.0
+    unrealized = 0.0
+    if entry is not None and effective_price is not None:
+        unrealized = sign * (effective_price - entry) * position.current_qty
+    gross_pnl = position.realised_partial_pnl + unrealized
+    net_pnl = gross_pnl - position.fees
+    risk_usdt = position.actual_risk_at_fill
+    current_r = (
+        net_pnl / risk_usdt
+        if risk_usdt is not None and risk_usdt > 0
+        else None
+    )
+    risk_distance = (
+        abs(entry - position.structural_stop) if entry is not None else 0.0
+    )
+
+    def excursion_r(price: float | None) -> float | None:
+        if entry is None or price is None or risk_distance <= 0:
+            return None
+        return sign * (price - entry) / risk_distance
+
+    mfe_r = excursion_r(position.max_favorable_price)
+    mae_r = excursion_r(position.max_adverse_price)
+    duration_seconds = 0
+    if position.opened_at is not None:
+        duration_seconds = max(
+            0, int((now - position.opened_at).total_seconds())
+        )
+    notional = (
+        entry * position.initial_qty
+        if entry is not None
+        else position.planned_notional
+    )
+    return QtrMicroPositionSnapshot(
+        trade_id=position.trade_id,
+        symbol=position.symbol,
+        direction=position.direction.value,
+        setup=position.setup_type.name_ru,
+        scanner_level=position.scanner_level,
+        actual_entry=entry,
+        current_price=effective_price,
+        initial_qty=position.initial_qty,
+        current_qty=position.current_qty,
+        notional=notional,
+        leverage=position.leverage,
+        initial_sl=position.structural_stop,
+        current_sl=position.current_stop,
+        tp1=position.tp1_price,
+        tp2=position.tp2_price,
+        runner_target=position.runner_target_price,
+        initial_risk_usdt=risk_usdt,
+        current_pnl_est=net_pnl,
+        current_r=current_r,
+        mfe_r=mfe_r,
+        mae_r=mae_r,
+        max_r=mfe_r,
+        opened_at=position.opened_at,
+        duration_seconds=duration_seconds,
+        stage=position.stage,
+        exit_price=position.runner_exit_price,
+        gross_pnl=gross_pnl,
+        fees=position.fees,
+        net_pnl=net_pnl,
     )
 
 
