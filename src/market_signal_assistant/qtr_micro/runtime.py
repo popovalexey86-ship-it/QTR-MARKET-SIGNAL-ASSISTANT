@@ -602,7 +602,10 @@ class QtrMicroRuntime:
                 )
 
     async def _price_for_position(self, position: MicroPosition) -> float | None:
-        if position.stage is MicroStage.CLOSED and position.runner_exit_price is not None:
+        if (
+            position.stage is MicroStage.CLOSED
+            and position.runner_exit_price is not None
+        ):
             return position.runner_exit_price
         if self._client is None:
             return position.average_fill
