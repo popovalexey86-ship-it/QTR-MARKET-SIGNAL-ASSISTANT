@@ -189,15 +189,15 @@ class TraderTelegramTransport:
             await asyncio.wait_for(
                 application.initialize(), timeout=self._timeout_seconds
             )
-            await asyncio.wait_for(
-                application.start(), timeout=self._timeout_seconds
-            )
             updater = application.updater
             if updater is None:
                 raise RuntimeError("Trader Telegram updater is unavailable.")
             await asyncio.wait_for(
                 updater.start_polling(drop_pending_updates=True),
                 timeout=self._timeout_seconds,
+            )
+            await asyncio.wait_for(
+                application.start(), timeout=self._timeout_seconds
             )
         except Exception as error:
             _LOGGER.warning(
