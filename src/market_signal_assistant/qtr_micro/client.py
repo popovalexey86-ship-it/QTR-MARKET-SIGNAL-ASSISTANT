@@ -91,6 +91,14 @@ class DemoTradingClient(Protocol):
         direction: object,
         expected_qty: float,
     ) -> ExecutionFill | None: ...
+    def external_manual_close_fill(
+        self,
+        *,
+        symbol: str,
+        opened_at: datetime,
+        direction: object,
+        expected_qty: float,
+    ) -> ExecutionFill | None: ...
     def set_protective_stop(
         self, *, symbol: str, stop_price: float, position_idx: int = 0
     ) -> None: ...
@@ -468,6 +476,84 @@ class BybitDemoTradingClient:
             candidates.append(fill)
 
         # Ambiguous history must remain fail-closed.
+        if len(candidates) != 1:
+            return None
+        return candidates[0]
+
+    def external_manual_close_fill(
+        self,
+        *,
+        symbol: str,
+        opened_at: datetime,
+        direction: object,
+        expected_qty: float,
+    ) -> ExecutionFill | None:
+        """Recover one unambiguous full reduce-only close created outside QTR."""
+        normalized_symbol = symbol.upper().strip()
+        if not normalized_symbol or expected_qty <= 0 or opened_at.tzinfo is None:
+            return None
+
+        direction_value = str(getattr(direction, "value", direction)).upper()
+        close_side = {
+            "LONG": "Sell",
+            "SHORT": "Buy",
+        }.get(direction_value)
+        if close_side is None:
+            return None
+
+        opened_utc = opened_at.astimezone(UTC)
+        opened_ms = int(opened_utc.timestamp() * 1000)
+        now_utc = datetime.now(UTC)
+        end_utc = min(now_utc, opened_utc + timedelta(days=7))
+        if end_utc < opened_utc:
+            return None
+
+        payload = self._request(
+            "GET",
+            "/v5/order/history",
+            {
+                "category": "linear",
+                "symbol": normalized_symbol,
+                "startTime": opened_ms,
+                "endTime": int(end_utc.timestamp() * 1000),
+                "limit": 100,
+            },
+        )
+
+        candidates: list[ExecutionFill] = []
+        for row in _result_list(payload):
+            if str(row.get("symbol", "")).upper() != normalized_symbol:
+                continue
+            if str(row.get("orderStatus", "")) != "Filled":
+                continue
+            if str(row.get("side", "")) != close_side:
+                continue
+            reduce_only = row.get("reduceOnly")
+            if not (reduce_only is True or str(reduce_only).lower() == "true"):
+                continue
+            if str(row.get("stopOrderType", "")) == "StopLoss":
+                continue
+            order_link_id = str(row.get("orderLinkId", "")).strip()
+            if order_link_id.startswith("QTRM-"):
+                continue
+
+            try:
+                updated_ms = int(str(row.get("updatedTime", "0")))
+            except ValueError:
+                continue
+            if updated_ms < opened_ms:
+                continue
+
+            order_id = str(row.get("orderId", "")).strip()
+            if not order_id:
+                continue
+            fill = self.execution_fill(order_id, normalized_symbol)
+            if fill is None or fill.filled_at < opened_utc:
+                continue
+            if fill.filled_qty + 1e-9 < expected_qty:
+                continue
+            candidates.append(fill)
+
         if len(candidates) != 1:
             return None
         return candidates[0]
