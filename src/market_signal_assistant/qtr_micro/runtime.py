@@ -8,7 +8,10 @@ from datetime import UTC, datetime
 
 from market_signal_assistant.qtr_micro.client import DemoTradingClient
 from market_signal_assistant.qtr_micro.engine import QtrMicroEntryEngine
-from market_signal_assistant.qtr_micro.execution import QtrMicroExecutionService
+from market_signal_assistant.qtr_micro.execution import (
+    JOURNAL_RECOVERY_BLOCK,
+    QtrMicroExecutionService,
+)
 from market_signal_assistant.qtr_micro.journal import (
     JsonlQtrMicroDecisionAudit,
     JsonlQtrMicroTradeJournal,
@@ -204,6 +207,14 @@ class QtrMicroRuntime:
         async with self._lock:
             result = await asyncio.to_thread(self._preflight.run, None)
             self._preflight_result = result
+            if (
+                not result.ready
+                and result.reason == JOURNAL_RECOVERY_BLOCK
+                and self._execution is not None
+            ):
+                await asyncio.to_thread(self._execution.reconcile, self._clock())
+                result = await asyncio.to_thread(self._preflight.run, None)
+                self._preflight_result = result
             if not result.ready:
                 _LOGGER.warning("QTR Micro Demo заблокирован: %s", result.reason)
                 return result

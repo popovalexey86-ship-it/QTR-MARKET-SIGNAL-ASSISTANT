@@ -390,6 +390,115 @@ def test_successful_preflight_checks_demo_account() -> None:
     assert result.position_mode == "ONE_WAY"
 
 
+def test_runtime_initialize_recovers_journal_block_before_returning(
+    tmp_path: Path,
+) -> None:
+    plan = decision().plan
+    assert plan is not None
+    client = FakeClient()
+    fill = ExecutionFill(
+        "external-manual-startup",
+        plan.entry_price + 1.0,
+        plan.qty,
+        0.2,
+        NOW + timedelta(minutes=13),
+    )
+    client.external_manual_recovery_fill = fill
+    store = JsonQtrMicroStateStore(tmp_path / "startup-recovery-state.json")
+    stranded = position_from_plan(
+        plan,
+        stage=MicroStage.CLOSED,
+        current_qty=0.0,
+        opened_at=NOW,
+        last_updated=NOW + timedelta(minutes=14),
+        entry_fees=0.1,
+        fees=0.1,
+        realised_partial_pnl=0.0,
+        journaled=False,
+        runner_exit_price=None,
+    )
+    store.save(
+        state(
+            trading_enabled=False,
+            blocked_reason=JOURNAL_RECOVERY_BLOCK,
+            positions={plan.trade_id: stranded},
+        )
+    )
+    journal_path = tmp_path / "startup-recovery.jsonl"
+    runtime = QtrMicroRuntime(
+        settings=settings(),
+        client=client,
+        state_store=store,
+        allowed_chat_ids=frozenset(),
+        clock=lambda: NOW + timedelta(minutes=15),
+        decision_audit=JsonlQtrMicroDecisionAudit(
+            tmp_path / "startup-decisions.jsonl"
+        ),
+        runtime_audit=JsonlQtrMicroRuntimeAudit(
+            tmp_path / "startup-runtime.jsonl"
+        ),
+    )
+    runtime._execution = QtrMicroExecutionService(  # type: ignore[assignment]  # noqa: SLF001
+        settings=settings(),
+        client=client,
+        state_store=store,
+        engine=QtrMicroEntryEngine(settings()),
+        journal=JsonlQtrMicroTradeJournal(journal_path),
+        runtime_audit=JsonlQtrMicroRuntimeAudit(
+            tmp_path / "startup-runtime-execution.jsonl"
+        ),
+    )
+
+    result = asyncio.run(runtime.initialize())
+
+    assert result.ready is True
+    loaded = store.load(
+        today=(NOW + timedelta(minutes=15)).date(),
+        trading_enabled=True,
+    )
+    recovered = loaded.positions[plan.trade_id]
+    assert loaded.trading_enabled is True
+    assert loaded.blocked_reason is None
+    assert recovered.journaled is True
+    assert recovered.runner_exit_price == fill.average_price
+    rows = journal_path.read_text(encoding="utf-8").splitlines()
+    assert len(rows) == 1
+    assert json.loads(rows[0])["exit_reason"] == "EXTERNAL_MANUAL_CLOSE"
+
+
+def test_runtime_initialize_keeps_unrelated_state_block_fail_closed(
+    tmp_path: Path,
+) -> None:
+    store = JsonQtrMicroStateStore(tmp_path / "unrelated-block-state.json")
+    store.save(
+        state(
+            trading_enabled=False,
+            blocked_reason="manual safety block",
+        )
+    )
+    runtime = QtrMicroRuntime(
+        settings=settings(),
+        client=FakeClient(),
+        state_store=store,
+        allowed_chat_ids=frozenset(),
+        clock=lambda: NOW,
+        decision_audit=JsonlQtrMicroDecisionAudit(
+            tmp_path / "unrelated-decisions.jsonl"
+        ),
+        runtime_audit=JsonlQtrMicroRuntimeAudit(
+            tmp_path / "unrelated-runtime.jsonl"
+        ),
+    )
+
+    result = asyncio.run(runtime.initialize())
+
+    assert result.ready is False
+    assert result.reason == "manual safety block"
+    loaded = store.load(today=NOW.date(), trading_enabled=True)
+    assert loaded.trading_enabled is False
+    assert loaded.blocked_reason == "manual safety block"
+
+
 @pytest.mark.parametrize("symbol", ("BTCUSDT", "ETHUSDT", "SOLUSDT"))
 def test_preflight_is_dynamic_per_requested_symbol(symbol: str) -> None:
     client = FakeClient()
