@@ -44,12 +44,19 @@ from market_signal_assistant.watchdog.runtime.models import (
     PollingPolicy,
     ShadowRuntimeConfig,
 )
+from market_signal_assistant.watchdog.runtime.retention import (
+    InactiveRetention,
+    InactiveSymbolArchive,
+)
 from market_signal_assistant.watchdog.runtime.retry import ApiRequestBudget
 from market_signal_assistant.watchdog.runtime.schedule import JsonBucketCursorStore
 from market_signal_assistant.watchdog.runtime.service import WatchdogShadowRuntime
 from market_signal_assistant.watchdog.runtime.storage import (
     StorageMonitor,
     StorageTelemetryJournal,
+)
+from market_signal_assistant.watchdog.runtime.universe_evidence import (
+    UniverseTransitionJournal,
 )
 from market_signal_assistant.watchdog.state_machine import WatchdogStateMachine
 from market_signal_assistant.watchdog.state_store import (
@@ -124,6 +131,17 @@ def build_bybit_shadow_runtime(
         JsonOutcomeCheckpointStore(data_root / "state" / "pending.json"),
         prices=price_journal,
     )
+    cursors = JsonBucketCursorStore(data_root / "state" / "buckets.json")
+    transitions = UniverseTransitionJournal(
+        data_root / "operational" / "universe-transitions.jsonl"
+    )
+    retention = InactiveRetention(
+        baselines,
+        states,
+        cursors,
+        InactiveSymbolArchive(data_root / "state" / "inactive.sqlite3"),
+        transitions,
+    )
     indexes = WatchdogIndexManager(
         data_root / "state" / "evidence.sqlite3",
         (
@@ -144,7 +162,7 @@ def build_bybit_shadow_runtime(
         states=states,
         events=events,
         outcomes=outcome_scheduler,
-        cursors=JsonBucketCursorStore(data_root / "state" / "buckets.json"),
+        cursors=cursors,
         audit=OperationalAuditJournal(
             data_root / "operational" / "runtime.jsonl"
         ),
@@ -160,6 +178,8 @@ def build_bybit_shadow_runtime(
             data_root / "operational" / "storage.jsonl"
         ),
         baseline_retained_counts=lambda: baselines.retained_counts,
+        universe_transitions=transitions,
+        inactive_retention=retention,
     )
     holder["runtime"] = runtime
     return ShadowRuntimeBundle(runtime, budget)

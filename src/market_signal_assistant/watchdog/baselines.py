@@ -234,6 +234,32 @@ class RollingBaselineEngine:
             self._maximum_samples,
         )
 
+    @property
+    def symbols(self) -> frozenset[str]:
+        return frozenset(key[0] for key in self._rings)
+
+    def evict_symbol(self, symbol: str) -> int:
+        """Forget inactive working history; re-entry must mature from cold start."""
+        return self.evict_symbols({symbol})
+
+    def evict_symbols(self, symbols: set[str]) -> int:
+        normalized = {symbol.strip().upper() for symbol in symbols}
+        keys = tuple(key for key in self._rings if key[0] in normalized)
+        if not keys:
+            return 0
+        removed = sum(len(self._rings[key]) for key in keys)
+        retained = tuple(
+            item
+            for key in sorted(self._rings)
+            if key[0] not in normalized
+            for item in self._rings[key]
+        )
+        self._store.save(retained)
+        for key in keys:
+            del self._rings[key]
+        self._pending_updates = 0
+        return removed
+
     def observe(
         self,
         observation: BaselineObservation,

@@ -69,13 +69,42 @@ class JsonBucketCursorStore:
     def retained_count(self) -> int:
         return len(self._cursors)
 
+    @property
+    def symbols(self) -> frozenset[str]:
+        return frozenset(symbol for symbol, _ in self._cursors)
+
+    def for_symbol(self, symbol: str) -> dict[str, datetime]:
+        normalized = symbol.strip().upper()
+        return {
+            interval: boundary
+            for (item_symbol, interval), boundary in self._cursors.items()
+            if item_symbol == normalized
+        }
+
+    def evict_symbol(self, symbol: str) -> int:
+        return self.evict_symbols({symbol})
+
+    def evict_symbols(self, symbols: set[str]) -> int:
+        normalized = {symbol.strip().upper() for symbol in symbols}
+        remaining = {
+            key: value
+            for key, value in self._cursors.items()
+            if key[0] not in normalized
+        }
+        removed = len(self._cursors) - len(remaining)
+        if removed:
+            self._persist(remaining)
+        return removed
+
     def save(self, symbol: str, interval: str, boundary: datetime) -> None:
         key = (symbol.strip().upper(), interval)
         value = _utc(boundary)
         existing = self._cursors.get(key)
         if existing is not None and value < existing:
             raise BucketCursorError("Bucket cursor cannot move backwards.")
-        updated = {**self._cursors, key: value}
+        self._persist({**self._cursors, key: value})
+
+    def _persist(self, updated: dict[tuple[str, str], datetime]) -> None:
         payload = {
             "version": 1,
             "cursors": [

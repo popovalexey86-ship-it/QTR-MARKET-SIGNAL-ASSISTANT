@@ -37,8 +37,15 @@ from market_signal_assistant.watchdog.runtime.audit import OperationalAuditJourn
 from market_signal_assistant.watchdog.runtime.gaps import GapLedger
 from market_signal_assistant.watchdog.runtime.health import JsonRuntimeHealthStore
 from market_signal_assistant.watchdog.runtime.models import ShadowRuntimeConfig
+from market_signal_assistant.watchdog.runtime.retention import (
+    InactiveRetention,
+    InactiveSymbolArchive,
+)
 from market_signal_assistant.watchdog.runtime.schedule import JsonBucketCursorStore
 from market_signal_assistant.watchdog.runtime.service import WatchdogShadowRuntime
+from market_signal_assistant.watchdog.runtime.universe_evidence import (
+    UniverseTransitionJournal,
+)
 from market_signal_assistant.watchdog.state_machine import (
     WatchdogStateMachine,
     WatchdogSymbolState,
@@ -665,12 +672,14 @@ def _runtime(
     sleep: Callable[[float], None] | None = None,
     config: ShadowRuntimeConfig | None = None,
     derivatives_provider: FailingDerivativesProvider | None = None,
+    with_retention: bool = False,
 ) -> WatchdogShadowRuntime:
     baselines = RollingBaselineEngine(
         JsonBaselineStore(root / "state" / "baselines.json"),
         minimum_samples=3,
         maximum_samples=30,
     )
+
     if not baselines.observations:
         for index in range(3):
             available = NOW - timedelta(minutes=30 - index * 5)
@@ -695,12 +704,36 @@ def _runtime(
         JsonOutcomeCheckpointStore(root / "state" / "pending.json"),
         prices=WatchdogPriceJournal(root / "outcomes" / "price_observations.jsonl"),
     )
+    cursors = JsonBucketCursorStore(root / "state" / "buckets.json")
+    transitions = (
+        UniverseTransitionJournal(root / "operational" / "universe-transitions.jsonl")
+        if with_retention
+        else None
+    )
+    retention = (
+        InactiveRetention(
+            baselines,
+            states,
+            cursors,
+            InactiveSymbolArchive(root / "state" / "inactive.sqlite3"),
+            transitions,
+            window=timedelta(hours=1),
+        )
+        if transitions is not None
+        else None
+    )
     return WatchdogShadowRuntime(
         universe_provider=provider,
         market_provider=provider,
         derivatives_provider=derivatives_provider,
         universe=DynamicUniverse(),
-        baseline_counts=lambda _now: {symbol: 20 for symbol in provider.symbols},
+        baseline_counts=(
+            lambda now: (
+                baselines.sample_counts("relative_volume_20", detected_at=now)
+                if with_retention
+                else {symbol: 20 for symbol in provider.symbols}
+            )
+        ),
         engine=WatchdogDetectionEngine(
             WatchdogFeatureBuilder(baselines),
             DetectorPipeline((VolumeShockDetector(),)),
@@ -711,7 +744,7 @@ def _runtime(
         states=states,
         events=events,
         outcomes=outcomes,
-        cursors=JsonBucketCursorStore(root / "state" / "buckets.json"),
+        cursors=cursors,
         audit=OperationalAuditJournal(root / "operational" / "runtime.jsonl"),
         health_store=JsonRuntimeHealthStore(root / "state" / "health.json"),
         gaps=GapLedger(root / "operational" / "gaps.jsonl"),
@@ -725,7 +758,69 @@ def _runtime(
         monotonic=time_counter(),
         sleep=sleep or time.sleep,
         random_value=lambda: 0.5,
+        baseline_retained_counts=lambda: baselines.retained_counts,
+        universe_transitions=transitions,
+        inactive_retention=retention,
     )
+
+
+def test_universe_reentry_after_expiry_is_cold_and_skips_inactive_buckets(
+    tmp_path: Path,
+) -> None:
+    clock = MutableClock(NOW)
+    provider = FixtureProvider(clock, ("ABCUSDT",))
+    runtime = _runtime(tmp_path, provider, clock, with_retention=True)
+    retention = runtime._inactive_retention
+    assert retention is not None
+    baselines = retention._baselines
+    for index in range(17):
+        available = NOW - timedelta(minutes=19 - index)
+        baselines.observe(
+            BaselineObservation(
+                "ABCUSDT",
+                "relative_volume_20",
+                1.0,
+                available - timedelta(minutes=1),
+                available,
+            ),
+            detected_at=available,
+        )
+    runtime._refresh_universe(NOW)
+    assert runtime._universe is not None
+    assert runtime._universe.eligible[0].tier.value == "ACTIVE"
+    runtime._cursors.save("ABCUSDT", "15m", NOW)
+    runtime._states.save(
+        WatchdogRuntimeState(WatchdogSymbolState.initial("ABCUSDT", detected_at=NOW))
+    )
+
+    provider.symbols = ()
+    runtime._refresh_universe(NOW + timedelta(minutes=15))
+    runtime._refresh_universe(NOW + timedelta(minutes=75))
+    assert baselines.retained_counts[1] == 0
+    provider.symbols = ("ABCUSDT",)
+    runtime._refresh_universe(NOW + timedelta(minutes=90))
+    assert runtime._universe is not None
+    assert runtime._universe.eligible[0].tier.value == "COLD_START"
+    assert runtime._states.persisted("ABCUSDT") is not None
+    assert runtime._cursors.get("ABCUSDT", "15m") == NOW + timedelta(minutes=75)
+    assert runtime._gaps is not None
+    gaps = runtime._gaps.records()
+    assert len(gaps) == 1
+    assert gaps[0]["reason"] == "inactive_reentry"
+    assert (
+        gaps[0]["first_missing_boundary"] == (NOW + timedelta(minutes=15)).isoformat()
+    )
+    assert gaps[0]["last_missing_boundary"] == (NOW + timedelta(minutes=75)).isoformat()
+    retained = dict(runtime._retained_counts())
+    for name in (
+        "event_journal_ram_index",
+        "outcome_journal_ram_index",
+        "price_journal_ram_index",
+        "audit_journal_ram_index",
+        "storage_journal_ram_index",
+        "universe_transition_ram_index",
+    ):
+        assert retained[name] == 0
 
 
 def time_counter() -> Callable[[], float]:

@@ -120,6 +120,28 @@ class WatchdogStateRepository:
         self._states = updated
 
     @property
+    def symbols(self) -> frozenset[str]:
+        return frozenset(self._states)
+
+    def evict(self, symbol: str) -> WatchdogRuntimeState | None:
+        normalized = symbol.strip().upper()
+        existing = self._states.get(normalized)
+        self.evict_symbols({normalized})
+        return existing
+
+    def evict_symbols(self, symbols: set[str]) -> int:
+        normalized = {symbol.strip().upper() for symbol in symbols}
+        remaining = {
+            key: value for key, value in self._states.items() if key not in normalized
+        }
+        removed = len(self._states) - len(remaining)
+        if not removed:
+            return 0
+        self._store.save(tuple(remaining[key] for key in sorted(remaining)))
+        self._states = remaining
+        return removed
+
+    @property
     def retained_count(self) -> int:
         return len(self._states)
 

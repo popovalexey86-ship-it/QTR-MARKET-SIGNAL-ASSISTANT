@@ -37,6 +37,7 @@ from market_signal_assistant.watchdog.runtime.models import (
     ShadowRuntimeConfig,
     interest_tier,
 )
+from market_signal_assistant.watchdog.runtime.retention import InactiveRetention
 from market_signal_assistant.watchdog.runtime.retry import (
     RetryPolicy,
     is_rate_limit_error,
@@ -52,6 +53,10 @@ from market_signal_assistant.watchdog.runtime.storage import (
     StorageMonitor,
     StorageSnapshot,
     StorageTelemetryJournal,
+)
+from market_signal_assistant.watchdog.runtime.universe_evidence import (
+    UniverseTransition,
+    UniverseTransitionJournal,
 )
 from market_signal_assistant.watchdog.state_store import WatchdogStateRepository
 from market_signal_assistant.watchdog.universe import (
@@ -136,6 +141,8 @@ class WatchdogShadowRuntime:
         storage_monitor: StorageMonitor | None = None,
         storage_telemetry: StorageTelemetryJournal | None = None,
         baseline_retained_counts: Callable[[], tuple[int, int, int]] | None = None,
+        universe_transitions: UniverseTransitionJournal | None = None,
+        inactive_retention: InactiveRetention | None = None,
     ) -> None:
         self._universe_provider = universe_provider
         self._market_provider = market_provider
@@ -161,6 +168,11 @@ class WatchdogShadowRuntime:
         self._storage_monitor = storage_monitor
         self._storage_telemetry = storage_telemetry
         self._baseline_retained_counts = baseline_retained_counts
+        self._universe_transitions = universe_transitions
+        self._transition_membership = (
+            universe_transitions.current() if universe_transitions is not None else {}
+        )
+        self._inactive_retention = inactive_retention
         self._scheduler = CompletedBucketScheduler(self._config.maximum_catchup_buckets)
         self._retry = RetryPolicy(
             self._config.retry_attempts,
@@ -593,9 +605,7 @@ class WatchdogShadowRuntime:
         )
 
     def _retained_counts(self) -> tuple[tuple[str, int], ...]:
-        pending_events, pending_points, completed, used = (
-            self._outcomes.retained_counts
-        )
+        pending_events, pending_points, completed, used = self._outcomes.retained_counts
         outcome_journal_index, price_journal_index = (
             self._outcomes.journal_retained_counts
         )
@@ -618,12 +628,24 @@ class WatchdogShadowRuntime:
             ("state_symbols", self._states.retained_count),
             ("scheduler_cursors", self._cursors.retained_count),
             ("scheduler_last_checks", len(self._last_checks)),
+            (
+                "inactive_window_symbols",
+                self._inactive_retention.retained_inactive_count
+                if self._inactive_retention is not None
+                else 0,
+            ),
             ("inflight_symbols", inflight_symbols),
             ("inflight_futures", inflight_futures),
             ("event_journal_ram_index", self._events.retained_index_entries),
             ("outcome_journal_ram_index", outcome_journal_index),
             ("price_journal_ram_index", price_journal_index),
             ("audit_journal_ram_index", self._audit_journal.retained_index_entries),
+            (
+                "universe_transition_ram_index",
+                self._universe_transitions.retained_index_entries
+                if self._universe_transitions is not None
+                else 0,
+            ),
             (
                 "storage_journal_ram_index",
                 self._storage_telemetry.retained_index_entries
@@ -683,7 +705,9 @@ class WatchdogShadowRuntime:
         ):
             return
         previous = (
-            {item.instrument.symbol for item in self._universe.eligible}
+            set(self._transition_membership)
+            if self._universe_transitions is not None
+            else {item.instrument.symbol for item in self._universe.eligible}
             if self._universe is not None
             else set()
         )
@@ -696,10 +720,68 @@ class WatchdogShadowRuntime:
                 observed_at=now,
                 baseline_samples=self._baseline_counts(now),
             )
+            if self._inactive_retention is not None:
+                entrants = {
+                    item.instrument.symbol for item in snapshot.eligible
+                } - previous
+                restored = [
+                    self._inactive_retention.activated(symbol)
+                    for symbol in sorted(entrants)
+                ]
+                if any(restored):
+                    # Evicted history must not make a re-entering symbol appear
+                    # baseline-ready for even one refresh cycle.
+                    snapshot = self._universe_builder.build(
+                        instruments,
+                        observed_at=now,
+                        baseline_samples=self._baseline_counts(now),
+                    )
         except Exception as error:
             self._degraded(f"universe:{type(error).__name__}", now)
             return
         current = {item.instrument.symbol for item in snapshot.eligible}
+        if self._universe_transitions is not None:
+            current_tiers = {
+                item.instrument.symbol: item.tier.value for item in snapshot.eligible
+            }
+            rejected = dict(snapshot.rejected)
+            available_at = max(_utc(self._clock()), now)
+            for symbol in sorted(previous | current):
+                old = self._transition_membership.get(symbol)
+                old_tier = old[0] if old is not None else None
+                new_tier = current_tiers.get(symbol)
+                if old_tier == new_tier:
+                    continue
+                if symbol in current and symbol not in previous:
+                    self._skip_inactive_buckets(symbol, new_tier, now)
+                state = self._states.persisted(symbol)
+                state_name = state.symbol_state.state.value if state else None
+                transition = UniverseTransition(
+                    symbol=symbol,
+                    previous_eligible=symbol in previous,
+                    new_eligible=symbol in current,
+                    previous_tier=old_tier,
+                    new_tier=new_tier,
+                    previous_state=old[1] if old is not None else state_name,
+                    new_state=state_name,
+                    rejection_reasons=(
+                        rejected.get(symbol, ("absent_from_catalog",))
+                        if symbol not in current
+                        else ()
+                    ),
+                    observed_at=now,
+                    available_at=available_at,
+                    recorded_at=max(_utc(self._clock()), available_at),
+                )
+                self._universe_transitions.append(transition)
+                if new_tier is None:
+                    self._transition_membership.pop(symbol, None)
+                    if self._inactive_retention is not None:
+                        self._inactive_retention.removed(symbol, now)
+                else:
+                    self._transition_membership[symbol] = (new_tier, state_name)
+            if self._inactive_retention is not None:
+                self._inactive_retention.expire(now, current)
         self._universe = snapshot
         self._last_checks = {
             symbol: checked_at
@@ -717,6 +799,44 @@ class WatchdogShadowRuntime:
                 ("rejected", str(len(snapshot.rejected))),
             ),
         )
+
+    def _skip_inactive_buckets(
+        self, symbol: str, tier: str | None, now: datetime
+    ) -> None:
+        if tier is None or self._gaps is None:
+            return
+        state = self._states.persisted(symbol)
+        state_name = state.symbol_state.state if state else None
+        from market_signal_assistant.watchdog.models import WatchdogState
+        from market_signal_assistant.watchdog.universe import UniverseTier
+
+        rule = self._polling.rule(
+            interest_tier(
+                UniverseTier(tier),
+                state_name if state_name is not None else WatchdogState.NORMAL,
+            )
+        )
+        interval = rule.interval
+        previous = self._cursors.get(symbol, interval)
+        if previous is None:
+            return
+        duration = interval_duration(interval)
+        current = completed_boundary(now, interval)
+        last_skipped = current - duration
+        if previous >= last_skipped:
+            return
+        self._gaps.append(
+            SchedulingGap(
+                symbol,
+                interval,
+                previous + duration,
+                last_skipped,
+                int((last_skipped - previous) / duration),
+                max(_utc(self._clock()), now),
+                reason="inactive_reentry",
+            )
+        )
+        self._cursors.save(symbol, interval, last_skipped)
 
     def _process_symbol(
         self,
