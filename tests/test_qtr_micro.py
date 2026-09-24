@@ -28,6 +28,7 @@ from market_signal_assistant.qtr_micro.engine import (
     QtrMicroEntryEngine,
 )
 from market_signal_assistant.qtr_micro.execution import (
+    JOURNAL_RECOVERY_BLOCK,
     QtrMicroExecutionService,
     record_trade_result,
 )
@@ -276,6 +277,7 @@ class FakeClient:
         self.stop_failures_remaining = 0
         self.fills_by_order: dict[str, ExecutionFill | None] = {}
         self.protective_stop_recovery_fill: ExecutionFill | None = None
+        self.external_manual_recovery_fill: ExecutionFill | None = None
 
     def connectivity(self) -> None:
         if self.fail:
@@ -347,6 +349,17 @@ class FakeClient:
     ) -> ExecutionFill | None:
         del symbol, opened_at, direction, expected_qty
         return self.protective_stop_recovery_fill
+
+    def external_manual_close_fill(
+        self,
+        *,
+        symbol: str,
+        opened_at: datetime,
+        direction: object,
+        expected_qty: float,
+    ) -> ExecutionFill | None:
+        del symbol, opened_at, direction, expected_qty
+        return self.external_manual_recovery_fill
 
     def cancel_order(self, symbol: str, order_id: str) -> None:
         self.cancelled_orders.append((symbol, order_id))
@@ -2729,6 +2742,217 @@ def test_bybit_demo_client_rejects_ambiguous_protective_stops() -> None:
     }
 
     assert recover_stop(history, executions) is None
+
+
+def manual_history_row(
+    order_id: str,
+    *,
+    symbol: str = "FARTCOINUSDT",
+    side: str = "Buy",
+    status: str = "Filled",
+    reduce_only: bool = True,
+    stop_order_type: str = "",
+    order_link_id: str = "",
+    updated_at: datetime = NOW + timedelta(minutes=13),
+) -> dict[str, object]:
+    return {
+        "orderId": order_id,
+        "orderLinkId": order_link_id,
+        "symbol": symbol,
+        "side": side,
+        "orderStatus": status,
+        "stopOrderType": stop_order_type,
+        "reduceOnly": reduce_only,
+        "updatedTime": str(int(updated_at.timestamp() * 1000)),
+    }
+
+
+def recover_external_manual(
+    history: list[dict[str, object]],
+    executions: dict[str, list[dict[str, object]]],
+    *,
+    expected_qty: float = 10.0,
+) -> ExecutionFill | None:
+    client = BybitDemoTradingClient(
+        ProtectiveStopRecoveryTransport(history, executions)
+    )
+    return client.external_manual_close_fill(
+        symbol="FARTCOINUSDT",
+        opened_at=NOW,
+        direction=MicroDirection.SHORT,
+        expected_qty=expected_qty,
+    )
+
+
+def test_bybit_demo_client_recovers_only_external_manual_full_close() -> None:
+    history = [
+        manual_history_row("qtr-close", order_link_id="QTRM-owned-HC"),
+        manual_history_row("stop-close", stop_order_type="StopLoss"),
+        manual_history_row("wrong-side", side="Sell"),
+        manual_history_row("manual-close"),
+    ]
+    executions = {
+        "qtr-close": [execution_row(qty=10)],
+        "stop-close": [execution_row(qty=10)],
+        "wrong-side": [execution_row(qty=10)],
+        "manual-close": [execution_row(qty=10)],
+    }
+
+    fill = recover_external_manual(history, executions)
+
+    assert fill is not None
+    assert fill.order_id == "manual-close"
+    assert fill.filled_qty == pytest.approx(10)
+
+
+@pytest.mark.parametrize(
+    ("history", "executions"),
+    (
+        (
+            [manual_history_row("not-reduce", reduce_only=False)],
+            {"not-reduce": [execution_row(qty=10)]},
+        ),
+        (
+            [manual_history_row("partial")],
+            {"partial": [execution_row(qty=9)]},
+        ),
+        (
+            [manual_history_row("qtr", order_link_id="QTRM-owned-HC")],
+            {"qtr": [execution_row(qty=10)]},
+        ),
+    ),
+)
+def test_bybit_demo_client_rejects_unsafe_external_manual_candidates(
+    history: list[dict[str, object]],
+    executions: dict[str, list[dict[str, object]]],
+) -> None:
+    assert recover_external_manual(history, executions) is None
+
+
+def test_bybit_demo_client_rejects_ambiguous_external_manual_closes() -> None:
+    history = [
+        manual_history_row("manual-1"),
+        manual_history_row("manual-2"),
+    ]
+    executions = {
+        "manual-1": [execution_row(qty=10)],
+        "manual-2": [execution_row(qty=10)],
+    }
+
+    assert recover_external_manual(history, executions) is None
+
+
+def test_reconciliation_recovers_external_manual_close_and_journals(
+    tmp_path: Path,
+) -> None:
+    plan = decision().plan
+    assert plan is not None
+    client = FakeClient()
+    fill = ExecutionFill(
+        "external-manual-1",
+        plan.entry_price + 1.0,
+        plan.qty,
+        0.2,
+        NOW + timedelta(minutes=13),
+    )
+    client.external_manual_recovery_fill = fill
+    journal_path = tmp_path / "manual-close.jsonl"
+    store = JsonQtrMicroStateStore(tmp_path / "manual-close-state.json")
+    opened = position_from_plan(
+        plan,
+        stage=MicroStage.OPEN,
+        current_qty=plan.qty,
+        opened_at=NOW,
+        entry_fees=0.1,
+        fees=0.1,
+        journaled=False,
+    )
+    store.save(state(positions={plan.trade_id: opened}))
+    service = QtrMicroExecutionService(
+        settings=settings(),
+        client=client,
+        state_store=store,
+        engine=QtrMicroEntryEngine(settings()),
+        journal=JsonlQtrMicroTradeJournal(journal_path),
+    )
+
+    recovered = service.reconcile(NOW + timedelta(minutes=14))
+
+    position = recovered.positions[plan.trade_id]
+    assert recovered.trading_enabled is True
+    assert recovered.blocked_reason is None
+    assert position.stage is MicroStage.CLOSED
+    assert position.journaled is True
+    assert position.runner_exit_price == fill.average_price
+    assert position.exit_fees == pytest.approx(fill.fee)
+    rows = [
+        json.loads(line)
+        for line in journal_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(rows) == 1
+    assert rows[0]["exit_reason"] == MicroExitReason.EXTERNAL_MANUAL_CLOSE.value
+
+
+def test_reconciliation_repairs_persisted_closed_external_manual_close(
+    tmp_path: Path,
+) -> None:
+    plan = decision().plan
+    assert plan is not None
+    client = FakeClient()
+    fill = ExecutionFill(
+        "external-manual-persisted",
+        plan.entry_price + 1.0,
+        plan.qty,
+        0.2,
+        NOW + timedelta(minutes=13),
+    )
+    client.external_manual_recovery_fill = fill
+    journal_path = tmp_path / "persisted-manual.jsonl"
+    store = JsonQtrMicroStateStore(tmp_path / "persisted-manual-state.json")
+    stranded = position_from_plan(
+        plan,
+        stage=MicroStage.CLOSED,
+        current_qty=0.0,
+        opened_at=NOW,
+        last_updated=NOW + timedelta(minutes=14),
+        entry_fees=0.1,
+        fees=0.1,
+        realised_partial_pnl=0.0,
+        journaled=False,
+        runner_exit_price=None,
+    )
+    store.save(
+        state(
+            trading_enabled=False,
+            blocked_reason=JOURNAL_RECOVERY_BLOCK,
+            positions={plan.trade_id: stranded},
+        )
+    )
+    service = QtrMicroExecutionService(
+        settings=settings(),
+        client=client,
+        state_store=store,
+        engine=QtrMicroEntryEngine(settings()),
+        journal=JsonlQtrMicroTradeJournal(journal_path),
+    )
+
+    first = service.reconcile(NOW + timedelta(minutes=15))
+
+    position = first.positions[plan.trade_id]
+    assert first.trading_enabled is True
+    assert first.blocked_reason is None
+    assert position.journaled is True
+    assert position.runner_exit_price == fill.average_price
+    assert position.last_updated == fill.filled_at
+    rows = journal_path.read_text(encoding="utf-8").splitlines()
+    assert len(rows) == 1
+    assert json.loads(rows[0])["exit_reason"] == "EXTERNAL_MANUAL_CLOSE"
+
+    second = service.reconcile(NOW + timedelta(minutes=16))
+    assert second.trading_enabled is True
+    assert second.blocked_reason is None
+    assert len(journal_path.read_text(encoding="utf-8").splitlines()) == 1
 
 
 def test_completion_reconciliation_never_invents_protective_stop(
