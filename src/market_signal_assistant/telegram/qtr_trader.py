@@ -136,7 +136,8 @@ class QtrTraderTelegramController:
             if snapshot.stage not in _ACTIVE_STAGES:
                 await self._render(chat_id, message_id, snapshot)
                 await query.answer(
-                    "⚠️ Эта позиция уже недоступна для ручного закрытия.", show_alert=True
+                    "⚠️ Эта позиция уже недоступна для ручного закрытия.",
+                    show_alert=True,
                 )
                 return
             self._confirmations[key] = self._clock() + _CONFIRMATION_TTL
