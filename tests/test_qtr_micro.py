@@ -3054,6 +3054,7 @@ def test_reconciliation_repairs_persisted_closed_external_manual_close(
     assert position.journaled is True
     assert position.runner_exit_price == fill.average_price
     assert position.last_updated == fill.filled_at
+    assert position.final_exit_reason is MicroExitReason.EXTERNAL_MANUAL_CLOSE
     rows = journal_path.read_text(encoding="utf-8").splitlines()
     assert len(rows) == 1
     assert json.loads(rows[0])["exit_reason"] == "EXTERNAL_MANUAL_CLOSE"
@@ -3113,9 +3114,11 @@ def test_trader_scanner_level_propagates_and_old_state_is_compatible(
     store.save(state(positions={position.trade_id: position}))
     payload = json.loads(path.read_text(encoding="utf-8"))
     del payload["positions"][position.trade_id]["scanner_level"]
+    del payload["positions"][position.trade_id]["final_exit_reason"]
     path.write_text(json.dumps(payload), encoding="utf-8")
     loaded = store.load(today=NOW.date(), trading_enabled=True)
     assert loaded.positions[position.trade_id].scanner_level is None
+    assert loaded.positions[position.trade_id].final_exit_reason is None
 
 
 def test_human_close_is_reduce_only_and_idempotent(tmp_path: Path) -> None:
@@ -3242,6 +3245,7 @@ def test_human_close_waits_for_fill_and_journals_exactly_once(
     closed = loaded.positions[position.trade_id]
     assert closed.stage is MicroStage.CLOSED
     assert closed.runner_exit_price == fill.average_price
+    assert closed.final_exit_reason is MicroExitReason.HUMAN_CLOSE
     rows = journal_path.read_text(encoding="utf-8").splitlines()
     assert len(rows) == 1
     assert json.loads(rows[0])["exit_reason"] == "HUMAN_CLOSE"
@@ -3307,6 +3311,7 @@ def test_closed_position_snapshot_duration_stops_at_close_time(
         last_updated=NOW + timedelta(minutes=24, seconds=7),
         runner_exit_price=100.5,
         journaled=True,
+        final_exit_reason=MicroExitReason.TIME_EXIT,
     )
     store = JsonQtrMicroStateStore(tmp_path / "closed-duration.json")
     store.save(state(positions={closed.trade_id: closed}))
@@ -3323,3 +3328,4 @@ def test_closed_position_snapshot_duration_stops_at_close_time(
     assert snapshot is not None
     assert snapshot.stage is MicroStage.CLOSED
     assert snapshot.duration_seconds == 24 * 60 + 7
+    assert snapshot.exit_reason is MicroExitReason.TIME_EXIT

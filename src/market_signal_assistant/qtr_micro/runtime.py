@@ -75,6 +75,7 @@ class QtrMicroPositionSnapshot:
     gross_pnl: float
     fees: float
     net_pnl: float
+    exit_reason: MicroExitReason | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -768,6 +769,7 @@ def _position_snapshot(
         gross_pnl=gross_pnl,
         fees=position.fees,
         net_pnl=net_pnl,
+        exit_reason=position.final_exit_reason,
     )
 
 

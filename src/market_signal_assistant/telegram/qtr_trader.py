@@ -209,7 +209,7 @@ def format_position_card(
 ) -> tuple[str, TraderButtons]:
     direction = _direction_label(snapshot.direction)
     if snapshot.stage is MicroStage.CLOSED:
-        reason = _exit_reason_label(exit_reason)
+        reason = _exit_reason_label(exit_reason or snapshot.exit_reason)
         text = "\n".join(
             (
                 "🏁 QTR TRADER — ПОЗИЦИЯ ЗАКРЫТА",
