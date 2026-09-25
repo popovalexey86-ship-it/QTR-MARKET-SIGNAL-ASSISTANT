@@ -677,6 +677,7 @@ class QtrMicroExecutionService:
                                 pending_exit_reason=None,
                                 pending_exit_qty=0.0,
                                 pending_new_stop=None,
+                                final_exit_reason=reason,
                                 runner_exit_price=fill.average_price,
                             )
                             records[trade_id] = position
@@ -735,6 +736,7 @@ class QtrMicroExecutionService:
                                 pending_exit_reason=None,
                                 pending_exit_qty=0.0,
                                 pending_new_stop=None,
+                                final_exit_reason=reason,
                                 runner_exit_price=fill.average_price,
                             )
                             records[trade_id] = position
@@ -774,6 +776,7 @@ class QtrMicroExecutionService:
                             fees=prior_position.fees + fill.fee,
                             exit_fees=prior_position.exit_fees + fill.fee,
                             last_updated=fill.filled_at,
+                            final_exit_reason=reason,
                             runner_exit_price=fill.average_price,
                         )
                         records[trade_id] = position
@@ -898,6 +901,9 @@ class QtrMicroExecutionService:
             pending_exit_reason=None,
             pending_exit_qty=0.0,
             pending_new_stop=None,
+            final_exit_reason=(
+                reason if remaining <= 0 else position.final_exit_reason
+            ),
             tp1_fill_price=(
                 fill.average_price
                 if reason is MicroExitReason.TP1
