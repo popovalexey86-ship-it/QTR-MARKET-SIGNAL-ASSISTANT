@@ -276,6 +276,20 @@ def test_closed_card_without_reason_is_explicit_not_generic_english_closed() -> 
     assert buttons == ()
 
 
+def test_closed_card_uses_persisted_reason_after_refresh() -> None:
+    closed = snapshot(
+        stage=MicroStage.CLOSED,
+        current_qty=0.0,
+        exit_price=101.5,
+        exit_reason=MicroExitReason.TIME_EXIT,
+    )
+
+    text, buttons = format_position_card(closed)
+
+    assert "📌 Причина: ⏱ Выход по времени" in text
+    assert buttons == ()
+
+
 def test_closed_card_uses_factual_exit_and_human_close_reason() -> None:
     closed = snapshot(
         stage=MicroStage.CLOSED,
