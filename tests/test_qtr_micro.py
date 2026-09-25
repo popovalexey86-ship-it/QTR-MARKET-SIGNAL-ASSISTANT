@@ -3292,3 +3292,34 @@ def test_position_snapshot_uses_actual_risk_and_existing_excursions(
     assert snapshot.mae_r == pytest.approx(-0.5)
     assert snapshot.max_r == pytest.approx(2.0)
     assert snapshot.duration_seconds == 300
+
+
+def test_closed_position_snapshot_duration_stops_at_close_time(
+    tmp_path: Path,
+) -> None:
+    plan = decision().plan
+    assert plan is not None
+    closed = position_from_plan(
+        plan,
+        stage=MicroStage.CLOSED,
+        current_qty=0.0,
+        opened_at=NOW,
+        last_updated=NOW + timedelta(minutes=24, seconds=7),
+        runner_exit_price=100.5,
+        journaled=True,
+    )
+    store = JsonQtrMicroStateStore(tmp_path / "closed-duration.json")
+    store.save(state(positions={closed.trade_id: closed}))
+    runtime = QtrMicroRuntime(
+        settings=settings(),
+        client=FakeClient(),
+        state_store=store,
+        allowed_chat_ids=frozenset(),
+        clock=lambda: NOW + timedelta(hours=3),
+    )
+
+    snapshot = asyncio.run(runtime.get_position_snapshot(closed.trade_id))
+
+    assert snapshot is not None
+    assert snapshot.stage is MicroStage.CLOSED
+    assert snapshot.duration_seconds == 24 * 60 + 7
