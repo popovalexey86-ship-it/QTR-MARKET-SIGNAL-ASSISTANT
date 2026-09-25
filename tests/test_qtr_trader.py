@@ -141,8 +141,8 @@ def test_position_opened_event_sends_one_trader_card() -> None:
     assert len(messenger.sent) == 1
     assert messenger.sent[0][0] == 200
     assert "QTR TRADER — MICRO DEMO" in messenger.sent[0][1]
-    assert "Scanner       100.8" in messenger.sent[0][1]
-    assert "Risk          $2.00 = 1R" in messenger.sent[0][1]
+    assert "🔎 Уровень Scanner 100.8" in messenger.sent[0][1]
+    assert "🛡 Риск            $2.00 = 1R" in messenger.sent[0][1]
 
 
 def test_hold_is_read_only_and_never_requests_execution() -> None:
@@ -156,7 +156,27 @@ def test_hold_is_read_only_and_never_requests_execution() -> None:
     run_callback(controller, query)
     assert runtime.close_calls == []
     assert messenger.edited
-    assert query.answers[-1][0] == "HOLD — позиция без изменений."
+    assert query.answers[-1][0] == "🟢 Держим позицию — без изменений."
+
+
+def test_refresh_is_read_only_and_uses_russian_ui() -> None:
+    current = snapshot()
+    runtime = FakeRuntime(current)
+    messenger = FakeMessenger()
+    controller = QtrTraderTelegramController(
+        runtime, messenger, frozenset({200})
+    )
+
+    query = FakeQuery(f"qtrt:refresh:{current.trade_id}")
+    run_callback(controller, query)
+
+    assert runtime.close_calls == []
+    assert messenger.edited
+    assert query.answers[-1][0] == "🔄 Данные обновлены."
+    buttons = messenger.edited[-1][3]
+    assert "🟢 ДЕРЖАТЬ" in str(buttons)
+    assert "🔴 ЗАКРЫТЬ" in str(buttons)
+    assert "🔄 ОБНОВИТЬ" in str(buttons)
 
 
 def test_close_is_two_step_and_repeated_confirm_is_idempotent_at_ui() -> None:
@@ -170,17 +190,17 @@ def test_close_is_two_step_and_repeated_confirm_is_idempotent_at_ui() -> None:
     close_query = FakeQuery(f"qtrt:close:{current.trade_id}")
     run_callback(controller, close_query)
     assert runtime.close_calls == []
-    assert "CONFIRM CLOSE" in str(messenger.edited[-1][3])
+    assert "✅ ПОДТВЕРДИТЬ ЗАКРЫТИЕ" in str(messenger.edited[-1][3])
 
     confirm_query = FakeQuery(f"qtrt:confirm:{current.trade_id}")
     run_callback(controller, confirm_query)
     assert runtime.close_calls == [current.trade_id]
-    assert "CLOSE PENDING" in messenger.edited[-1][2]
+    assert "⏳ ЗАКРЫТИЕ ОЖИДАЕТСЯ" in messenger.edited[-1][2]
 
     repeated = FakeQuery(f"qtrt:confirm:{current.trade_id}")
     run_callback(controller, repeated)
     assert runtime.close_calls == [current.trade_id]
-    assert repeated.answers[-1] == ("Подтверждение CLOSE истекло.", True)
+    assert repeated.answers[-1] == ("⏱ Подтверждение закрытия истекло.", True)
 
 
 def test_cancel_never_requests_execution() -> None:
@@ -196,7 +216,7 @@ def test_cancel_never_requests_execution() -> None:
     cancel = FakeQuery(f"qtrt:cancel:{current.trade_id}")
     run_callback(controller, cancel)
     assert runtime.close_calls == []
-    assert cancel.answers[-1][0] == "Закрытие отменено."
+    assert cancel.answers[-1][0] == "↩️ Закрытие отменено."
 
 
 def test_expired_confirmation_never_requests_execution() -> None:
@@ -217,7 +237,7 @@ def test_expired_confirmation_never_requests_execution() -> None:
     confirm = FakeQuery(f"qtrt:confirm:{current.trade_id}")
     run_callback(controller, confirm)
     assert runtime.close_calls == []
-    assert confirm.answers[-1] == ("Подтверждение CLOSE истекло.", True)
+    assert confirm.answers[-1] == ("⏱ Подтверждение закрытия истекло.", True)
 
 
 def test_execution_callbacks_require_allowlisted_private_chat() -> None:
@@ -240,6 +260,22 @@ def test_execution_callbacks_require_allowlisted_private_chat() -> None:
     assert group.answers[-1] == ("Доступ запрещён.", True)
 
 
+def test_closed_card_without_reason_is_explicit_not_generic_english_closed() -> None:
+    closed = snapshot(
+        stage=MicroStage.CLOSED,
+        current_qty=0.0,
+        exit_price=101.5,
+    )
+
+    text, buttons = format_position_card(closed)
+
+    assert "🏁 QTR TRADER — ПОЗИЦИЯ ЗАКРЫТА" in text
+    assert "📌 Причина: не указана" in text
+    assert "Reason:" not in text
+    assert "POSITION CLOSED" not in text
+    assert buttons == ()
+
+
 def test_closed_card_uses_factual_exit_and_human_close_reason() -> None:
     closed = snapshot(
         stage=MicroStage.CLOSED,
@@ -255,10 +291,10 @@ def test_closed_card_uses_factual_exit_and_human_close_reason() -> None:
     text, buttons = format_position_card(
         closed, exit_reason=MicroExitReason.HUMAN_CLOSE
     )
-    assert "Reason: HUMAN_CLOSE" in text
-    assert "Exit fill   102.25" in text
-    assert "Net PnL     +$2.25" in text
-    assert "Result      +1.12R" in text
+    assert "📌 Причина: 👤 Закрыто через QTR Trader" in text
+    assert "🏁 Выход           102.25" in text
+    assert "💰 Итоговый PnL    +$2.25" in text
+    assert "📊 Результат       +1.12R" in text
     assert buttons == ()
 
 

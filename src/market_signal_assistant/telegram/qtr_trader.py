@@ -116,7 +116,7 @@ class QtrTraderTelegramController:
                 await query.answer("Позиция не найдена.", show_alert=True)
                 return
             await self._render(chat_id, message_id, snapshot)
-            await query.answer("HOLD — позиция без изменений.")
+            await query.answer("🟢 Держим позицию — без изменений.")
             return
 
         if action == "refresh":
@@ -125,7 +125,7 @@ class QtrTraderTelegramController:
                 await query.answer("Позиция не найдена.", show_alert=True)
                 return
             await self._render(chat_id, message_id, snapshot)
-            await query.answer("Обновлено.")
+            await query.answer("🔄 Данные обновлены.")
             return
 
         if action == "close":
@@ -136,7 +136,8 @@ class QtrTraderTelegramController:
             if snapshot.stage not in _ACTIVE_STAGES:
                 await self._render(chat_id, message_id, snapshot)
                 await query.answer(
-                    "Позиция не доступна для Human Close.", show_alert=True
+                    "⚠️ Эта позиция уже недоступна для ручного закрытия.",
+                    show_alert=True,
                 )
                 return
             self._confirmations[key] = self._clock() + _CONFIRMATION_TTL
@@ -153,7 +154,7 @@ class QtrTraderTelegramController:
                 await query.answer("Позиция не найдена.", show_alert=True)
                 return
             await self._render(chat_id, message_id, snapshot)
-            await query.answer("Закрытие отменено.")
+            await query.answer("↩️ Закрытие отменено.")
             return
 
         if action == "confirm":
@@ -163,7 +164,7 @@ class QtrTraderTelegramController:
                 if snapshot is not None:
                     await self._render(chat_id, message_id, snapshot)
                 await query.answer(
-                    "Подтверждение CLOSE истекло.", show_alert=True
+                    "⏱ Подтверждение закрытия истекло.", show_alert=True
                 )
                 return
             snapshot = await self._runtime.request_human_close(trade_id)
@@ -177,7 +178,7 @@ class QtrTraderTelegramController:
                 exit_reason=MicroExitReason.HUMAN_CLOSE,
                 close_pending=snapshot.stage is MicroStage.EXIT_ACKNOWLEDGED,
             )
-            await query.answer("CLOSE принят.")
+            await query.answer("🔴 Команда на закрытие принята.")
             return
 
         await query.answer("Некорректная команда.", show_alert=True)
@@ -206,81 +207,88 @@ def format_position_card(
     exit_reason: MicroExitReason | None = None,
     close_pending: bool = False,
 ) -> tuple[str, TraderButtons]:
+    direction = _direction_label(snapshot.direction)
     if snapshot.stage is MicroStage.CLOSED:
-        reason = exit_reason.value if exit_reason is not None else "CLOSED"
+        reason = _exit_reason_label(exit_reason)
         text = "\n".join(
             (
-                "🏁 QTR TRADER — POSITION CLOSED",
+                "🏁 QTR TRADER — ПОЗИЦИЯ ЗАКРЫТА",
                 "",
-                f"{snapshot.symbol} • {snapshot.direction}",
-                f"Reason: {reason}",
+                f"{snapshot.symbol} • {direction}",
+                f"📌 Причина: {reason}",
                 "",
-                f"Entry       {_number(snapshot.actual_entry)}",
-                f"Exit fill   {_number(snapshot.exit_price)}",
-                f"Qty         {_number(snapshot.initial_qty)}",
+                f"🎯 Вход            {_number(snapshot.actual_entry)}",
+                f"🏁 Выход           {_number(snapshot.exit_price)}",
+                f"📦 Объём           {_number(snapshot.initial_qty)}",
                 "",
-                f"Gross PnL   {_signed_money(snapshot.gross_pnl)}",
-                f"Fees        -{_money(abs(snapshot.fees))}",
-                f"Net PnL     {_signed_money(snapshot.net_pnl)}",
-                f"Result      {_signed_r(snapshot.current_r)}",
+                f"💵 PnL до комиссий {_signed_money(snapshot.gross_pnl)}",
+                f"💸 Комиссии        -{_money(abs(snapshot.fees))}",
+                f"💰 Итоговый PnL    {_signed_money(snapshot.net_pnl)}",
+                f"📊 Результат       {_signed_r(snapshot.current_r)}",
                 "",
-                f"MFE         {_signed_r(snapshot.mfe_r)}",
-                f"MAE         {_signed_r(snapshot.mae_r)}",
-                f"Duration    {_duration(snapshot.duration_seconds)}",
+                f"🚀 Макс. плюс MFE  {_signed_r(snapshot.mfe_r)}",
+                f"📉 Макс. минус MAE {_signed_r(snapshot.mae_r)}",
+                f"⏱ В позиции       {_duration(snapshot.duration_seconds)}",
                 "",
-                f"Trade ID    {snapshot.trade_id}",
+                f"🆔 Сделка          {snapshot.trade_id}",
             )
         )
         return text, ()
 
-    state = "CLOSE PENDING" if close_pending else snapshot.stage.value
+    state = (
+        "⏳ ЗАКРЫТИЕ ОЖИДАЕТСЯ"
+        if close_pending
+        else _stage_label(snapshot.stage)
+    )
     risk = (
         f"{_money(snapshot.initial_risk_usdt)} = 1R"
         if snapshot.initial_risk_usdt is not None
-        else "N/A"
+        else "—"
     )
     text = "\n".join(
         (
-            "🟢 QTR TRADER — MICRO DEMO",
+            "📡 QTR TRADER — MICRO DEMO",
             "",
-            f"{snapshot.symbol} • {snapshot.direction}",
-            f"Setup: {snapshot.setup}",
-            f"State: {state}",
+            f"{snapshot.symbol} • {direction}",
+            f"🧩 Сетап: {snapshot.setup}",
+            f"📊 Состояние: {state}",
             "",
-            f"Scanner       {_number(snapshot.scanner_level)}",
-            f"Entry         {_number(snapshot.actual_entry)}",
-            f"Price         {_number(snapshot.current_price)}",
+            f"🔎 Уровень Scanner {_number(snapshot.scanner_level)}",
+            f"🎯 Вход            {_number(snapshot.actual_entry)}",
+            f"💹 Цена сейчас     {_number(snapshot.current_price)}",
             "",
-            f"Qty           {_number(snapshot.current_qty)}",
-            f"Notional      {_money(snapshot.notional)}",
-            f"Leverage      x{snapshot.leverage}",
+            f"📦 Объём           {_number(snapshot.current_qty)}",
+            f"💵 Номинал         {_money(snapshot.notional)}",
+            f"⚙️ Плечо           x{snapshot.leverage}",
             "",
-            f"SL            {_number(snapshot.current_sl)}",
-            f"TP1           {_number(snapshot.tp1)}",
-            f"TP2           {_number(snapshot.tp2)}",
-            f"Runner        {_number(snapshot.runner_target)}",
+            f"🛡 SL               {_number(snapshot.current_sl)}",
+            f"🎯 TP1              {_number(snapshot.tp1)}",
+            f"🎯 TP2              {_number(snapshot.tp2)}",
+            f"🚀 Runner           {_number(snapshot.runner_target)}",
             "",
-            f"PnL est.      {_signed_money(snapshot.current_pnl_est)}",
-            f"Current R     {_signed_r(snapshot.current_r)}",
-            f"MFE           {_signed_r(snapshot.mfe_r)}",
-            f"MAE           {_signed_r(snapshot.mae_r)}",
-            f"Max R         {_signed_r(snapshot.max_r)}",
+            f"💰 PnL сейчас      {_signed_money(snapshot.current_pnl_est)}",
+            f"📊 Текущий R       {_signed_r(snapshot.current_r)}",
+            f"🚀 MFE             {_signed_r(snapshot.mfe_r)}",
+            f"📉 MAE             {_signed_r(snapshot.mae_r)}",
+            f"🏆 Max R           {_signed_r(snapshot.max_r)}",
             "",
-            f"Risk          {risk}",
-            f"Duration      {_duration(snapshot.duration_seconds)}",
+            f"🛡 Риск            {risk}",
+            f"⏱ В позиции       {_duration(snapshot.duration_seconds)}",
             "",
-            f"Trade ID      {snapshot.trade_id}",
+            f"🆔 Сделка          {snapshot.trade_id}",
         )
     )
     if snapshot.stage is MicroStage.EXIT_ACKNOWLEDGED or close_pending:
-        return text, ((("REFRESH", _callback("refresh", snapshot.trade_id)),),)
+        return text, (
+            (("🔄 ОБНОВИТЬ", _callback("refresh", snapshot.trade_id)),),
+        )
     if snapshot.stage in _ACTIVE_STAGES:
         return text, (
             (
-                ("HOLD", _callback("hold", snapshot.trade_id)),
-                ("CLOSE", _callback("close", snapshot.trade_id)),
+                ("🟢 ДЕРЖАТЬ", _callback("hold", snapshot.trade_id)),
+                ("🔴 ЗАКРЫТЬ", _callback("close", snapshot.trade_id)),
             ),
-            (("REFRESH", _callback("refresh", snapshot.trade_id)),),
+            (("🔄 ОБНОВИТЬ", _callback("refresh", snapshot.trade_id)),),
         )
     return text, ()
 
@@ -290,20 +298,63 @@ def format_close_confirmation(
 ) -> tuple[str, TraderButtons]:
     text = "\n".join(
         (
-            "⚠️ Подтвердить закрытие?",
+            "⚠️ QTR TRADER — ПОДТВЕРДИТЬ ЗАКРЫТИЕ?",
             "",
-            f"{snapshot.symbol} • {snapshot.direction}",
-            f"PnL est.: {_signed_money(snapshot.current_pnl_est)}",
-            f"Current R: {_signed_r(snapshot.current_r)}",
+            f"{snapshot.symbol} • {_direction_label(snapshot.direction)}",
+            f"💰 PnL сейчас: {_signed_money(snapshot.current_pnl_est)}",
+            f"📊 Текущий R: {_signed_r(snapshot.current_r)}",
             "",
-            "Первое нажатие CLOSE ордер не отправляет.",
+            "Первое нажатие «🔴 ЗАКРЫТЬ» ордер не отправляет.",
+            "Ордер уйдёт только после отдельного подтверждения.",
         )
     )
     return text, (
-        (("CONFIRM CLOSE", _callback("confirm", snapshot.trade_id)),),
-        (("CANCEL", _callback("cancel", snapshot.trade_id)),),
+        (
+            (
+                "✅ ПОДТВЕРДИТЬ ЗАКРЫТИЕ",
+                _callback("confirm", snapshot.trade_id),
+            ),
+        ),
+        (("↩️ ОТМЕНА", _callback("cancel", snapshot.trade_id)),),
     )
 
+
+def _direction_label(direction: str) -> str:
+    normalized = direction.upper()
+    if normalized == "LONG":
+        return "🟢 ЛОНГ"
+    if normalized == "SHORT":
+        return "🔴 ШОРТ"
+    return direction
+
+
+def _stage_label(stage: MicroStage) -> str:
+    labels = {
+        MicroStage.OPEN: "🟢 ОТКРЫТА",
+        MicroStage.TP1_FILLED: "✅ TP1 ВЫПОЛНЕН",
+        MicroStage.TP2_FILLED: "✅ TP2 ВЫПОЛНЕН",
+        MicroStage.RUNNER: "🚀 RUNNER",
+        MicroStage.EXIT_ACKNOWLEDGED: "⏳ ЗАКРЫТИЕ ОТПРАВЛЕНО",
+    }
+    return labels.get(stage, stage.value)
+
+
+def _exit_reason_label(reason: MicroExitReason | None) -> str:
+    if reason is None:
+        return "не указана"
+    labels = {
+        MicroExitReason.STOP: "🛑 Стоп-лосс",
+        MicroExitReason.TP1: "🎯 TP1",
+        MicroExitReason.TP2: "🎯 TP2",
+        MicroExitReason.RUNNER_TARGET: "🚀 Цель Runner",
+        MicroExitReason.TIME_EXIT: "⏱ Выход по времени",
+        MicroExitReason.RUNNER_TIME_EXIT: "⏱ Выход Runner по времени",
+        MicroExitReason.STRUCTURE_EXIT: "📉 Выход по структуре",
+        MicroExitReason.HUMAN_CLOSE: "👤 Закрыто через QTR Trader",
+        MicroExitReason.EXTERNAL_MANUAL_CLOSE: "⚠️ Закрыто вручную вне QTR",
+        MicroExitReason.STOP_PROTECTION_FAILED: "🚨 Ошибка защиты стопом",
+    }
+    return labels.get(reason, reason.value)
 
 def _callback(action: str, trade_id: str) -> str:
     return f"qtrt:{action}:{trade_id}"
