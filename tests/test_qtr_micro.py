@@ -3311,6 +3311,7 @@ def test_closed_position_snapshot_duration_stops_at_close_time(
         last_updated=NOW + timedelta(minutes=24, seconds=7),
         runner_exit_price=100.5,
         journaled=True,
+        final_exit_reason=MicroExitReason.TIME_EXIT,
     )
     store = JsonQtrMicroStateStore(tmp_path / "closed-duration.json")
     store.save(state(positions={closed.trade_id: closed}))
@@ -3327,4 +3328,4 @@ def test_closed_position_snapshot_duration_stops_at_close_time(
     assert snapshot is not None
     assert snapshot.stage is MicroStage.CLOSED
     assert snapshot.duration_seconds == 24 * 60 + 7
-    assert snapshot.exit_reason is None
+    assert snapshot.exit_reason is MicroExitReason.TIME_EXIT
