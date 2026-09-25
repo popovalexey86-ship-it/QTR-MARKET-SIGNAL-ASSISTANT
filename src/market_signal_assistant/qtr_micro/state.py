@@ -253,6 +253,11 @@ def _position_from_json(raw: dict[str, Any]) -> MicroPosition:
             if raw.get("scanner_level") is not None
             else None
         ),
+        final_exit_reason=(
+            MicroExitReason(str(raw["final_exit_reason"]))
+            if raw.get("final_exit_reason") is not None
+            else None
+        ),
     )
 
 
