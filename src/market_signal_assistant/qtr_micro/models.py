@@ -255,6 +255,7 @@ class MicroPosition:
     funding: float | None = None
     journaled: bool = False
     scanner_level: float | None = None
+    final_exit_reason: MicroExitReason | None = None
 
 
 @dataclass(frozen=True, slots=True)
