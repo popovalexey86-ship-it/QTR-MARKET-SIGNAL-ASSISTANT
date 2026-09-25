@@ -725,8 +725,13 @@ def _position_snapshot(
     mae_r = excursion_r(position.max_adverse_price)
     duration_seconds = 0
     if position.opened_at is not None:
+        duration_end = (
+            position.last_updated
+            if position.stage is MicroStage.CLOSED
+            else now
+        )
         duration_seconds = max(
-            0, int((now - position.opened_at).total_seconds())
+            0, int((duration_end - position.opened_at).total_seconds())
         )
     notional = (
         entry * position.initial_qty
