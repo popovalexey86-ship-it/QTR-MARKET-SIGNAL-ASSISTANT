@@ -1,0 +1,15 @@
+{
+  "dataset_id": "phase5-final-acceptance-20260922T2000Z",
+  "path": "/opt/qtr/watchdog-shadow-data/phase5-final-acceptance-20260922T2000Z",
+  "known_commit_sha": "927847b916ac5025df0ead7332bb71094558ba29",
+  "duration_seconds": 86419,
+  "compatibility": "PARTIALLY_COMPATIBLE",
+  "limitations": [
+    "Diagnostic cohort, not clean Final Acceptance: external stop/restart at 2026-09-23T06:11Z.",
+    "KASUSDT catchup_cap_exceeded gap of 71 completed 15m buckets.",
+    "Universe transition observability predates the bounded-repair append-only evidence journal.",
+    "Commit attribution is external launch provenance, not self-authenticated by JSONL."
+  ],
+  "analysis_as_of": "2026-09-23T20:04:45.804047+00:00",
+  "analyzer_version": "evidence-baseline-v1"
+}

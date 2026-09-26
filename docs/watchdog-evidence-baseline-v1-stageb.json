@@ -1,0 +1,14 @@
+{
+  "dataset_id": "phase5-repair-validation-20260922T1127Z",
+  "path": "/opt/qtr/watchdog-shadow-data/phase5-repair-validation-20260922T1127Z",
+  "known_commit_sha": "927847b916ac5025df0ead7332bb71094558ba29",
+  "duration_seconds": 21629,
+  "compatibility": "PARTIALLY_COMPATIBLE",
+  "limitations": [
+    "Six-hour repair Stage B cohort; incomplete long-horizon coverage.",
+    "Universe transition observability predates bounded-repair evidence journal.",
+    "Commit attribution is external launch provenance, not self-authenticated by JSONL."
+  ],
+  "analysis_as_of": "2026-09-22T17:33:17.388038+00:00",
+  "analyzer_version": "evidence-baseline-v1"
+}

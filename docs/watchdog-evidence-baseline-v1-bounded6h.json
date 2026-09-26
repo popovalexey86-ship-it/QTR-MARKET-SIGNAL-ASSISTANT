@@ -1,0 +1,15 @@
+{
+  "dataset_id": "phase5-bounded-live-20260924T193118Z",
+  "path": "/opt/qtr/watchdog-shadow-data/phase5-bounded-live-20260924T193118Z",
+  "known_commit_sha": "617f69bf85343427a3a41b3e04718a289cf26ae3",
+  "duration_seconds": 21608,
+  "compatibility": "PARTIALLY_COMPATIBLE",
+  "limitations": [
+    "Six-hour targeted validation; +60m outcomes had not matured by shutdown.",
+    "One explained EGLDUSDT inactive re-entry gap; do not combine with older universe behavior.",
+    "Small cohort, not a standalone statistical sample or 24h acceptance.",
+    "Commit attribution is external launch provenance, not self-authenticated by JSONL."
+  ],
+  "analysis_as_of": "2026-09-25T01:45:21.337415+00:00",
+  "analyzer_version": "evidence-baseline-v1"
+}
