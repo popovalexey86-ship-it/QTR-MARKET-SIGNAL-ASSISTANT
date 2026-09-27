@@ -34,11 +34,23 @@ class QtrSetupScanner(Protocol):
 
 QtrSetupSender = Callable[[int, str], Awaitable[None]]
 QtrSetupCandidateHandler = Callable[
-    [tuple[QtrSetupCandidate, ...], QtrSetupSender], Awaitable[None]
+    [tuple[QtrSetupCandidate, ...], QtrSetupSender, str | None], Awaitable[None]
 ]
 QtrSetupShadowObserver = Callable[
     [tuple[QtrSetupCandidate, ...], datetime], None
 ]
+
+
+class QtrSetupQualifiedShadowDispatcher(Protocol):
+    def enqueue(
+        self, plan: QtrSetupNotificationPlan, qualified_at: datetime
+    ) -> str | None: ...
+
+    def production_completed(
+        self, production_cycle_id: str | None, completed_at: datetime
+    ) -> None: ...
+
+    async def wait(self) -> None: ...
 
 
 class QtrSetupPilotNotifier:
@@ -53,6 +65,8 @@ class QtrSetupPilotNotifier:
         candidate_handler: QtrSetupCandidateHandler | None = None,
         shadow_observer: QtrSetupShadowObserver | None = None,
         shadow_busy_observer: QtrSetupShadowObserver | None = None,
+        qualified_shadow_dispatcher: QtrSetupQualifiedShadowDispatcher
+        | None = None,
     ) -> None:
         self._scanner = scanner
         self._notifications = notification_service
@@ -62,6 +76,7 @@ class QtrSetupPilotNotifier:
         self._candidate_handler = candidate_handler
         self._shadow_observer = shadow_observer
         self._shadow_busy_observer = shadow_busy_observer
+        self._qualified_shadow_dispatcher = qualified_shadow_dispatcher
         self._shadow_task: asyncio.Task[None] | None = None
         self._shadow_auxiliary_tasks: set[asyncio.Task[None]] = set()
         self._lock = asyncio.Lock()
@@ -74,6 +89,7 @@ class QtrSetupPilotNotifier:
             _LOGGER.warning("Предыдущий QTR Setup scan ещё выполняется; scan пропущен.")
             return False
         now = self._clock()
+        production_cycle_id: str | None = None
         try:
             async with self._lock:
                 candidates = await asyncio.to_thread(self._scanner.scan)
@@ -81,6 +97,17 @@ class QtrSetupPilotNotifier:
                 plan = await asyncio.to_thread(
                     self._notifications.prepare, candidates, now
                 )
+                dispatcher = self._qualified_shadow_dispatcher
+                if dispatcher is not None:
+                    try:
+                        production_cycle_id = dispatcher.enqueue(
+                            plan, self._clock()
+                        )
+                    except Exception as error:
+                        _LOGGER.warning(
+                            "QTR distance Shadow enqueue failed (%s).",
+                            type(error).__name__,
+                        )
                 metrics = self._notifications.metrics
                 _LOGGER.info(
                     "QTR Scanner Telegram filter: candidates_seen=%d, "
@@ -125,7 +152,9 @@ class QtrSetupPilotNotifier:
                 self._write_audit(plan, delivered, delivered, now)
                 if self._candidate_handler is not None:
                     try:
-                        await self._candidate_handler(candidates, send)
+                        await self._candidate_handler(
+                            candidates, send, production_cycle_id
+                        )
                     except Exception as error:
                         _LOGGER.warning(
                             "QTR Micro candidate handler завершился ошибкой (%s).",
@@ -138,6 +167,18 @@ class QtrSetupPilotNotifier:
                 type(error).__name__,
             )
             return False
+        finally:
+            dispatcher = self._qualified_shadow_dispatcher
+            if dispatcher is not None:
+                try:
+                    dispatcher.production_completed(
+                        production_cycle_id, self._clock()
+                    )
+                except Exception as error:
+                    _LOGGER.warning(
+                        "QTR distance Shadow completion failed (%s).",
+                        type(error).__name__,
+                    )
 
     def _launch_shadow_observer(
         self, candidates: tuple[QtrSetupCandidate, ...]
@@ -188,6 +229,9 @@ class QtrSetupPilotNotifier:
         auxiliary = tuple(self._shadow_auxiliary_tasks)
         if auxiliary:
             await asyncio.gather(*auxiliary, return_exceptions=True)
+        dispatcher = self._qualified_shadow_dispatcher
+        if dispatcher is not None:
+            await dispatcher.wait()
 
     def _write_audit(
         self,

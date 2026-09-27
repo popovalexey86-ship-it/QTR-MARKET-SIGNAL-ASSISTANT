@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
 from market_signal_assistant.qtr_micro.client import DemoTradingClient
+from market_signal_assistant.qtr_micro.distance_shadow import FrozenRuntimeContext
 from market_signal_assistant.qtr_micro.engine import QtrMicroEntryEngine
 from market_signal_assistant.qtr_micro.execution import (
     JOURNAL_RECOVERY_BLOCK,
@@ -42,6 +43,9 @@ from market_signal_assistant.telegram.qtr_micro import (
 
 _LOGGER = logging.getLogger(__name__)
 MicroSender = Callable[[int, str], Awaitable[None]]
+DistanceShadowContextPublisher = Callable[
+    [str, QtrSetupCandidate, FrozenRuntimeContext, datetime], None
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +153,8 @@ class QtrMicroRuntime:
         decision_audit: JsonlQtrMicroDecisionAudit | None = None,
         runtime_audit: JsonlQtrMicroRuntimeAudit | None = None,
         position_event_handler: QtrMicroPositionEventHandler | None = None,
+        distance_shadow_context_publisher: DistanceShadowContextPublisher
+        | None = None,
     ) -> None:
         self._settings = settings
         self._client = client
@@ -178,6 +184,9 @@ class QtrMicroRuntime:
         )
         self._preflight_result = PreflightResult(False, "Preflight ещё не выполнен.")
         self._position_event_handler = position_event_handler
+        self._distance_shadow_context_publisher = (
+            distance_shadow_context_publisher
+        )
         self._lock = asyncio.Lock()
 
     @property
@@ -296,6 +305,7 @@ class QtrMicroRuntime:
         self,
         candidates: tuple[QtrSetupCandidate, ...],
         send: MicroSender,
+        production_cycle_id: str | None = None,
     ) -> None:
         if not self._preflight_result.ready:
             return
@@ -362,6 +372,26 @@ class QtrMicroRuntime:
                     rules = await asyncio.to_thread(
                         self._client.instrument_rules, candidate.result.symbol
                     )
+                    publisher = self._distance_shadow_context_publisher
+                    if publisher is not None and production_cycle_id is not None:
+                        try:
+                            publisher(
+                                production_cycle_id,
+                                candidate,
+                                FrozenRuntimeContext.capture(
+                                    now=now,
+                                    equity=equity,
+                                    rules=rules,
+                                    state=state,
+                                    preflight=self._preflight_result,
+                                ),
+                                self._clock(),
+                            )
+                        except Exception as error:
+                            _LOGGER.warning(
+                                "QTR distance Shadow context capture failed (%s).",
+                                type(error).__name__,
+                            )
                     decision = self._engine.prepare_entry(
                         candidate,
                         now=now,

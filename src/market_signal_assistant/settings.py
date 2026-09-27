@@ -348,6 +348,19 @@ class EntryReadinessShadowSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class DistanceRelaxationShadowSettings:
+    """Opt-in distance comparison; never changes the production threshold."""
+
+    enabled: bool = False
+
+    @classmethod
+    def from_environment(cls) -> DistanceRelaxationShadowSettings:
+        return cls(
+            enabled=_environment_bool("QTR_MICRO_DISTANCE_SHADOW_ENABLED")
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class NewsAutoSettings:
     enabled: bool = False
     interval_minutes: int = 60

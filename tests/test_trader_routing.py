@@ -93,8 +93,10 @@ def test_micro_entry_tp_and_closed_only_use_trader_sender() -> None:
             self,
             candidates: tuple[object, ...],
             send: Callable[[int, str], Awaitable[None]],
+            production_cycle_id: str | None,
         ) -> None:
             assert candidates == ("candidate",)
+            assert production_cycle_id == "cycle-routing"
             for event in ("ENTRY", "TP1", "CLOSED/TIME_EXIT"):
                 await send(201, event)
 
@@ -105,7 +107,7 @@ def test_micro_entry_tp_and_closed_only_use_trader_sender() -> None:
         scanner_calls.append((chat_id, text))
 
     handler = _micro_candidate_handler(FakeRuntime().handle_candidates, trader_send)
-    asyncio.run(handler(("candidate",), scanner_send))
+    asyncio.run(handler(("candidate",), scanner_send, "cycle-routing"))
     assert scanner_calls == []
     assert trader_calls == [
         (201, "ENTRY"),
@@ -120,15 +122,17 @@ def test_missing_trader_transport_never_falls_back_to_scanner() -> None:
     async def fake_micro(
         candidates: tuple[object, ...],
         send: Callable[[int, str], Awaitable[None]],
+        production_cycle_id: str | None,
     ) -> None:
         assert candidates == ("candidate",)
+        assert production_cycle_id is None
         await send(100, "ENTRY")
 
     async def scanner_send(chat_id: int, text: str) -> None:
         scanner_calls.append((chat_id, text))
 
     handler = _micro_candidate_handler(fake_micro, _discard_trader_message)
-    asyncio.run(handler(("candidate",), scanner_send))
+    asyncio.run(handler(("candidate",), scanner_send, None))
     assert scanner_calls == []
 
 
@@ -140,8 +144,10 @@ def test_trader_failure_does_not_abort_micro_cycle_or_other_chat() -> None:
     async def fake_micro(
         candidates: tuple[object, ...],
         send: Callable[[int, str], Awaitable[None]],
+        production_cycle_id: str | None,
     ) -> None:
         assert candidates == ("candidate",)
+        assert production_cycle_id is None
         await send(200, "ENTRY")
         await send(201, "ENTRY")
         completed.append("trade cycle continued")
@@ -152,7 +158,7 @@ def test_trader_failure_does_not_abort_micro_cycle_or_other_chat() -> None:
     async def exercise() -> None:
         assert await transport.start()
         handler = _micro_candidate_handler(fake_micro, transport.send)
-        await handler(("candidate",), scanner_send)
+        await handler(("candidate",), scanner_send, None)
         await transport.close()
 
     asyncio.run(exercise())

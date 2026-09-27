@@ -46,6 +46,7 @@ from market_signal_assistant.qtr_setup_pilot.notifications import (
 )
 from market_signal_assistant.qtr_setup_pilot.service import QtrSetupScanService
 from market_signal_assistant.settings import (
+    DistanceRelaxationShadowSettings,
     EntryReadinessShadowSettings,
     InPlayAutoSettings,
     QtrSetupTelegramSettings,
@@ -492,9 +493,11 @@ def test_delivery_failure_does_not_commit_and_retry_succeeds(
     handled: list[tuple[QtrSetupCandidate, ...]] = []
 
     async def handle_candidates(
-        items: tuple[QtrSetupCandidate, ...], send_callback: Any
+        items: tuple[QtrSetupCandidate, ...],
+        send_callback: Any,
+        production_cycle_id: str | None,
     ) -> None:
-        del send_callback
+        del send_callback, production_cycle_id
         handled.append(items)
 
     notifier = QtrSetupPilotNotifier(
@@ -759,6 +762,125 @@ def test_entry_readiness_shadow_setting_is_disabled_by_default(
 
     monkeypatch.setenv("QTR_ENTRY_READINESS_SHADOW_ENABLED", "true")
     assert EntryReadinessShadowSettings.from_environment().enabled is True
+
+
+def test_distance_shadow_setting_is_disabled_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("QTR_MICRO_DISTANCE_SHADOW_ENABLED", raising=False)
+    assert DistanceRelaxationShadowSettings.from_environment().enabled is False
+
+    monkeypatch.setenv("QTR_MICRO_DISTANCE_SHADOW_ENABLED", "true")
+    assert DistanceRelaxationShadowSettings.from_environment().enabled is True
+
+
+def test_qualified_shadow_hook_includes_duplicate_without_telegram_gate(
+    tmp_path: Path,
+) -> None:
+    item = candidate()
+    notifications = service(tmp_path)
+    commit_first(notifications, item, NOW)
+    calls: list[tuple[str, Any]] = []
+
+    class Dispatcher:
+        def enqueue(self, plan: Any, qualified_at: datetime) -> str:
+            calls.append(("enqueue", (plan, qualified_at)))
+            assert plan.decisions[0].reason is QtrNotificationReason.DUPLICATE
+            assert plan.decisions[0].should_notify is False
+            return "cycle-exact"
+
+        def production_completed(
+            self, production_cycle_id: str | None, completed_at: datetime
+        ) -> None:
+            calls.append(
+                ("completed", (production_cycle_id, completed_at))
+            )
+
+        async def wait(self) -> None:
+            return None
+
+    handled: list[str | None] = []
+
+    async def handle_candidates(
+        items: tuple[QtrSetupCandidate, ...],
+        send_callback: Any,
+        production_cycle_id: str | None,
+    ) -> None:
+        del items, send_callback
+        handled.append(production_cycle_id)
+
+    class Scanner:
+        def scan(self) -> tuple[QtrSetupCandidate, ...]:
+            return (item,)
+
+    notifier = QtrSetupPilotNotifier(
+        scanner=Scanner(),
+        notification_service=notifications,
+        audit_store=JsonlQtrSetupTelegramAuditStore(tmp_path / "audit.jsonl"),
+        allowed_chat_ids=frozenset((1,)),
+        clock=lambda: NOW,
+        candidate_handler=handle_candidates,
+        qualified_shadow_dispatcher=Dispatcher(),
+    )
+
+    async def unexpected_send(chat_id: int, text: str) -> None:
+        raise AssertionError((chat_id, text))
+
+    assert asyncio.run(notifier.run_once(unexpected_send)) is False
+    assert handled == ["cycle-exact"]
+    assert [name for name, _ in calls] == ["enqueue", "completed"]
+
+
+def test_qualified_shadow_failure_does_not_change_primary_flow(
+    tmp_path: Path,
+) -> None:
+    class Dispatcher:
+        def enqueue(self, plan: Any, qualified_at: datetime) -> str:
+            del plan, qualified_at
+            raise OSError("shadow queue unavailable")
+
+        def production_completed(
+            self, production_cycle_id: str | None, completed_at: datetime
+        ) -> None:
+            del production_cycle_id, completed_at
+            raise OSError("shadow completion unavailable")
+
+        async def wait(self) -> None:
+            return None
+
+    class Scanner:
+        def scan(self) -> tuple[QtrSetupCandidate, ...]:
+            return (candidate(),)
+
+    handled: list[str | None] = []
+
+    async def handle_candidates(
+        items: tuple[QtrSetupCandidate, ...],
+        send_callback: Any,
+        production_cycle_id: str | None,
+    ) -> None:
+        del items, send_callback
+        handled.append(production_cycle_id)
+
+    sent: list[str] = []
+
+    async def send(chat_id: int, text: str) -> None:
+        del chat_id
+        sent.append(text)
+
+    notifier = QtrSetupPilotNotifier(
+        scanner=Scanner(),
+        notification_service=service(tmp_path),
+        audit_store=JsonlQtrSetupTelegramAuditStore(tmp_path / "audit.jsonl"),
+        allowed_chat_ids=frozenset((1,)),
+        clock=lambda: NOW,
+        candidate_handler=handle_candidates,
+        qualified_shadow_dispatcher=Dispatcher(),
+    )
+
+    assert asyncio.run(notifier.run_once(send)) is True
+    assert len(sent) == 1
+    assert handled == [None]
 
 
 def test_quality_and_distance_settings_are_configurable(
