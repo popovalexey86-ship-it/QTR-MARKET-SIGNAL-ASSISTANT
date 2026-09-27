@@ -3329,3 +3329,246 @@ def test_closed_position_snapshot_duration_stops_at_close_time(
     assert snapshot.stage is MicroStage.CLOSED
     assert snapshot.duration_seconds == 24 * 60 + 7
     assert snapshot.exit_reason is MicroExitReason.TIME_EXIT
+
+
+class SequenceDemoTransport:
+    base_url = DEMO_BASE_URL
+
+    def __init__(self, responses: list[Any]) -> None:
+        self.responses = list(responses)
+        self.calls: list[tuple[str, str, dict[str, object], bool]] = []
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        params: Any,
+        *,
+        authenticated: bool,
+    ) -> Any:
+        self.calls.append(
+            (method, path, dict(params), authenticated)
+        )
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+def _position_mode_payload(position_idx: int = 0) -> dict[str, Any]:
+    return {
+        "result": {
+            "list": [
+                {
+                    "positionIdx": position_idx,
+                }
+            ]
+        }
+    }
+
+
+def test_position_mode_retries_once_on_ret_code_10002() -> None:
+    transport = SequenceDemoTransport(
+        [
+            DemoApiError(
+                "Bybit Demo API отклонил запрос, код 10002.",
+                ret_code=10002,
+            ),
+            _position_mode_payload(),
+        ]
+    )
+    client = BybitDemoTradingClient(transport)
+
+    result = client.position_mode("ETHUSDT")
+
+    assert result == "ONE_WAY"
+    assert len(transport.calls) == 2
+    assert all(
+        call
+        == (
+            "GET",
+            "/v5/position/list",
+            {"category": "linear", "symbol": "ETHUSDT"},
+            True,
+        )
+        for call in transport.calls
+    )
+
+
+def test_position_mode_10002_is_retried_at_most_once() -> None:
+    transport = SequenceDemoTransport(
+        [
+            DemoApiError(
+                "Bybit Demo API отклонил запрос, код 10002.",
+                ret_code=10002,
+            ),
+            DemoApiError(
+                "Bybit Demo API отклонил запрос, код 10002.",
+                ret_code=10002,
+            ),
+        ]
+    )
+    client = BybitDemoTradingClient(transport)
+
+    with pytest.raises(DemoApiError) as error_info:
+        client.position_mode("ETHUSDT")
+
+    assert error_info.value.ret_code == 10002
+    assert len(transport.calls) == 2
+
+
+def test_position_mode_does_not_retry_other_demo_errors() -> None:
+    transport = SequenceDemoTransport(
+        [
+            DemoApiError(
+                "Bybit Demo API отклонил запрос, код 10006.",
+                ret_code=10006,
+            ),
+        ]
+    )
+    client = BybitDemoTradingClient(transport)
+
+    with pytest.raises(DemoApiError) as error_info:
+        client.position_mode("ETHUSDT")
+
+    assert error_info.value.ret_code == 10006
+    assert len(transport.calls) == 1
+
+
+def test_create_market_order_never_inherits_position_mode_retry() -> None:
+    transport = SequenceDemoTransport(
+        [
+            DemoApiError(
+                "Bybit Demo API отклонил запрос, код 10002.",
+                ret_code=10002,
+            ),
+        ]
+    )
+    client = BybitDemoTradingClient(transport)
+
+    with pytest.raises(DemoApiError) as error_info:
+        client.create_market_order(
+            symbol="ETHUSDT",
+            side="Buy",
+            qty=1.0,
+            order_link_id="QTRM-reliability-test",
+        )
+
+    assert error_info.value.ret_code == 10002
+    assert len(transport.calls) == 1
+    assert transport.calls[0][1] == "/v5/order/create"
+
+
+def test_position_mode_retry_rebuilds_authenticated_timestamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_timestamps: list[str] = []
+    payloads = iter(
+        (
+            {
+                "retCode": 10002,
+                "retMsg": "request time exceeds the time window range",
+            },
+            {
+                "retCode": 0,
+                "result": {
+                    "list": [
+                        {
+                            "positionIdx": 0,
+                        }
+                    ]
+                },
+            },
+        )
+    )
+    clock_values = iter((1000.000, 1000.250))
+
+    class FakeHttpResponse:
+        def __init__(self, payload: dict[str, Any]) -> None:
+            self._payload = payload
+
+        def __enter__(self) -> FakeHttpResponse:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def read(self) -> bytes:
+            return json.dumps(self._payload).encode("utf-8")
+
+    def fake_urlopen(request: Any, timeout: float) -> FakeHttpResponse:
+        del timeout
+        headers = {
+            key.lower(): value
+            for key, value in request.header_items()
+        }
+        captured_timestamps.append(headers["x-bapi-timestamp"])
+        return FakeHttpResponse(next(payloads))
+
+    monkeypatch.setattr(
+        "market_signal_assistant.qtr_micro.client.time.time",
+        lambda: next(clock_values),
+    )
+    monkeypatch.setattr(
+        "market_signal_assistant.qtr_micro.client.urllib.request.urlopen",
+        fake_urlopen,
+    )
+
+    client = BybitDemoTradingClient(
+        UrllibBybitDemoTransport(
+            "demo-key",
+            "demo-secret",
+        )
+    )
+
+    assert client.position_mode("ETHUSDT") == "ONE_WAY"
+    assert captured_timestamps == ["1000000", "1000250"]
+
+
+def test_runtime_logs_exact_position_mode_failure_stage(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = FakeClient()
+    runtime = QtrMicroRuntime(
+        settings=settings(),
+        client=client,
+        state_store=JsonQtrMicroStateStore(tmp_path / "state.json"),
+        allowed_chat_ids=frozenset(),
+        clock=lambda: NOW,
+        decision_audit=JsonlQtrMicroDecisionAudit(
+            tmp_path / "decisions.jsonl"
+        ),
+        runtime_audit=JsonlQtrMicroRuntimeAudit(
+            tmp_path / "runtime.jsonl"
+        ),
+    )
+    item = candidate(
+        episode="reliability-10002",
+        input_changes={"symbol": "ETHUSDT"},
+    )
+
+    async def exercise() -> None:
+        assert (await runtime.initialize()).ready is True
+
+        def fail_position_mode(symbol: str) -> str:
+            assert symbol == "ETHUSDT"
+            raise DemoApiError(
+                "Bybit Demo API отклонил запрос, код 10002.",
+                ret_code=10002,
+            )
+
+        client.position_mode = fail_position_mode  # type: ignore[method-assign]
+
+        await runtime.handle_candidates(
+            (item,),
+            _discard_message,
+        )
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(exercise())
+
+    assert client.orders == []
+    assert "ETHUSDT" in caplog.text
+    assert "stage=position_mode" in caplog.text
+    assert "ret_code=10002" in caplog.text
