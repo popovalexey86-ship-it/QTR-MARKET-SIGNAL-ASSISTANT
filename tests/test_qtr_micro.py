@@ -942,7 +942,7 @@ def test_runtime_entry_notification_is_routed_only_to_trader(
     async def exercise() -> None:
         assert (await runtime.initialize()).ready
         routed = _micro_candidate_handler(runtime.handle_candidates, trader_send)
-        await routed((candidate(),), scanner_send)
+        await routed((candidate(),), scanner_send, None)
 
     asyncio.run(exercise())
     assert scanner_messages == []
@@ -1002,6 +1002,57 @@ def test_runtime_skips_stock_and_prelaunch_without_order(
     assert audit_row["skip_detail"] == (
         "Инструмент не входит в торговую вселенную QTR Micro."
     )
+
+
+def test_runtime_publishes_exact_shadow_context_before_submission(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    client.auto_fill = True
+    published: list[tuple[str, QtrSetupCandidate, Any, datetime]] = []
+
+    def publish(
+        cycle_id: str,
+        item: QtrSetupCandidate,
+        context: Any,
+        captured_at: datetime,
+    ) -> None:
+        assert client.orders == []
+        published.append((cycle_id, item, context, captured_at))
+
+    runtime = QtrMicroRuntime(
+        settings=settings(),
+        client=client,
+        state_store=JsonQtrMicroStateStore(tmp_path / "state.json"),
+        allowed_chat_ids=frozenset(),
+        clock=lambda: NOW,
+        decision_audit=JsonlQtrMicroDecisionAudit(
+            tmp_path / "decisions.jsonl"
+        ),
+        runtime_audit=JsonlQtrMicroRuntimeAudit(tmp_path / "runtime.jsonl"),
+        distance_shadow_context_publisher=publish,
+    )
+    item = candidate()
+
+    async def exercise() -> None:
+        assert (await runtime.initialize()).ready
+        await runtime.handle_candidates(
+            (item,), _discard_message, "cycle-observation-1"
+        )
+
+    asyncio.run(exercise())
+
+    assert len(published) == 1
+    cycle_id, published_item, context, captured_at = published[0]
+    assert cycle_id == "cycle-observation-1"
+    assert published_item == item
+    assert context.now == NOW
+    assert context.equity == 10_000
+    assert context.rules.symbol == item.result.symbol
+    assert context.state.positions == {}
+    assert context.preflight.ready is True
+    assert captured_at == NOW
+    assert len(client.orders) == 1
 
 
 def test_ready_trade_eligible_creates_market_candidate_with_base_risk() -> None:
