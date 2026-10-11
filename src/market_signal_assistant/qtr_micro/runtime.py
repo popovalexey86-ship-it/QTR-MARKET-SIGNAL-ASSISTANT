@@ -6,7 +6,10 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
-from market_signal_assistant.qtr_micro.client import DemoTradingClient
+from market_signal_assistant.qtr_micro.client import (
+    DemoApiError,
+    DemoTradingClient,
+)
 from market_signal_assistant.qtr_micro.engine import QtrMicroEntryEngine
 from market_signal_assistant.qtr_micro.execution import (
     JOURNAL_RECOVERY_BLOCK,
@@ -347,6 +350,7 @@ class QtrMicroRuntime:
                     for item in state.positions.values()
                 ):
                     continue
+                stage = "position_mode"
                 try:
                     position_mode = await asyncio.to_thread(
                         self._client.position_mode, candidate.result.symbol
@@ -359,9 +363,12 @@ class QtrMicroRuntime:
                             position_mode,
                         )
                         continue
+                    stage = "instrument_rules"
                     rules = await asyncio.to_thread(
                         self._client.instrument_rules, candidate.result.symbol
                     )
+
+                    stage = "prepare_entry"
                     decision = self._engine.prepare_entry(
                         candidate,
                         now=now,
@@ -398,6 +405,7 @@ class QtrMicroRuntime:
                         decision.plan,
                         now,
                     )
+                    stage = "fresh_price"
                     fresh_price = await asyncio.to_thread(
                         self._client.current_market_price,
                         candidate.result.symbol,
@@ -408,6 +416,7 @@ class QtrMicroRuntime:
                         now,
                         detail=f"price={fresh_price:.12g}",
                     )
+                    stage = "revalidation"
                     revalidated = self._engine.revalidate_entry(
                         candidate,
                         decision.plan,
@@ -451,6 +460,7 @@ class QtrMicroRuntime:
                             f"fees_r_pct={revalidated.plan.estimated_fees_r_pct:.4f}"
                         ),
                     )
+                    stage = "submit_entry"
                     confirmed = await asyncio.to_thread(
                         self._execution.submit_and_confirm_entry,
                         revalidated.plan,
@@ -471,9 +481,17 @@ class QtrMicroRuntime:
                                 format_micro_entry(_plan_from_position(confirmed)),
                             )
                 except Exception as error:
+                    ret_code = (
+                        error.ret_code
+                        if isinstance(error, DemoApiError)
+                        else None
+                    )
                     _LOGGER.warning(
-                        "QTR Micro entry пропущен для %s (%s): %s.",
+                        "QTR Micro entry пропущен для %s: "
+                        "stage=%s ret_code=%s error=%s: %s.",
                         candidate.result.symbol,
+                        stage,
+                        ret_code if ret_code is not None else "n/a",
                         type(error).__name__,
                         str(error),
                     )

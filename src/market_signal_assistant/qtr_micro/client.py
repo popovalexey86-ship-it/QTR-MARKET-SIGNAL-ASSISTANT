@@ -221,9 +221,22 @@ class BybitDemoTradingClient:
         return "UNKNOWN"
 
     def position_mode(self, symbol: str) -> str:
-        payload = self._request(
-            "GET", "/v5/position/list", {"category": "linear", "symbol": symbol}
-        )
+        params = {"category": "linear", "symbol": symbol}
+        try:
+            payload = self._request(
+                "GET",
+                "/v5/position/list",
+                params,
+            )
+        except DemoApiError as error:
+            if error.ret_code != 10002:
+                raise
+            payload = self._request(
+                "GET",
+                "/v5/position/list",
+                params,
+            )
+
         rows = _result_list(payload)
         if not rows:
             raise DemoApiError("Position mode не подтверждён Demo API.")
