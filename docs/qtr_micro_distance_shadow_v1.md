@@ -77,5 +77,20 @@ produce `EXPERIMENT_INVALID`. The dispatcher's operational counter must be
 supplied to `summarize_distance_shadow(invalid_observations=...)` for the final
 prospective verdict.
 
+After all validity and count gates pass, a Shadow threshold produces
+`DISTANCE_INCREASES_ELIGIBILITY` only when it improves the episode eligibility
+rate by at least 10 percentage points and improves eligible unique episodes by
+at least 5 versus the `0.25` control. Both conditions are required. Otherwise,
+the category is `NO_MATERIAL_FUNNEL_CHANGE`. This category makes a threshold
+only a candidate for QTR AI review; it never recommends or applies a production
+threshold change.
+
+The prospective 72-hour sample is valid only for one uninterrupted Shadow
+collection run. If `qtr-scanner-telegram` restarts after sample start, the
+sample must be stopped and restarted or treated as invalid because
+`invalid_observations` is process-local and must not be assumed to survive a
+restart. Operational deployment verification must record `NRestarts` at
+sample start and during the sample; the required delta is zero.
+
 Starting any prospective sample, selecting an evidence path, or enabling the
 opt-in integration requires a separate QTR AI authorization and review.

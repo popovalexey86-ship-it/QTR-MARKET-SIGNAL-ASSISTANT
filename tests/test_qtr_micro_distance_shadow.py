@@ -19,6 +19,7 @@ from market_signal_assistant.qtr_micro.distance_shadow import (
     QtrMicroDistanceShadowObserver,
     QualifiedScannerSnapshot,
     ShadowStatus,
+    _meets_review_threshold,
     summarize_distance_shadow,
 )
 from market_signal_assistant.qtr_micro.engine import QtrMicroEntryEngine
@@ -326,7 +327,7 @@ def test_episode_aggregation_caps_success_but_keeps_snapshot_statistics(
     assert shadow["eligible_unique_episodes"] == 2
     assert shadow["delta_eligible_episodes_vs_control"] == 1
     assert shadow["delta_episode_rate_pp_vs_control"] == 50.0
-    assert report["category"] == ExperimentCategory.DISTANCE_INCREASES_ELIGIBILITY
+    assert report["category"] == ExperimentCategory.NO_MATERIAL_FUNNEL_CHANGE
     assert report["sample_gate"] == {
         "minimum_valid_snapshots": 3,
         "minimum_unique_episodes": 2,
@@ -335,6 +336,13 @@ def test_episode_aggregation_caps_success_but_keeps_snapshot_statistics(
         "invalid_observations_must_equal": 0,
         "invalid_observations_requirement_met": True,
     }
+
+
+def test_verdict_threshold_requires_both_approved_deltas() -> None:
+    assert _meets_review_threshold(9.99, 5) is False
+    assert _meets_review_threshold(10.0, 4) is False
+    assert _meets_review_threshold(10.0, 5) is True
+    assert _meets_review_threshold(9.999999999999998, 5) is True
 
 
 def test_sample_gate_requires_snapshots_episodes_and_zero_invalid_observations(

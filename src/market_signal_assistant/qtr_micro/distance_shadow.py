@@ -36,6 +36,8 @@ EXPERIMENT_NAME = "qtr_micro_distance_funnel_v1"
 EXPERIMENT_VERSION = 2
 CONTROL_THRESHOLD = 0.25
 DISTANCE_THRESHOLDS = (CONTROL_THRESHOLD, 0.40, 0.60)
+MINIMUM_REVIEW_DELTA_EPISODE_RATE_PP = 10.0
+MINIMUM_REVIEW_DELTA_ELIGIBLE_EPISODES = 5
 DEFAULT_DISTANCE_SHADOW_EVIDENCE_PATH = (
     Path(__file__).resolve().parents[3]
     / "data"
@@ -65,6 +67,27 @@ class ExperimentCategory(StrEnum):
     DISTANCE_INCREASES_ELIGIBILITY = "DISTANCE_INCREASES_ELIGIBILITY"
     INCONCLUSIVE_SAMPLE = "INCONCLUSIVE_SAMPLE"
     EXPERIMENT_INVALID = "EXPERIMENT_INVALID"
+
+
+def _meets_review_threshold(
+    delta_episode_rate_pp_vs_control: float,
+    delta_eligible_episodes_vs_control: int,
+) -> bool:
+    rate_threshold_met = (
+        delta_episode_rate_pp_vs_control
+        >= MINIMUM_REVIEW_DELTA_EPISODE_RATE_PP
+        or math.isclose(
+            delta_episode_rate_pp_vs_control,
+            MINIMUM_REVIEW_DELTA_EPISODE_RATE_PP,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+    )
+    return (
+        rate_threshold_met
+        and delta_eligible_episodes_vs_control
+        >= MINIMUM_REVIEW_DELTA_ELIGIBLE_EPISODES
+    )
 
 
 class FreshPriceReader(Protocol):
@@ -804,7 +827,13 @@ def summarize_distance_shadow(
         category = ExperimentCategory.EXPERIMENT_INVALID
     elif not snapshots_met or not episodes_met:
         category = ExperimentCategory.INCONCLUSIVE_SAMPLE
-    elif any(row["delta_eligible_episodes_vs_control"] > 0 for row in rows[1:]):
+    elif any(
+        _meets_review_threshold(
+            row["delta_episode_rate_pp_vs_control"],
+            row["delta_eligible_episodes_vs_control"],
+        )
+        for row in rows[1:]
+    ):
         category = ExperimentCategory.DISTANCE_INCREASES_ELIGIBILITY
     else:
         category = ExperimentCategory.NO_MATERIAL_FUNNEL_CHANGE
