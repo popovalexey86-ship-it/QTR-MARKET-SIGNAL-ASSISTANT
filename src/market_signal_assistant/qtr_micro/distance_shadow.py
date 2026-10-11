@@ -736,7 +736,9 @@ class DistanceShadowDispatcher:
 def summarize_distance_shadow(
     path: Path,
     *,
+    minimum_conclusive_snapshots: int = 100,
     minimum_conclusive_episodes: int = 30,
+    invalid_observations: int = 0,
 ) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     invalid = 0
@@ -795,9 +797,12 @@ def summarize_distance_shadow(
         )
         for record in records
     )
-    if invalid or evidence_missing:
+    snapshots_met = len(records) >= minimum_conclusive_snapshots
+    episodes_met = len(episodes) >= minimum_conclusive_episodes
+    invalid_observations_requirement_met = invalid_observations == 0
+    if invalid or evidence_missing or not invalid_observations_requirement_met:
         category = ExperimentCategory.EXPERIMENT_INVALID
-    elif len(episodes) < minimum_conclusive_episodes:
+    elif not snapshots_met or not episodes_met:
         category = ExperimentCategory.INCONCLUSIVE_SAMPLE
     elif any(row["delta_eligible_episodes_vs_control"] > 0 for row in rows[1:]):
         category = ExperimentCategory.DISTANCE_INCREASES_ELIGIBILITY
@@ -821,7 +826,18 @@ def summarize_distance_shadow(
         "valid_records": len(records),
         "invalid_records": invalid,
         "evidence_missing_records": evidence_missing,
+        "invalid_observations": invalid_observations,
         "unique_episodes": len(episodes),
+        "sample_gate": {
+            "minimum_valid_snapshots": minimum_conclusive_snapshots,
+            "minimum_unique_episodes": minimum_conclusive_episodes,
+            "valid_snapshots_met": snapshots_met,
+            "unique_episodes_met": episodes_met,
+            "invalid_observations_must_equal": 0,
+            "invalid_observations_requirement_met": (
+                invalid_observations_requirement_met
+            ),
+        },
         "thresholds": rows,
         "temporal_evidence": {
             "qualification_to_quote_request_ms": _distribution(

@@ -4,13 +4,16 @@
 
 This component compares the existing Micro entry-distance gate at `0.25 ATR`
 with read-only shadow gates at `0.40 ATR` and `0.60 ATR`. It is deliberately
-not connected to the Scanner loop, Micro runtime, Telegram routing, systemd, or
-deployment configuration. Prospective collection therefore cannot start as a
-side effect of this change.
+integrated through opt-in hooks in the existing Scanner, Micro runtime, and
+Telegram process. `QTR_MICRO_DISTANCE_SHADOW_ENABLED` defaults to `False`;
+when disabled, no prospective collection occurs. There is no separate service
+or systemd component. Enabling prospective collection requires separate
+authorization.
 
 Production `QtrMicroSettings.max_entry_distance_atr` remains `0.25`. The
 observer rejects construction if its production settings snapshot is not
-exactly `0.25`.
+exactly `0.25`, and the integration does not change production Micro
+semantics.
 
 ## Observation contract
 
@@ -61,6 +64,18 @@ control and emits only these interpretation categories:
 - `INCONCLUSIVE_SAMPLE`
 - `EXPERIMENT_INVALID`
 
-The default minimum for a conclusive label is 30 unique episodes. Starting any
-prospective sample, selecting an evidence path, or wiring the observer into the
-running process requires a separate QTR AI authorization and review.
+A final verdict requires at least 100 valid A+ snapshots and at least 30 unique
+episodes, collected within a maximum operational window of 72 hours. The
+72-hour limit is operational rather than code-enforced because the existing
+component has no causal experiment-start timestamp. Before both count
+requirements are met, the category is `INCONCLUSIVE_SAMPLE`.
+
+The final operational sample is valid only when `invalid_observations == 0`,
+unless a future separately approved criterion states otherwise. Invalid
+records, evidence-missing records, or nonzero operational invalid observations
+produce `EXPERIMENT_INVALID`. The dispatcher's operational counter must be
+supplied to `summarize_distance_shadow(invalid_observations=...)` for the final
+prospective verdict.
+
+Starting any prospective sample, selecting an evidence path, or enabling the
+opt-in integration requires a separate QTR AI authorization and review.

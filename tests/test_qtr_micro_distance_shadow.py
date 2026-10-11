@@ -312,7 +312,11 @@ def test_episode_aggregation_caps_success_but_keeps_snapshot_statistics(
     _observe(path, snapshot=_snapshot(episode="episode-a", distance=0.20), price=101.0)
     _observe(path, snapshot=_snapshot(episode="episode-b", distance=0.35))
 
-    report = summarize_distance_shadow(path, minimum_conclusive_episodes=2)
+    report = summarize_distance_shadow(
+        path,
+        minimum_conclusive_snapshots=3,
+        minimum_conclusive_episodes=2,
+    )
     control = report["thresholds"][0]
     shadow = report["thresholds"][1]
     assert control["eligible_unique_episodes"] == 1
@@ -323,14 +327,62 @@ def test_episode_aggregation_caps_success_but_keeps_snapshot_statistics(
     assert shadow["delta_eligible_episodes_vs_control"] == 1
     assert shadow["delta_episode_rate_pp_vs_control"] == 50.0
     assert report["category"] == ExperimentCategory.DISTANCE_INCREASES_ELIGIBILITY
+    assert report["sample_gate"] == {
+        "minimum_valid_snapshots": 3,
+        "minimum_unique_episodes": 2,
+        "valid_snapshots_met": True,
+        "unique_episodes_met": True,
+        "invalid_observations_must_equal": 0,
+        "invalid_observations_requirement_met": True,
+    }
+
+
+def test_sample_gate_requires_snapshots_episodes_and_zero_invalid_observations(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "evidence.jsonl"
+    _observe(path, snapshot=_snapshot(episode="episode-a", distance=0.20))
+    _observe(path, snapshot=_snapshot(episode="episode-a", distance=0.20))
+    _observe(path, snapshot=_snapshot(episode="episode-b", distance=0.35))
+
+    snapshots_short = summarize_distance_shadow(
+        path,
+        minimum_conclusive_snapshots=4,
+        minimum_conclusive_episodes=2,
+    )
+    assert snapshots_short["category"] == ExperimentCategory.INCONCLUSIVE_SAMPLE
+    assert snapshots_short["sample_gate"]["valid_snapshots_met"] is False
+    assert snapshots_short["sample_gate"]["unique_episodes_met"] is True
+
+    episodes_short = summarize_distance_shadow(
+        path,
+        minimum_conclusive_snapshots=3,
+        minimum_conclusive_episodes=3,
+    )
+    assert episodes_short["category"] == ExperimentCategory.INCONCLUSIVE_SAMPLE
+    assert episodes_short["sample_gate"]["valid_snapshots_met"] is True
+    assert episodes_short["sample_gate"]["unique_episodes_met"] is False
+
+    invalid = summarize_distance_shadow(
+        path,
+        minimum_conclusive_snapshots=3,
+        minimum_conclusive_episodes=2,
+        invalid_observations=1,
+    )
+    assert invalid["category"] == ExperimentCategory.EXPERIMENT_INVALID
+    assert invalid["invalid_observations"] == 1
+    assert (
+        invalid["sample_gate"]["invalid_observations_requirement_met"] is False
+    )
 
 
 def test_inconclusive_and_invalid_report_categories(tmp_path: Path) -> None:
     path = tmp_path / "evidence.jsonl"
     _observe(path)
-    assert summarize_distance_shadow(path)["category"] == (
-        ExperimentCategory.INCONCLUSIVE_SAMPLE
-    )
+    report = summarize_distance_shadow(path)
+    assert report["category"] == ExperimentCategory.INCONCLUSIVE_SAMPLE
+    assert report["sample_gate"]["minimum_valid_snapshots"] == 100
+    assert report["sample_gate"]["minimum_unique_episodes"] == 30
     with path.open("a", encoding="utf-8") as stream:
         stream.write("not-json\n")
     assert summarize_distance_shadow(path)["category"] == (
