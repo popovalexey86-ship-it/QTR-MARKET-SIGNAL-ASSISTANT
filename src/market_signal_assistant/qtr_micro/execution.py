@@ -268,6 +268,7 @@ class QtrMicroExecutionService:
             detail=f"actual={actual_risk:.8f}; allowed={allowed_risk:.8f}",
         )
         effective_qty = fill.filled_qty
+        confirmed_resize_fill: ExecutionFill | None = None
         if actual_risk > allowed_risk:
             safe_qty = (
                 _round_down(allowed_risk / filled_r, rules.qty_step)
@@ -296,6 +297,7 @@ class QtrMicroExecutionService:
                 )
                 if resize_fill is not None and resize_fill.filled_qty >= resize_qty:
                     effective_qty = safe_qty
+                    confirmed_resize_fill = resize_fill
                     self._audit(
                         QtrMicroRuntimeEvent.ACTUAL_RISK_RESIZE,
                         position,
@@ -416,6 +418,21 @@ class QtrMicroExecutionService:
                 fill.average_price + sign * self._settings.runner_initial_r * filled_r
             ),
         )
+        filled_position = replace(
+            filled_position,
+            max_favorable_price=_favorable(filled_position, fill.average_price),
+            max_adverse_price=_adverse(filled_position, fill.average_price),
+        )
+        if confirmed_resize_fill is not None:
+            filled_position = replace(
+                filled_position,
+                max_favorable_price=_favorable(
+                    filled_position, confirmed_resize_fill.average_price
+                ),
+                max_adverse_price=_adverse(
+                    filled_position, confirmed_resize_fill.average_price
+                ),
+            )
         stop_installed = False
         for _ in range(STOP_INSTALL_ATTEMPTS):
             try:
@@ -512,14 +529,15 @@ class QtrMicroExecutionService:
         setup_cancelled: bool = False,
         opposite_structure: bool = False,
         structure_degraded: bool = False,
+        setup_state_at_exit: str | None = None,
+        current_breakout_failure: bool | None = None,
+        setup_context_available: bool = True,
     ) -> ManagementDecision:
         timestamp = _utc(now)
         state = self._state_store.load(
             today=timestamp.date(), trading_enabled=self._settings.enabled
         )
         position = state.positions[trade_id]
-        if position.pending_exit_order_id is not None:
-            return self._confirm_exit(state, position, timestamp)
         observed = replace(
             position,
             max_favorable_price=_favorable(position, current_price),
@@ -534,6 +552,8 @@ class QtrMicroExecutionService:
                 positions={**state.positions, trade_id: observed},
             )
             position = observed
+        if position.pending_exit_order_id is not None:
+            return self._confirm_exit(state, position, timestamp)
         decision = self._engine.manage(
             position,
             current_price=current_price,
@@ -547,6 +567,27 @@ class QtrMicroExecutionService:
         acknowledgement = self._reduce(position, decision.close_qty, decision.action)
         pending = replace(
             position,
+            exit_detail=decision.exit_detail,
+            exit_trigger=decision.action.value,
+            position_age_seconds=(
+                (timestamp - position.opened_at).total_seconds()
+                if position.opened_at is not None else None
+            ),
+            current_r_at_exit_decision=(
+                (1 if position.direction is MicroDirection.LONG else -1)
+                * (current_price - position.average_fill) / position.initial_r
+                if position.average_fill is not None and position.initial_r > 0
+                else None
+            ),
+            structure_degraded=(
+                structure_degraded if setup_context_available else None
+            ),
+            setup_cancelled=(setup_cancelled if setup_context_available else None),
+            opposite_structure=(
+                opposite_structure if setup_context_available else None
+            ),
+            current_breakout_failure=current_breakout_failure,
+            setup_state_at_exit=setup_state_at_exit,
             pending_exit_order_id=acknowledgement.order_id,
             pending_exit_order_link_id=acknowledgement.order_link_id,
             pending_exit_reason=decision.action,
@@ -803,6 +844,9 @@ class QtrMicroExecutionService:
                         blocked_reason=JOURNAL_RECOVERY_BLOCK,
                     )
                     continue
+                position = _observe_exit_fill(position, fill, reason)
+                records[trade_id] = position
+                changed = True
                 if self._write_journal(
                     position,
                     fill,
@@ -866,6 +910,7 @@ class QtrMicroExecutionService:
         closed_qty = min(fill.filled_qty, position.current_qty)
         remaining = max(0.0, position.current_qty - closed_qty)
         reason = position.pending_exit_reason
+        position = _observe_exit_fill(position, fill, reason)
         gross = _realised_pnl(position, fill, closed_qty)
         current_stop = position.current_stop
         stop_update_failed = False
@@ -983,6 +1028,9 @@ class QtrMicroExecutionService:
     ) -> bool:
         if self._journal is None or position.average_fill is None:
             return False
+        # All confirmed-fill paths, including durable recovery, share this guard.
+        position = _observe_exit_fill(position, fill, reason)
+        assert position.average_fill is not None
         opened_at = position.opened_at or position.signal_at
         submitted_at = position.order_submitted_at or position.signal_at
         total_gross = position.realised_partial_pnl
@@ -1026,6 +1074,20 @@ class QtrMicroExecutionService:
                 realised_gross_pnl=total_gross,
                 realised_net_pnl=total_net,
                 result_r=result_r,
+                setup_state_at_entry=position.setup_state_at_entry,
+                classification_candidates=position.classification_candidates,
+                exit_detail=position.exit_detail,
+                exit_trigger=position.exit_trigger,
+                position_age_seconds=position.position_age_seconds,
+                current_r_at_exit_decision=position.current_r_at_exit_decision,
+                structure_degraded=position.structure_degraded,
+                setup_cancelled=position.setup_cancelled,
+                opposite_structure=position.opposite_structure,
+                current_breakout_failure=position.current_breakout_failure,
+                setup_state_at_exit=position.setup_state_at_exit,
+                exit_setup_state=position.setup_state_at_exit,
+                exit_structure_degraded=position.structure_degraded,
+                exit_current_r=position.current_r_at_exit_decision,
                 max_favorable_excursion=_excursion(position, favorable=True),
                 max_adverse_excursion=_excursion(position, favorable=False),
                 hold_duration_seconds=max(
@@ -1173,6 +1235,8 @@ def _position_from_plan(plan: EntryPlan, now: datetime) -> MicroPosition:
         pre_submit_price=plan.pre_submit_price,
         planned_notional=plan.notional,
         scanner_level=plan.scanner_level,
+        setup_state_at_entry=plan.setup_state_at_entry,
+        classification_candidates=plan.classification_candidates,
     )
 
 
@@ -1186,22 +1250,50 @@ def _next_stage(reason: MicroExitReason, remaining: float) -> MicroStage:
     return MicroStage.CLOSED
 
 
+def _observe_exit_fill(
+    position: MicroPosition, fill: ExecutionFill, reason: MicroExitReason,
+) -> MicroPosition:
+    # A later stop/manual close must not inherit a prior partial-exit decision.
+    if position.exit_trigger != reason.value:
+        position = replace(
+            position,
+            exit_detail=None,
+            exit_trigger=None,
+            position_age_seconds=None,
+            current_r_at_exit_decision=None,
+            structure_degraded=None,
+            setup_cancelled=None,
+            opposite_structure=None,
+            current_breakout_failure=None,
+            setup_state_at_exit=None,
+        )
+    return replace(
+        position,
+        max_favorable_price=_favorable(position, fill.average_price),
+        max_adverse_price=_adverse(position, fill.average_price),
+    )
+
+
 def _favorable(position: MicroPosition, price: float) -> float:
-    previous = position.max_favorable_price
-    if previous is None:
-        return price
+    prices = [price]
+    if position.max_favorable_price is not None:
+        prices.append(position.max_favorable_price)
+    if position.average_fill is not None:
+        prices.append(position.average_fill)
     if position.direction is MicroDirection.LONG:
-        return max(previous, price)
-    return min(previous, price)
+        return max(prices)
+    return min(prices)
 
 
 def _adverse(position: MicroPosition, price: float) -> float:
-    previous = position.max_adverse_price
-    if previous is None:
-        return price
+    prices = [price]
+    if position.max_adverse_price is not None:
+        prices.append(position.max_adverse_price)
+    if position.average_fill is not None:
+        prices.append(position.average_fill)
     if position.direction is MicroDirection.LONG:
-        return min(previous, price)
-    return max(previous, price)
+        return min(prices)
+    return max(prices)
 
 
 def _realised_pnl(

@@ -118,6 +118,8 @@ class EntryPlan:
     estimated_round_trip_fees: float = 0.0
     estimated_fees_r_pct: float = 0.0
     scanner_level: float | None = None
+    setup_state_at_entry: str | None = None
+    classification_candidates: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,6 +258,17 @@ class MicroPosition:
     journaled: bool = False
     scanner_level: float | None = None
     final_exit_reason: MicroExitReason | None = None
+    setup_state_at_entry: str | None = None
+    classification_candidates: tuple[str, ...] | None = None
+    exit_detail: str | None = None
+    exit_trigger: str | None = None
+    position_age_seconds: float | None = None
+    current_r_at_exit_decision: float | None = None
+    structure_degraded: bool | None = None
+    setup_cancelled: bool | None = None
+    opposite_structure: bool | None = None
+    current_breakout_failure: bool | None = None
+    setup_state_at_exit: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

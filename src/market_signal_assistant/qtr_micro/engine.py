@@ -34,6 +34,7 @@ class ManagementDecision:
     action: MicroExitReason | None
     close_qty: float
     new_stop: float | None = None
+    exit_detail: str | None = None
 
 
 class QtrMicroEntryEngine:
@@ -281,18 +282,25 @@ class QtrMicroEntryEngine:
         r_value = _r_value(position, current_price)
         if age >= timedelta(minutes=self._settings.runner_max_hold_minutes):
             return ManagementDecision(
-                MicroExitReason.RUNNER_TIME_EXIT, position.current_qty
+                MicroExitReason.RUNNER_TIME_EXIT, position.current_qty,
+                exit_detail="RUNNER_MAX_HOLD",
             )
         if age >= timedelta(
             minutes=self._settings.normal_max_hold_minutes
         ) and position.stage not in {MicroStage.TP2_FILLED, MicroStage.RUNNER}:
-            return ManagementDecision(MicroExitReason.TIME_EXIT, position.current_qty)
+            return ManagementDecision(
+                MicroExitReason.TIME_EXIT, position.current_qty,
+                exit_detail="NORMAL_MAX_HOLD",
+            )
         if (
             age >= timedelta(minutes=self._settings.progress_check_minutes)
             and r_value < 0.5
             and structure_degraded
         ):
-            return ManagementDecision(MicroExitReason.TIME_EXIT, position.current_qty)
+            return ManagementDecision(
+                MicroExitReason.TIME_EXIT, position.current_qty,
+                exit_detail="EARLY_PROGRESS_STRUCTURE_DEGRADED",
+            )
         if position.stage is MicroStage.OPEN and r_value >= self._settings.tp1_r:
             return ManagementDecision(
                 MicroExitReason.TP1,
