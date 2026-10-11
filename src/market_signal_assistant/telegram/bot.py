@@ -24,6 +24,7 @@ from market_signal_assistant.qtr_micro.runtime import (
 from market_signal_assistant.qtr_micro.settings import QtrMicroSettings
 from market_signal_assistant.qtr_setup_pilot.models import QtrSetupCandidate
 from market_signal_assistant.settings import (
+    DistanceRelaxationShadowSettings,
     EarlyDiscoverySettings,
     EarlyDiscoveryV2Settings,
     EntryReadinessShadowSettings,
@@ -239,6 +240,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     early_discovery_v2_settings = EarlyDiscoveryV2Settings.from_environment()
     qtr_setup_settings = QtrSetupTelegramSettings.from_environment()
     entry_readiness_settings = EntryReadinessShadowSettings.from_environment()
+    distance_shadow_settings = (
+        DistanceRelaxationShadowSettings.from_environment()
+    )
     qtr_micro_settings = QtrMicroSettings.from_environment()
     trader_transport: TraderTelegramTransport | None = None
     trader_settings = TraderTelegramSettings()
@@ -279,6 +283,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     trader_controller: QtrTraderTelegramController | None = None
     entry_readiness_observer: QtrSetupShadowObserver | None = None
     entry_readiness_busy_observer: QtrSetupShadowObserver | None = None
+    distance_shadow_dispatcher: Any | None = None
     effective_qtr_setup_settings = QtrSetupTelegramSettings(
         enabled=qtr_setup_settings.enabled or qtr_micro_settings.enabled,
         minimum_quality=qtr_setup_settings.minimum_quality,
@@ -348,6 +353,36 @@ def main(argv: Sequence[str] | None = None) -> None:
                         base_url=qtr_micro_settings.base_url,
                     )
                 )
+            if distance_shadow_settings.enabled and demo_client is not None:
+                try:
+                    from market_signal_assistant.qtr_micro.distance_shadow import (
+                        CallableFreshPriceReader,
+                        DistanceShadowDispatcher,
+                        JsonlDistanceShadowEvidence,
+                        QtrMicroDistanceShadowObserver,
+                    )
+
+                    shadow_quote_client = BybitDemoTradingClient(
+                        UrllibBybitDemoTransport(
+                            qtr_micro_settings.api_key,
+                            qtr_micro_settings.api_secret,
+                            base_url=qtr_micro_settings.base_url,
+                        )
+                    )
+                    distance_shadow_dispatcher = DistanceShadowDispatcher(
+                        QtrMicroDistanceShadowObserver(
+                            production_settings=qtr_micro_settings,
+                            price_reader=CallableFreshPriceReader(
+                                shadow_quote_client.current_market_price
+                            ),
+                            evidence=JsonlDistanceShadowEvidence(),
+                        )
+                    )
+                except Exception as error:
+                    _LOGGER.warning(
+                        "QTR distance Shadow disabled after setup failure (%s).",
+                        type(error).__name__,
+                    )
             qtr_micro_runtime = QtrMicroRuntime(
                 settings=qtr_micro_settings,
                 client=demo_client,
@@ -356,6 +391,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                     trader_settings.allowed_chat_ids
                     if trader_settings.configured
                     else frozenset()
+                ),
+                distance_shadow_context_publisher=(
+                    distance_shadow_dispatcher.capture_context
+                    if distance_shadow_dispatcher is not None
+                    else None
                 ),
             )
             if trader_transport is not None and trader_settings.configured:
@@ -401,11 +441,16 @@ def main(argv: Sequence[str] | None = None) -> None:
             ),
             shadow_observer=entry_readiness_observer,
             shadow_busy_observer=entry_readiness_busy_observer,
+            qualified_shadow_dispatcher=distance_shadow_dispatcher,
         )
     elif entry_readiness_settings.enabled:
         _LOGGER.warning(
             "QTR Entry Readiness shadow hook не запущен: "
             "QTR Setup candidate flow отключён."
+        )
+    if distance_shadow_settings.enabled and distance_shadow_dispatcher is None:
+        _LOGGER.warning(
+            "QTR distance Shadow не запущен: Demo Micro context недоступен."
         )
     news_service = build_news_service(news_settings)
     news_notification_service = build_news_notification_service(news_settings)
@@ -508,10 +553,12 @@ def _micro_candidate_handler(
     trader_send: QtrSetupSender,
 ) -> QtrSetupCandidateHandler:
     async def route(
-        candidates: tuple[QtrSetupCandidate, ...], scanner_send: QtrSetupSender
+        candidates: tuple[QtrSetupCandidate, ...],
+        scanner_send: QtrSetupSender,
+        production_cycle_id: str | None,
     ) -> None:
         del scanner_send
-        await handle_candidates(candidates, trader_send)
+        await handle_candidates(candidates, trader_send, production_cycle_id)
 
     return route
 
