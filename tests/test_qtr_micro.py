@@ -194,7 +194,11 @@ class ManagementExecutionSpy:
         setup_cancelled: bool = False,
         opposite_structure: bool = False,
         structure_degraded: bool = False,
+        setup_state_at_exit: str | None = None,
+        current_breakout_failure: bool | None = None,
+        setup_context_available: bool = True,
     ) -> ManagementDecision:
+        del setup_state_at_exit, current_breakout_failure, setup_context_available
         assert trade_id == self._position.trade_id
         self.flags.append(
             (setup_cancelled, opposite_structure, structure_degraded)

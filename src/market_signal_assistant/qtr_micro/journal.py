@@ -23,6 +23,11 @@ _LOGGER = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class TradeJournalEntry:
+    """Legacy result_r uses planned risk; net_r uses actual fill risk.
+
+    realised_net_r_actual is net realised PnL / positive actual_risk_at_fill.
+    Unknown funding is not estimated or subtracted from the realised PnL.
+    """
     trade_id: str
     setup_episode: str
     symbol: str
@@ -69,6 +74,27 @@ class TradeJournalEntry:
     pre_submit_price: float | None = None
     signal_to_submit_slippage: float | None = None
     submit_to_fill_slippage: float | None = None
+    setup_state_at_entry: str | None = None
+    classification_candidates: tuple[str, ...] | None = None
+    exit_detail: str | None = None
+    exit_trigger: str | None = None
+    position_age_seconds: float | None = None
+    current_r_at_exit_decision: float | None = None
+    structure_degraded: bool | None = None
+    setup_cancelled: bool | None = None
+    opposite_structure: bool | None = None
+    current_breakout_failure: bool | None = None
+    setup_state_at_exit: str | None = None
+    exit_setup_state: str | None = None
+    exit_structure_degraded: bool | None = None
+    exit_current_r: float | None = None
+
+    @property
+    def realised_net_r_actual(self) -> float | None:
+        """Explicit serialization alias of net_r for a positive actual risk."""
+        if self.actual_risk_at_fill is not None and self.actual_risk_at_fill > 0:
+            return self.net_r
+        return None
 
 
 class JsonlQtrMicroTradeJournal:
@@ -104,6 +130,7 @@ class JsonlQtrMicroTradeJournal:
 
     def append_once(self, entry: TradeJournalEntry) -> bool:
         payload = asdict(entry)
+        payload["realised_net_r_actual"] = entry.realised_net_r_actual
         payload["direction"] = entry.direction.value
         for field in (
             "entry_signal_timestamp",

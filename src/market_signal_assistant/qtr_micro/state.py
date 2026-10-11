@@ -248,6 +248,20 @@ def _position_from_json(raw: dict[str, Any]) -> MicroPosition:
         exit_fees=float(raw.get("exit_fees", 0.0)),
         funding=(float(raw["funding"]) if raw.get("funding") is not None else None),
         journaled=bool(raw.get("journaled", False)),
+        setup_state_at_entry=raw.get("setup_state_at_entry"),
+        classification_candidates=(
+            tuple(str(item) for item in raw["classification_candidates"])
+            if raw.get("classification_candidates") is not None else None
+        ),
+        exit_detail=raw.get("exit_detail"),
+        exit_trigger=raw.get("exit_trigger"),
+        position_age_seconds=raw.get("position_age_seconds"),
+        current_r_at_exit_decision=raw.get("current_r_at_exit_decision"),
+        structure_degraded=raw.get("structure_degraded"),
+        setup_cancelled=raw.get("setup_cancelled"),
+        opposite_structure=raw.get("opposite_structure"),
+        current_breakout_failure=raw.get("current_breakout_failure"),
+        setup_state_at_exit=raw.get("setup_state_at_exit"),
         scanner_level=(
             float(raw["scanner_level"])
             if raw.get("scanner_level") is not None

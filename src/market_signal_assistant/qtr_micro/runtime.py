@@ -463,7 +463,14 @@ class QtrMicroRuntime:
                     stage = "submit_entry"
                     confirmed = await asyncio.to_thread(
                         self._execution.submit_and_confirm_entry,
-                        revalidated.plan,
+                        replace(
+                            revalidated.plan,
+                            setup_state_at_entry=candidate.result.setup_state.value,
+                            classification_candidates=tuple(
+                                item.value
+                                for item in candidate.result.classification_candidates
+                            ),
+                        ),
                         now,
                         rules,
                     )
@@ -589,6 +596,15 @@ class QtrMicroRuntime:
                 setup_cancelled=management_flags.setup_cancelled,
                 opposite_structure=management_flags.opposite_structure,
                 structure_degraded=management_flags.structure_degraded,
+                setup_state_at_exit=(
+                    candidate.result.setup_state.value if candidate is not None
+                    else None
+                ),
+                current_breakout_failure=(
+                    candidate.result.current_breakout_failure
+                    if candidate is not None else None
+                ),
+                setup_context_available=candidate is not None,
             )
             if decision.action is not None and self._position_event_handler is not None:
                 refreshed = self._state_store.load(
