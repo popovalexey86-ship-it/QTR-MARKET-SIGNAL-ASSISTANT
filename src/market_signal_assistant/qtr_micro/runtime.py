@@ -192,6 +192,10 @@ class QtrMicroRuntime:
         )
         self._lock = asyncio.Lock()
 
+    def shadow_preflight_snapshot(self) -> PreflightResult:
+        """Immutable factual value only; never runs preflight or reads/repairs state."""
+        return replace(self._preflight_result)
+
     @property
     def status(self) -> QtrMicroRuntimeStatus:
         now = self._clock()

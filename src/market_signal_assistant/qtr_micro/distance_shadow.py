@@ -8,13 +8,20 @@ import math
 import os
 import threading
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import suppress
 from copy import deepcopy
 from dataclasses import asdict, dataclass, fields, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum, StrEnum
 from pathlib import Path
 from typing import Any, Protocol, cast
+from uuid import uuid4
 
+from market_signal_assistant.qtr_micro.distance_shadow_accounting import (
+    ShadowAccounting,
+    drain_thread_task,
+    read_shadow_accounting,
+)
 from market_signal_assistant.qtr_micro.engine import QtrMicroEntryEngine
 from market_signal_assistant.qtr_micro.models import (
     EntryDecision,
@@ -33,15 +40,13 @@ from market_signal_assistant.qtr_setup_pilot.notifications import (
 )
 
 EXPERIMENT_NAME = "qtr_micro_distance_funnel_v1"
-EXPERIMENT_VERSION = 2
+EXPERIMENT_VERSION = 3
 CONTROL_THRESHOLD = 0.25
 DISTANCE_THRESHOLDS = (CONTROL_THRESHOLD, 0.40, 0.60)
 MINIMUM_REVIEW_DELTA_EPISODE_RATE_PP = 10.0
 MINIMUM_REVIEW_DELTA_ELIGIBLE_EPISODES = 5
 DEFAULT_DISTANCE_SHADOW_EVIDENCE_PATH = (
-    Path(__file__).resolve().parents[3]
-    / "data"
-    / "qtr_micro_distance_shadow_v1.jsonl"
+    Path(__file__).resolve().parents[3] / "data" / "qtr_micro_distance_shadow_v2"
 )
 _QUALIFIED_REASONS = frozenset(
     {
@@ -74,8 +79,7 @@ def _meets_review_threshold(
     delta_eligible_episodes_vs_control: int,
 ) -> bool:
     rate_threshold_met = (
-        delta_episode_rate_pp_vs_control
-        >= MINIMUM_REVIEW_DELTA_EPISODE_RATE_PP
+        delta_episode_rate_pp_vs_control >= MINIMUM_REVIEW_DELTA_EPISODE_RATE_PP
         or math.isclose(
             delta_episode_rate_pp_vs_control,
             MINIMUM_REVIEW_DELTA_EPISODE_RATE_PP,
@@ -85,8 +89,7 @@ def _meets_review_threshold(
     )
     return (
         rate_threshold_met
-        and delta_eligible_episodes_vs_control
-        >= MINIMUM_REVIEW_DELTA_ELIGIBLE_EPISODES
+        and delta_eligible_episodes_vs_control >= MINIMUM_REVIEW_DELTA_ELIGIBLE_EPISODES
     )
 
 
@@ -160,6 +163,7 @@ class TemporalEvidence:
     worker_started_at: datetime
     production_cycle_id: str
     context_captured_at: datetime | None
+    context_source: str = "PUBLISHED_RUNTIME_CONTEXT"
 
     def __post_init__(self) -> None:
         for value in (
@@ -179,20 +183,44 @@ class TemporalEvidence:
             raise ValueError("Production completion precedes Shadow enqueue.")
         if self.worker_started_at < self.production_handler_completed_at:
             raise ValueError("Shadow worker precedes production completion.")
-        if (
-            self.context_captured_at is not None
-            and self.context_captured_at > self.production_handler_completed_at
-        ):
-            raise ValueError("Runtime context was captured after cycle completion.")
+        if self.context_source not in {
+            "PUBLISHED_RUNTIME_CONTEXT",
+            "SHADOW_READ_ONLY_FALLBACK",
+        }:
+            raise ValueError("Unknown Shadow context source.")
+        if self.context_captured_at is not None:
+            if self.context_source == "PUBLISHED_RUNTIME_CONTEXT":
+                if self.context_captured_at > self.production_handler_completed_at:
+                    raise ValueError(
+                        "Runtime context was captured after cycle completion."
+                    )
+            elif self.context_captured_at < self.worker_started_at:
+                raise ValueError("Fallback context precedes the Shadow worker.")
 
 
 class JsonlDistanceShadowEvidence:
     """Append-only evidence sink; it has no access to factual Micro state."""
 
-    def __init__(
-        self, path: Path = DEFAULT_DISTANCE_SHADOW_EVIDENCE_PATH
-    ) -> None:
-        self._path = path.resolve()
+    def __init__(self, path: Path | None = None, *, run_id: str | None = None) -> None:
+        self.run_id = run_id or uuid4().hex
+        self._path = (
+            path
+            if path is not None
+            else DEFAULT_DISTANCE_SHADOW_EVIDENCE_PATH / f"{self.run_id}.jsonl"
+        ).resolve()
+        if self._path.name == "qtr_micro_distance_shadow_v1.jsonl":
+            raise ValueError("The invalid V1 evidence path is immutable.")
+        if self._path.exists() and self._path.stat().st_size:
+            first = json.loads(self._path.read_bytes().splitlines()[0])
+            if (
+                run_id is None
+                or first.get("experiment_run_id") != run_id
+                or first.get("schema_version") != EXPERIMENT_VERSION
+            ):
+                raise ValueError("A new Shadow run requires a fresh evidence path.")
+        if self._path.with_suffix(".accounting.seal.json").exists():
+            raise ValueError("A sealed Shadow run cannot be reopened.")
+        self._sealed = False
         self._lock = threading.Lock()
 
     @property
@@ -205,12 +233,36 @@ class JsonlDistanceShadowEvidence:
             record, sort_keys=True, ensure_ascii=False, separators=(",", ":")
         )
         with self._lock:
+            if self._sealed:
+                raise ValueError("Shadow evidence is sealed.")
             self._path.parent.mkdir(parents=True, exist_ok=True)
             _ensure_line_boundary(self._path)
             with self._path.open("a", encoding="utf-8", newline="\n") as stream:
                 stream.write(payload + "\n")
                 stream.flush()
                 os.fsync(stream.fileno())
+
+    def finalized_snapshot(self) -> tuple[int, str]:
+        with self._lock:
+            self._sealed = True
+            raw = self._path.read_bytes() if self._path.exists() else b""
+            if raw and not raw.endswith(b"\n"):
+                raise ValueError("Incomplete Shadow evidence cannot be sealed.")
+            records = [json.loads(line) for line in raw.splitlines() if line.strip()]
+            identities = set()
+            for record in records:
+                _validate_record(record)
+                identity = _observation_key(record)
+                if identity in identities:
+                    raise ValueError("Duplicate Shadow observation identity.")
+                identities.add(identity)
+                if record["experiment_run_id"] != self.run_id:
+                    raise ValueError("Mixed evidence runs cannot be sealed.")
+            return len(records), hashlib.sha256(raw).hexdigest()
+
+
+class ShadowEvidenceJournalFailure(RuntimeError):
+    """Writing or serializing Shadow evidence failed; never a production failure."""
 
 
 class QtrMicroDistanceShadowObserver:
@@ -232,6 +284,17 @@ class QtrMicroDistanceShadowObserver:
         self._price_reader = price_reader
         self._evidence = evidence
         self._clock = clock
+
+    @property
+    def run_id(self) -> str:
+        return self._evidence.run_id
+
+    @property
+    def accounting_path(self) -> Path:
+        return self._evidence.path.with_suffix(".accounting.jsonl")
+
+    def finalized_evidence_snapshot(self) -> tuple[int, str]:
+        return self._evidence.finalized_snapshot()
 
     def observe(
         self,
@@ -264,9 +327,7 @@ class QtrMicroDistanceShadowObserver:
         context_digest = _context_digest(context)
         initial: list[tuple[float, QtrMicroSettings, EntryDecision]] = []
         for threshold in DISTANCE_THRESHOLDS:
-            branch_settings = replace(
-                self._settings, max_entry_distance_atr=threshold
-            )
+            branch_settings = replace(self._settings, max_entry_distance_atr=threshold)
             initial.append(
                 (
                     threshold,
@@ -401,6 +462,7 @@ class QtrMicroDistanceShadowObserver:
 
         record: dict[str, Any] = {
             "experiment": EXPERIMENT_NAME,
+            "experiment_run_id": self.run_id,
             "schema_version": EXPERIMENT_VERSION,
             "version": EXPERIMENT_VERSION,
             "candidate_id": candidate_id,
@@ -430,20 +492,27 @@ class QtrMicroDistanceShadowObserver:
             "correct_side_of_level": correct_side,
             "fresh_price_requested_at": _time(requested_at),
             "fresh_price_received_at": _time(received_at),
+            "context_source": temporal.context_source,
+            "production_completed_at": _time(temporal.production_handler_completed_at),
+            "context_acquired_at": (
+                _time(temporal.context_captured_at)
+                if temporal.context_captured_at is not None
+                else None
+            ),
             "qualified_at": _time(temporal.qualified_at),
             "enqueued_at": _time(temporal.enqueued_at),
             "production_handler_completed_at": _time(
                 temporal.production_handler_completed_at
             ),
             "worker_started_at": _time(temporal.worker_started_at),
+            "fresh_quote_at": _time(received_at),
             "quote_requested_at": _time(requested_at),
             "quote_received_at": _time(received_at),
             "queue_delay_ms": _milliseconds(
                 temporal.worker_started_at - temporal.enqueued_at
             ),
             "post_production_delay_ms": _milliseconds(
-                temporal.worker_started_at
-                - temporal.production_handler_completed_at
+                temporal.worker_started_at - temporal.production_handler_completed_at
             ),
             "qualification_to_quote_ms": _milliseconds(
                 requested_at - temporal.qualified_at
@@ -465,8 +534,14 @@ class QtrMicroDistanceShadowObserver:
             "shadow_040": branches[1],
             "shadow_060": branches[2],
         }
-        self._evidence.append(record)
+        self._append_evidence(record)
         return record
+
+    def _append_evidence(self, record: Mapping[str, Any]) -> None:
+        try:
+            self._evidence.append(record)
+        except Exception as error:
+            raise ShadowEvidenceJournalFailure(type(error).__name__) from None
 
     def observe_missing_context(
         self,
@@ -474,6 +549,7 @@ class QtrMicroDistanceShadowObserver:
         *,
         temporal: TemporalEvidence,
         reason: str = "MATCHING_CONTEXT_MISSING",
+        detail: str | None = None,
     ) -> dict[str, Any]:
         """Record a qualified observation without inventing runtime context."""
         candidate = snapshot.decision.candidate
@@ -482,9 +558,7 @@ class QtrMicroDistanceShadowObserver:
         candidate_id = _candidate_id(snapshot)
         branches = []
         for threshold in DISTANCE_THRESHOLDS:
-            branch_settings = replace(
-                self._settings, max_entry_distance_atr=threshold
-            )
+            branch_settings = replace(self._settings, max_entry_distance_atr=threshold)
             branches.append(
                 {
                     "max_distance_atr": threshold,
@@ -499,12 +573,12 @@ class QtrMicroDistanceShadowObserver:
                     "initial": None,
                     "initial_accepted": None,
                     "initial_skip_reason": reason,
-                    "initial_skip_detail": None,
+                    "initial_skip_detail": detail,
                     "revalidation_executed": False,
                     "revalidation": None,
                     "revalidation_accepted": None,
                     "revalidation_skip_reason": reason,
-                    "revalidation_skip_detail": None,
+                    "revalidation_skip_detail": detail,
                     "initial_distance_atr": candidate.result.distance_to_trigger_atr,
                     "fresh_price": None,
                     "fresh_distance_atr": None,
@@ -518,6 +592,7 @@ class QtrMicroDistanceShadowObserver:
             )
         record: dict[str, Any] = {
             "experiment": EXPERIMENT_NAME,
+            "experiment_run_id": self.run_id,
             "schema_version": EXPERIMENT_VERSION,
             "version": EXPERIMENT_VERSION,
             "candidate_id": candidate_id,
@@ -547,24 +622,32 @@ class QtrMicroDistanceShadowObserver:
             "correct_side_of_level": None,
             "fresh_price_requested_at": None,
             "fresh_price_received_at": None,
+            "context_source": temporal.context_source,
+            "production_completed_at": _time(temporal.production_handler_completed_at),
+            "context_acquired_at": (
+                _time(temporal.context_captured_at)
+                if temporal.context_captured_at is not None
+                else None
+            ),
             "qualified_at": _time(temporal.qualified_at),
             "enqueued_at": _time(temporal.enqueued_at),
             "production_handler_completed_at": _time(
                 temporal.production_handler_completed_at
             ),
             "worker_started_at": _time(temporal.worker_started_at),
+            "fresh_quote_at": None,
             "quote_requested_at": None,
             "quote_received_at": None,
             "queue_delay_ms": _milliseconds(
                 temporal.worker_started_at - temporal.enqueued_at
             ),
             "post_production_delay_ms": _milliseconds(
-                temporal.worker_started_at
-                - temporal.production_handler_completed_at
+                temporal.worker_started_at - temporal.production_handler_completed_at
             ),
             "qualification_to_quote_ms": None,
             "quote_latency_ms": None,
             "fresh_price_error": reason,
+            "context_failure_detail": detail,
             "quote_id": None,
             "production_cycle_id": temporal.production_cycle_id,
             "context_captured_at": None,
@@ -576,7 +659,7 @@ class QtrMicroDistanceShadowObserver:
             "shadow_040": branches[1],
             "shadow_060": branches[2],
         }
-        self._evidence.append(record)
+        self._append_evidence(record)
         return record
 
 
@@ -617,6 +700,8 @@ class DistanceShadowDispatcher:
         observer: QtrMicroDistanceShadowObserver,
         *,
         capacity: int = 128,
+        fallback_provider: Callable[[QtrSetupCandidate], FrozenRuntimeContext]
+        | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         if capacity < 1:
@@ -626,17 +711,26 @@ class DistanceShadowDispatcher:
         self._clock = clock
         self._cycles: dict[str, _PendingCycle] = {}
         self._worker: asyncio.Task[None] | None = None
-        self._invalid_observations = 0
+        self._fallback_provider = fallback_provider
+        self.accounting = ShadowAccounting(observer.accounting_path, observer.run_id)
+        self._admission_closed_at: str | None = None
+        self._finalization: asyncio.Task[dict[str, Any]] | None = None
+
+    def set_fallback_provider(
+        self, provider: Callable[[QtrSetupCandidate], FrozenRuntimeContext]
+    ) -> None:
+        self._fallback_provider = provider
 
     @property
     def invalid_observations(self) -> int:
-        return self._invalid_observations
+        return int(self.accounting.snapshot()["invalid_observations"])
 
     def enqueue(
-        self,
-        plan: QtrSetupNotificationPlan,
-        qualified_at: datetime,
+        self, plan: QtrSetupNotificationPlan, qualified_at: datetime
     ) -> str | None:
+        if self._admission_closed_at is not None:
+            _LOGGER.warning("QTR distance Shadow admission closed; outside run cutoff.")
+            return None
         qualified = []
         for decision in plan.decisions:
             try:
@@ -646,29 +740,77 @@ class DistanceShadowDispatcher:
         snapshots = tuple(qualified)
         if not snapshots:
             return None
+        accepted_before = self.accounting.counts["accepted_count"]
+        dropped_before = (
+            self.accounting.counts["queue_dropped_count"]
+            + self.accounting.counts["enqueue_dropped_count"]
+        )
+        try:
+            return self._enqueue(plan, qualified_at, snapshots)
+        except Exception:
+            self.accounting.admission_failed(
+                accepted_before=accepted_before,
+                dropped_before=dropped_before,
+                dropped=len(snapshots),
+            )
+            raise
+
+    def _enqueue(
+        self,
+        plan: QtrSetupNotificationPlan,
+        qualified_at: datetime,
+        snapshots: tuple[QualifiedScannerSnapshot, ...],
+    ) -> str | None:
         if self._queue.qsize() + len(snapshots) > self._queue.maxsize:
-            self._invalid_observations += len(snapshots)
+            self.accounting.change(
+                queue_overflow_count=1, queue_dropped_count=len(snapshots)
+            )
             _LOGGER.warning(
                 "QTR distance Shadow queue full; observations invalidated: %d.",
                 len(snapshots),
             )
             return None
         qualified_at = _utc(qualified_at)
-        cycle_id = "QTRDS-" + _digest(
-            {
-                "scanner_observed_at": plan.observed_at,
-                "qualified_at": qualified_at,
-                "candidate_ids": [_candidate_id(item) for item in snapshots],
-            }
-        )[:24]
+        cycle_id = (
+            "QTRDS-"
+            + _digest(
+                {
+                    "scanner_observed_at": plan.observed_at,
+                    "qualified_at": qualified_at,
+                    "candidate_ids": [_candidate_id(item) for item in snapshots],
+                }
+            )[:24]
+        )
+        loop = asyncio.get_running_loop()
         cycle = _PendingCycle(cycle_id, qualified_at, snapshots)
+        # All fallible clock/identity/preparation work precedes queue mutation.
+        queued = tuple(
+            _QueuedObservation(cycle, snapshot, _utc(self._clock()))
+            for snapshot in snapshots
+        )
+        if cycle_id in self._cycles:
+            raise ValueError("Shadow cycle already has completion ownership.")
+        # Accounting is established before anything becomes consumable. No await
+        # occurs until the caller receives its cycle/completion handle.
+        self.accounting.change(accepted_count=len(snapshots))
         self._cycles[cycle_id] = cycle
-        for snapshot in snapshots:
-            self._queue.put_nowait(
-                _QueuedObservation(cycle, snapshot, _utc(self._clock()))
-            )
-        if self._worker is None or self._worker.done():
-            self._worker = asyncio.create_task(self._run())
+        try:
+            if self._worker is None or self._worker.done():
+                self._worker = loop.create_task(self._run())
+            for item in queued:
+                self._queue.put_nowait(item)
+        except Exception:
+            # Synchronous rollback: preserve other cycles and queue task counts.
+            retained = []
+            while not self._queue.empty():
+                pending = self._queue.get_nowait()
+                self._queue.task_done()
+                if pending.cycle is not cycle:
+                    retained.append(pending)
+            for pending in retained:
+                asyncio.Queue.put_nowait(self._queue, pending)
+            self._cycles.pop(cycle_id, None)
+            raise
         return cycle_id
 
     def capture_context(
@@ -707,7 +849,73 @@ class DistanceShadowDispatcher:
         cycle.completed.set()
 
     async def wait(self) -> None:
-        await self._queue.join()
+        joined = asyncio.create_task(self._queue.join())
+        try:
+            while not joined.done():
+                # No await between checking and replacing: concurrent drainers
+                # share one worker, including after admission has closed.
+                if self._queue.qsize() and (
+                    self._worker is None or self._worker.done()
+                ):
+                    self._worker = asyncio.create_task(self._run())
+                worker = self._worker
+                if worker is None or worker.done():
+                    await joined
+                    break
+                await asyncio.wait(
+                    (joined, worker), return_when=asyncio.FIRST_COMPLETED
+                )
+            await joined
+        finally:
+            if not joined.done():
+                joined.cancel()
+            # Cancelling a drainer must not cancel the shared worker.
+            with suppress(asyncio.CancelledError):
+                await joined
+        await self.accounting.wait()
+
+    async def finalize(self) -> dict[str, Any]:
+        """Close admission, drain every accepted operation, then publish the seal."""
+        if self._finalization is None:
+            self._admission_closed_at = _time(self._clock())
+            self._finalization = asyncio.create_task(self._finish_run())
+        try:
+            return await asyncio.shield(self._finalization)
+        except asyncio.CancelledError:
+            await drain_thread_task(self._finalization)
+            raise
+
+    async def _finish_run(self) -> dict[str, Any]:
+        await self.wait()
+        io = asyncio.create_task(
+            asyncio.to_thread(self._observer.finalized_evidence_snapshot)
+        )
+        try:
+            count, digest = await asyncio.shield(io)
+        except asyncio.CancelledError:
+            await drain_thread_task(io)
+            raise
+        assert self._admission_closed_at is not None
+        return await self.accounting.seal(
+            evidence_record_count=count,
+            evidence_sha256=digest,
+            admission_closed_at=self._admission_closed_at,
+            unique_observation_count=count,
+        )
+
+    async def _thread_call(
+        self, call: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> Any:
+        io = asyncio.create_task(asyncio.to_thread(call, *args, **kwargs))
+        try:
+            return await asyncio.shield(io)
+        except asyncio.CancelledError:
+            try:
+                await drain_thread_task(io)
+            except Exception as error:
+                if isinstance(error, (OSError, ShadowEvidenceJournalFailure)):
+                    self.accounting.change(journal_failure_count=1)
+            raise
 
     async def _run(self) -> None:
         while True:
@@ -717,38 +925,81 @@ class DistanceShadowDispatcher:
                 worker_started_at = _utc(self._clock())
                 completed_at = queued.cycle.completed_at
                 assert completed_at is not None
-                captured = queued.cycle.contexts.get(
-                    _candidate_id(queued.snapshot)
-                )
+                captured = queued.cycle.contexts.get(_candidate_id(queued.snapshot))
+                fallback_error: Exception | None = None
+                source = "PUBLISHED_RUNTIME_CONTEXT"
+                if captured is None and self._fallback_provider is not None:
+                    source = "SHADOW_READ_ONLY_FALLBACK"
+                    try:
+                        context = await self._thread_call(
+                            self._fallback_provider, queued.snapshot.decision.candidate
+                        )
+                        captured = _CapturedContext(
+                            FrozenRuntimeContext.capture(
+                                now=context.now,
+                                equity=context.equity,
+                                rules=context.rules,
+                                state=context.state,
+                                preflight=context.preflight,
+                            ),
+                            _utc(self._clock()),
+                        )
+                    except Exception as error:
+                        fallback_error = error
+                        self.accounting.change(fallback_failure_count=1)
                 temporal = TemporalEvidence(
                     qualified_at=queued.cycle.qualified_at,
                     enqueued_at=queued.enqueued_at,
                     production_handler_completed_at=completed_at,
                     worker_started_at=worker_started_at,
                     production_cycle_id=queued.cycle.cycle_id,
+                    context_source=source,
                     context_captured_at=(
                         captured.captured_at if captured is not None else None
                     ),
                 )
                 if captured is None:
-                    await asyncio.to_thread(
+                    await self._thread_call(
                         self._observer.observe_missing_context,
                         queued.snapshot,
                         temporal=temporal,
+                        reason=(
+                            "CONTEXT_FALLBACK_FAILED"
+                            if fallback_error is not None
+                            else "MATCHING_CONTEXT_MISSING"
+                        ),
+                        detail=(
+                            str(fallback_error)
+                            if type(fallback_error).__name__ == "ContextFallbackFailed"
+                            else type(fallback_error).__name__
+                            if fallback_error is not None
+                            else None
+                        ),
                     )
                 else:
-                    await asyncio.to_thread(
+                    await self._thread_call(
                         self._observer.observe,
                         queued.snapshot,
                         captured.context,
                         temporal=temporal,
                     )
+            except asyncio.CancelledError:
+                self.accounting.change(cancelled_invalid_count=1)
+                raise
             except Exception as error:
-                self._invalid_observations += 1
+                self.accounting.change(
+                    failed_invalid_count=1,
+                    worker_exception_count=1,
+                    journal_failure_count=int(
+                        isinstance(error, (OSError, ShadowEvidenceJournalFailure))
+                    ),
+                )
                 _LOGGER.warning(
                     "QTR distance Shadow observation failed (%s).",
                     type(error).__name__,
                 )
+            else:
+                self.accounting.change(completed_count=1)
             finally:
                 queued.cycle.remaining -= 1
                 if queued.cycle.remaining == 0:
@@ -761,12 +1012,13 @@ def summarize_distance_shadow(
     *,
     minimum_conclusive_snapshots: int = 100,
     minimum_conclusive_episodes: int = 30,
-    invalid_observations: int = 0,
+    invalid_observations: int | None = None,
 ) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     invalid = 0
+    raw = path.read_bytes() if path.exists() else b""
     if path.exists():
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line in raw.decode("utf-8").splitlines():
             if not line.strip():
                 continue
             try:
@@ -775,12 +1027,69 @@ def summarize_distance_shadow(
                 records.append(record)
             except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                 invalid += 1
-    episodes = {record["episode_id"] for record in records}
+    raw_record_count = len(records)
+    unique = {_observation_key(record): record for record in records}
+    duplicate_records = len(records) - len(unique)
+    records = list(unique.values())
+    runs = {record.get("experiment_run_id") for record in records}
+    mixed_runs = len(runs) > 1
+    supplied_invalid_observations = invalid_observations
+    invalid_observations = None
+    finalized = False
+    if len(runs) == 1 and None not in runs:
+        try:
+            checkpoint = read_shadow_accounting(
+                path.with_suffix(".accounting.jsonl"), run_id=str(next(iter(runs)))
+            )
+            if (
+                checkpoint["completed_count"] != raw_record_count + invalid
+                or checkpoint["evidence_record_count"] != raw_record_count + invalid
+                or duplicate_records
+                or checkpoint["unique_observation_count"] != len(records)
+                or checkpoint["evidence_sha256"] != hashlib.sha256(raw).hexdigest()
+            ):
+                raise ValueError("Sealed accounting does not match evidence.")
+            created = datetime.fromisoformat(checkpoint["run_created_at"])
+            cutoff = datetime.fromisoformat(checkpoint["admission_closed_at"])
+            finalized_at = datetime.fromisoformat(checkpoint["finalized_at"])
+            for record in records:
+                if (
+                    not created
+                    <= datetime.fromisoformat(record["qualified_at"])
+                    <= cutoff
+                ):
+                    raise ValueError("Observation falls outside Shadow admission.")
+                for key in (
+                    "production_completed_at",
+                    "worker_started_at",
+                    "context_acquired_at",
+                    "fresh_quote_at",
+                ):
+                    if (
+                        record[key] is not None
+                        and datetime.fromisoformat(record[key]) > finalized_at
+                    ):
+                        raise ValueError("Observation outlives finalization.")
+            invalid_observations = checkpoint["invalid_observations"]
+            if (
+                supplied_invalid_observations is not None
+                and supplied_invalid_observations != invalid_observations
+            ):
+                raise ValueError("Supplied accounting differs from final seal.")
+            finalized = True
+        except (OSError, KeyError, TypeError, ValueError):
+            invalid_observations = (
+                supplied_invalid_observations
+                if supplied_invalid_observations is not None
+                and supplied_invalid_observations > 0
+                else None
+            )
+    episodes = {_episode_key(record) for record in records}
     rows = []
     control_count = 0
     for threshold in DISTANCE_THRESHOLDS:
         eligible_episodes = {
-            record["episode_id"]
+            _episode_key(record)
             for record in records
             if _branch(record, threshold)["final_status"]
             == ShadowStatus.PRE_SUBMIT_ELIGIBLE.value
@@ -823,7 +1132,13 @@ def summarize_distance_shadow(
     snapshots_met = len(records) >= minimum_conclusive_snapshots
     episodes_met = len(episodes) >= minimum_conclusive_episodes
     invalid_observations_requirement_met = invalid_observations == 0
-    if invalid or evidence_missing or not invalid_observations_requirement_met:
+    if (
+        not finalized
+        or mixed_runs
+        or invalid
+        or evidence_missing
+        or not invalid_observations_requirement_met
+    ):
         category = ExperimentCategory.EXPERIMENT_INVALID
     elif not snapshots_met or not episodes_met:
         category = ExperimentCategory.INCONCLUSIVE_SAMPLE
@@ -852,11 +1167,18 @@ def summarize_distance_shadow(
     ]
     return {
         "category": category.value,
+        "finalized": finalized,
+        "mixed_experiment_runs": mixed_runs,
         "valid_records": len(records),
+        "raw_valid_records": raw_record_count,
+        "duplicate_records": duplicate_records,
+        "unique_observations": len(records),
+        "observation_identity": "experiment_run_id,production_cycle_id,candidate_id",
         "invalid_records": invalid,
         "evidence_missing_records": evidence_missing,
         "invalid_observations": invalid_observations,
         "unique_episodes": len(episodes),
+        "episode_aggregation": "experiment_run_id,symbol,raw_episode_id",
         "sample_gate": {
             "minimum_valid_snapshots": minimum_conclusive_snapshots,
             "minimum_unique_episodes": minimum_conclusive_episodes,
@@ -869,12 +1191,8 @@ def summarize_distance_shadow(
         },
         "thresholds": rows,
         "temporal_evidence": {
-            "qualification_to_quote_request_ms": _distribution(
-                request_delays
-            ),
-            "qualification_to_quote_received_ms": _distribution(
-                received_delays
-            ),
+            "qualification_to_quote_request_ms": _distribution(request_delays),
+            "qualification_to_quote_received_ms": _distribution(received_delays),
         },
     }
 
@@ -1100,8 +1418,46 @@ def _branch(record: Mapping[str, Any], threshold: float) -> Mapping[str, Any]:
 
 
 def _validate_record(record: Mapping[str, Any]) -> None:
+    _observation_key(record)
     if record.get("experiment") != EXPERIMENT_NAME:
         raise ValueError("Unexpected experiment name.")
+    if record.get("schema_version") != EXPERIMENT_VERSION:
+        raise ValueError("Evidence version requires a separate historical report.")
+    if not record.get("experiment_run_id"):
+        raise ValueError("Missing Shadow run identity.")
+    if record["production_completed_at"] != record["production_handler_completed_at"]:
+        raise ValueError("Production completion aliases differ.")
+    if record["context_acquired_at"] != record["context_captured_at"]:
+        raise ValueError("Context timestamp aliases differ.")
+    if record["fresh_quote_at"] != record["quote_received_at"]:
+        raise ValueError("Quote timestamp aliases differ.")
+    TemporalEvidence(
+        qualified_at=datetime.fromisoformat(record["qualified_at"]),
+        enqueued_at=datetime.fromisoformat(record["enqueued_at"]),
+        production_handler_completed_at=datetime.fromisoformat(
+            record["production_completed_at"]
+        ),
+        worker_started_at=datetime.fromisoformat(record["worker_started_at"]),
+        production_cycle_id=record["production_cycle_id"],
+        context_captured_at=(
+            datetime.fromisoformat(record["context_acquired_at"])
+            if record["context_acquired_at"] is not None
+            else None
+        ),
+        context_source=record["context_source"],
+    )
+    if record["quote_requested_at"] is not None:
+        request_at = datetime.fromisoformat(record["quote_requested_at"])
+        receive_at = datetime.fromisoformat(record["quote_received_at"])
+        if receive_at < request_at or (
+            record["context_acquired_at"] is not None
+            and request_at < datetime.fromisoformat(record["context_acquired_at"])
+        ):
+            raise ValueError("Quote precedes its context/request.")
+    if len(record["branches"]) != 3:
+        raise ValueError("Expected exactly three branches.")
+    if not record.get("symbol") or record.get("episode_id") in {None, "", "unassigned"}:
+        raise ValueError("Missing symbol-scoped episode identity.")
     branches = [_branch(record, threshold) for threshold in DISTANCE_THRESHOLDS]
     aliases = ("control_025", "shadow_040", "shadow_060")
     if any(
@@ -1116,11 +1472,37 @@ def _validate_record(record: Mapping[str, Any]) -> None:
             raise ValueError("Runtime context differs between branches.")
         if branch["fresh_price"] != record["fresh_price"]:
             raise ValueError("Fresh price differs between branches.")
-        allowed = [] if branch["threshold_atr"] == CONTROL_THRESHOLD else [
-            "max_entry_distance_atr"
-        ]
+        if branch["quote_id"] != record["quote_id"]:
+            raise ValueError("Quote identity differs between branches.")
+        allowed = (
+            []
+            if branch["threshold_atr"] == CONTROL_THRESHOLD
+            else ["max_entry_distance_atr"]
+        )
         if branch["settings_override_fields"] != allowed:
             raise ValueError("Branch settings differ outside the threshold.")
         if branch["final_status"] not in {item.value for item in ShadowStatus}:
             raise ValueError("Invalid shadow status.")
     _assert_no_forbidden_evidence_keys(record)
+
+
+def _observation_key(record: Mapping[str, Any]) -> tuple[str, str, str]:
+    values = tuple(
+        record.get(key)
+        for key in (
+            "experiment_run_id",
+            "production_cycle_id",
+            "candidate_id",
+        )
+    )
+    if any(not isinstance(value, str) or not value for value in values):
+        raise ValueError("Missing Shadow observation identity.")
+    return cast(tuple[str, str, str], values)
+
+
+def _episode_key(record: Mapping[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(record.get("experiment_run_id", "LEGACY")),
+        str(record["symbol"]),
+        str(record["episode_id"]),
+    )

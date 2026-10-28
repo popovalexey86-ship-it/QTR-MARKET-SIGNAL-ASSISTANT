@@ -240,9 +240,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     early_discovery_v2_settings = EarlyDiscoveryV2Settings.from_environment()
     qtr_setup_settings = QtrSetupTelegramSettings.from_environment()
     entry_readiness_settings = EntryReadinessShadowSettings.from_environment()
-    distance_shadow_settings = (
-        DistanceRelaxationShadowSettings.from_environment()
-    )
+    distance_shadow_settings = DistanceRelaxationShadowSettings.from_environment()
     qtr_micro_settings = QtrMicroSettings.from_environment()
     trader_transport: TraderTelegramTransport | None = None
     trader_settings = TraderTelegramSettings()
@@ -332,9 +330,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 entry_readiness_service.evaluate(candidates, observed_at)
 
             entry_readiness_observer = observe_entry_readiness
-            entry_readiness_busy_observer = (
-                entry_readiness_service.record_skipped_busy
-            )
+            entry_readiness_busy_observer = entry_readiness_service.record_skipped_busy
         if qtr_micro_settings.enabled:
             from market_signal_assistant.qtr_micro.client import (
                 BybitDemoTradingClient,
@@ -398,6 +394,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                     else None
                 ),
             )
+            if distance_shadow_dispatcher is not None:
+                distance_shadow_dispatcher = _wire_distance_shadow_fallback(
+                    distance_shadow_dispatcher, qtr_micro_runtime, shadow_quote_client
+                )
             if trader_transport is not None and trader_settings.configured:
                 trader_controller = QtrTraderTelegramController(
                     qtr_micro_runtime,
@@ -407,9 +407,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 qtr_micro_runtime.set_position_event_handler(
                     trader_controller.handle_position_event
                 )
-                trader_transport.set_callback_handler(
-                    trader_controller.handle_callback
-                )
+                trader_transport.set_callback_handler(trader_controller.handle_callback)
         qtr_setup_notifier = QtrSetupPilotNotifier(
             scanner=QtrSetupScanService(v2_service),
             notification_service=QtrSetupNotificationService(
@@ -588,9 +586,7 @@ def _run_sdk_bot_handlers(
 ) -> None:
     resolved_news_auto = news_auto_settings or NewsAutoSettings()
     resolved_timing_audit = timing_audit_settings or InPlayTimingAuditSettings()
-    resolved_early_discovery = (
-        early_discovery_settings or EarlyDiscoverySettings()
-    )
+    resolved_early_discovery = early_discovery_settings or EarlyDiscoverySettings()
     resolved_qtr_setup = qtr_setup_settings or QtrSetupTelegramSettings()
 
     async def handle(update: Any, context: Any) -> None:
@@ -617,9 +613,7 @@ def _run_sdk_bot_handlers(
                 news_scan_interval_minutes=resolved_news_auto.interval_minutes,
                 qtr_setup_telegram_enabled=resolved_qtr_setup.enabled,
                 qtr_micro_status=(
-                    qtr_micro_runtime.status
-                    if qtr_micro_runtime is not None
-                    else None
+                    qtr_micro_runtime.status if qtr_micro_runtime is not None else None
                 ),
             )
             replies = result.messages
@@ -717,8 +711,7 @@ def _run_sdk_bot_handlers(
     lifecycle_enabled = False
     if auto_settings.enabled and not settings.allowed_chat_ids:
         _LOGGER.warning(
-            "Автосканирование IN PLAY не запущено: "
-            "TELEGRAM_ALLOWED_CHAT_IDS не задан."
+            "Автосканирование IN PLAY не запущено: TELEGRAM_ALLOWED_CHAT_IDS не задан."
         )
     elif auto_settings.enabled:
         lifecycle_enabled = True
@@ -732,14 +725,10 @@ def _run_sdk_bot_handlers(
         else:
             lifecycle_enabled = True
     if resolved_news_auto.enabled and not settings.allowed_chat_ids:
-        _LOGGER.warning(
-            "Автоновости не запущены: TELEGRAM_ALLOWED_CHAT_IDS не задан."
-        )
+        _LOGGER.warning("Автоновости не запущены: TELEGRAM_ALLOWED_CHAT_IDS не задан.")
     elif resolved_news_auto.enabled:
         if news_service is None or news_notification_service is None:
-            _LOGGER.warning(
-                "Автоновости не запущены: news service недоступен."
-            )
+            _LOGGER.warning("Автоновости не запущены: news service недоступен.")
         else:
             lifecycle_enabled = True
     if resolved_qtr_setup.enabled and not settings.allowed_chat_ids:
@@ -756,6 +745,35 @@ def _run_sdk_bot_handlers(
     application = builder.build()
     application.add_handler(MessageHandler(filters.COMMAND, handle))
     application.run_polling()
+
+
+def _wire_distance_shadow_fallback(
+    dispatcher: Any,
+    runtime: Any,
+    shadow_client: Any,
+) -> Any:
+    """Optional Shadow setup must never prevent production startup."""
+    try:
+        from market_signal_assistant.qtr_micro.distance_shadow_context import (
+            ReadOnlyShadowContextProvider,
+        )
+        from market_signal_assistant.qtr_micro.state import DEFAULT_QTR_MICRO_STATE_PATH
+
+        dispatcher.set_fallback_provider(
+            ReadOnlyShadowContextProvider(
+                state_path=DEFAULT_QTR_MICRO_STATE_PATH,
+                equity_reader=shadow_client.wallet_equity,
+                rules_reader=shadow_client.instrument_rules,
+                preflight_reader=runtime.shadow_preflight_snapshot,
+            )
+        )
+        return dispatcher
+    except Exception as error:
+        _LOGGER.warning(
+            "QTR distance Shadow unavailable after fallback setup failure (%s).",
+            type(error).__name__,
+        )
+        return None
 
 
 if __name__ == "__main__":
