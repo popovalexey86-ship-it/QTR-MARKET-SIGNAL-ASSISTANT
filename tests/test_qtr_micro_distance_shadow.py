@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -19,8 +20,11 @@ from market_signal_assistant.qtr_micro.distance_shadow import (
     QtrMicroDistanceShadowObserver,
     QualifiedScannerSnapshot,
     ShadowStatus,
+    TemporalEvidence,
     _meets_review_threshold,
-    summarize_distance_shadow,
+)
+from market_signal_assistant.qtr_micro.distance_shadow import (
+    summarize_distance_shadow as _summarize_distance_shadow,
 )
 from market_signal_assistant.qtr_micro.engine import QtrMicroEntryEngine
 from market_signal_assistant.qtr_micro.models import InstrumentRules, PreflightResult
@@ -41,6 +45,30 @@ from market_signal_assistant.setup_engine import (
 
 NOW = datetime(2026, 9, 26, 10, 0, tzinfo=UTC)
 RULES = InstrumentRules("BTCUSDT", 0.001, 0.001, 1000, 5, 100)
+
+
+_DIRECT_ACCOUNTING: dict[Path, Any] = {}
+
+
+def summarize_distance_shadow(path: Path, **kwargs: Any) -> dict[str, Any]:
+    """Direct-observer fixtures explicitly finalize their known synthetic run."""
+    accounting_path = path.with_suffix(".accounting.jsonl")
+    if not accounting_path.with_suffix(".seal.json").exists():
+        raw = path.read_bytes()
+        try:
+            records = [json.loads(line) for line in raw.splitlines() if line.strip()]
+        except ValueError:
+            return _summarize_distance_shadow(path, **kwargs)
+        accounting = _DIRECT_ACCOUNTING[path.resolve()]
+        accounting.change(accepted_count=len(records), completed_count=len(records))
+        asyncio.run(
+            accounting.seal(
+                evidence_record_count=len(records),
+                evidence_sha256=hashlib.sha256(raw).hexdigest(),
+                admission_closed_at=NOW.isoformat(),
+            )
+        )
+    return _summarize_distance_shadow(path, **kwargs)
 
 
 def _settings(**changes: Any) -> QtrMicroSettings:
@@ -164,17 +192,44 @@ def _observe(
     observer = QtrMicroDistanceShadowObserver(
         production_settings=_settings(),
         price_reader=reader,
-        evidence=JsonlDistanceShadowEvidence(path),
+        evidence=JsonlDistanceShadowEvidence(
+            path,
+            run_id=(
+                json.loads(path.read_text(encoding="utf-8").splitlines()[0])[
+                    "experiment_run_id"
+                ]
+                if path.exists()
+                else None
+            ),
+        ),
         clock=Clock(),
     )
-    return observer.observe(snapshot or _snapshot(), _context()), reader
+    if path.resolve() not in _DIRECT_ACCOUNTING:
+        from market_signal_assistant.qtr_micro.distance_shadow_accounting import (
+            ShadowAccounting,
+        )
+
+        _DIRECT_ACCOUNTING[path.resolve()] = ShadowAccounting(
+            observer.accounting_path, observer.run_id
+        )
+    # Direct fixtures model distinct scanner cycles explicitly.
+    count = len(path.read_bytes().splitlines()) if path.exists() else 0
+    temporal = TemporalEvidence(
+        qualified_at=NOW,
+        enqueued_at=NOW,
+        production_handler_completed_at=NOW,
+        worker_started_at=NOW,
+        context_captured_at=NOW,
+        production_cycle_id=f"DIRECT-UNIT-{count + 1}",
+    )
+    return observer.observe(
+        snapshot or _snapshot(), _context(), temporal=temporal
+    ), reader
 
 
 def _branch(record: dict[str, Any], threshold: float) -> dict[str, Any]:
     return next(
-        branch
-        for branch in record["branches"]
-        if branch["threshold_atr"] == threshold
+        branch for branch in record["branches"] if branch["threshold_atr"] == threshold
     )
 
 
@@ -185,7 +240,7 @@ def test_same_candidate_context_quote_and_only_threshold_changes(
 
     assert reader.calls == ["BTCUSDT"]
     assert reader.order_calls == 0
-    assert record["schema_version"] == 2
+    assert record["schema_version"] == 3
     assert record["direction"] == "UP"
     assert record["setup_type"]
     assert record["control_025"] == record["branches"][0]
@@ -201,9 +256,7 @@ def test_same_candidate_context_quote_and_only_threshold_changes(
         record["context_digest"]
     }
     assert {branch["fresh_price"] for branch in record["branches"]} == {101.15}
-    assert {branch["quote_id"] for branch in record["branches"]} == {
-        record["quote_id"]
-    }
+    assert {branch["quote_id"] for branch in record["branches"]} == {record["quote_id"]}
     assert _branch(record, 0.25)["settings_override_fields"] == []
     assert _branch(record, 0.40)["settings_override_fields"] == [
         "max_entry_distance_atr"
@@ -213,8 +266,7 @@ def test_same_candidate_context_quote_and_only_threshold_changes(
     ]
     assert all(branch["correct_side_of_level"] for branch in record["branches"])
     freshness_snapshots = {
-        json.dumps(branch["freshness"], sort_keys=True)
-        for branch in record["branches"]
+        json.dumps(branch["freshness"], sort_keys=True) for branch in record["branches"]
     }
     assert len(freshness_snapshots) == 1
 
@@ -315,6 +367,7 @@ def test_episode_aggregation_caps_success_but_keeps_snapshot_statistics(
 
     report = summarize_distance_shadow(
         path,
+        invalid_observations=0,
         minimum_conclusive_snapshots=3,
         minimum_conclusive_episodes=2,
     )
@@ -355,6 +408,7 @@ def test_sample_gate_requires_snapshots_episodes_and_zero_invalid_observations(
 
     snapshots_short = summarize_distance_shadow(
         path,
+        invalid_observations=0,
         minimum_conclusive_snapshots=4,
         minimum_conclusive_episodes=2,
     )
@@ -364,6 +418,7 @@ def test_sample_gate_requires_snapshots_episodes_and_zero_invalid_observations(
 
     episodes_short = summarize_distance_shadow(
         path,
+        invalid_observations=0,
         minimum_conclusive_snapshots=3,
         minimum_conclusive_episodes=3,
     )
@@ -373,27 +428,25 @@ def test_sample_gate_requires_snapshots_episodes_and_zero_invalid_observations(
 
     invalid = summarize_distance_shadow(
         path,
+        invalid_observations=1,
         minimum_conclusive_snapshots=3,
         minimum_conclusive_episodes=2,
-        invalid_observations=1,
     )
     assert invalid["category"] == ExperimentCategory.EXPERIMENT_INVALID
     assert invalid["invalid_observations"] == 1
-    assert (
-        invalid["sample_gate"]["invalid_observations_requirement_met"] is False
-    )
+    assert invalid["sample_gate"]["invalid_observations_requirement_met"] is False
 
 
 def test_inconclusive_and_invalid_report_categories(tmp_path: Path) -> None:
     path = tmp_path / "evidence.jsonl"
     _observe(path)
-    report = summarize_distance_shadow(path)
+    report = summarize_distance_shadow(path, invalid_observations=0)
     assert report["category"] == ExperimentCategory.INCONCLUSIVE_SAMPLE
     assert report["sample_gate"]["minimum_valid_snapshots"] == 100
     assert report["sample_gate"]["minimum_unique_episodes"] == 30
     with path.open("a", encoding="utf-8") as stream:
         stream.write("not-json\n")
-    assert summarize_distance_shadow(path)["category"] == (
+    assert summarize_distance_shadow(path, invalid_observations=0)["category"] == (
         ExperimentCategory.EXPERIMENT_INVALID
     )
 
@@ -431,9 +484,7 @@ def test_dispatcher_joins_exact_cycle_context_after_production(
     )
     dispatcher = DistanceShadowDispatcher(observer, clock=clock)
     snapshot = _snapshot(should_notify=False)
-    plan = QtrSetupNotificationPlan(
-        NOW, (snapshot.decision,), {}
-    )
+    plan = QtrSetupNotificationPlan(NOW, (snapshot.decision,), {})
 
     async def exercise() -> str:
         cycle_id = dispatcher.enqueue(plan, NOW + timedelta(seconds=1))
@@ -447,22 +498,19 @@ def test_dispatcher_joins_exact_cycle_context_after_production(
         assert not path.exists()
         assert reader.calls == []
         clock.value = NOW + timedelta(seconds=5)
-        dispatcher.production_completed(
-            cycle_id, NOW + timedelta(seconds=3)
-        )
+        dispatcher.production_completed(cycle_id, NOW + timedelta(seconds=3))
         await dispatcher.wait()
         return cycle_id
 
     cycle_id = asyncio.run(exercise())
     record = json.loads(path.read_text(encoding="utf-8"))
     assert record["production_cycle_id"] == cycle_id
-    assert record["context_captured_at"] == (
-        NOW + timedelta(seconds=2)
-    ).isoformat()
+    assert record["context_captured_at"] == (NOW + timedelta(seconds=2)).isoformat()
     assert record["qualified_at"] == (NOW + timedelta(seconds=1)).isoformat()
-    assert record["production_handler_completed_at"] == (
-        NOW + timedelta(seconds=3)
-    ).isoformat()
+    assert (
+        record["production_handler_completed_at"]
+        == (NOW + timedelta(seconds=3)).isoformat()
+    )
     assert record["quote_requested_at"] is not None
     assert record["quote_received_at"] is not None
     assert record["queue_delay_ms"] >= 0
@@ -526,41 +574,39 @@ def test_dispatcher_journal_failure_and_queue_overflow_do_not_propagate(
     async def failed_write() -> None:
         cycle_id = dispatcher.enqueue(plan, NOW)
         assert cycle_id is not None
-        dispatcher.capture_context(
-            cycle_id, first.decision.candidate, _context(), NOW
-        )
+        dispatcher.capture_context(cycle_id, first.decision.candidate, _context(), NOW)
         dispatcher.production_completed(cycle_id, NOW)
         await dispatcher.wait()
 
     asyncio.run(failed_write())
     assert dispatcher.invalid_observations == 1
 
-    overflow = DistanceShadowDispatcher(observer, capacity=1, clock=Clock())
-    second = _snapshot(episode="second")
-    two = QtrSetupNotificationPlan(
-        NOW, (first.decision, second.decision), {}
+    overflow_observer = QtrMicroDistanceShadowObserver(
+        production_settings=_settings(),
+        price_reader=PriceReaderSpy(101.15),
+        evidence=JsonlDistanceShadowEvidence(tmp_path / "overflow.jsonl"),
+        clock=Clock(),
     )
+    overflow = DistanceShadowDispatcher(overflow_observer, capacity=1, clock=Clock())
+    second = _snapshot(episode="second")
+    two = QtrSetupNotificationPlan(NOW, (first.decision, second.decision), {})
     assert overflow.enqueue(two, NOW) is None
     assert overflow.invalid_observations == 2
 
 
-def test_journal_restart_boundary_and_temporal_report(tmp_path: Path) -> None:
+def test_existing_journal_is_not_repaired_or_reused(tmp_path: Path) -> None:
     path = tmp_path / "evidence.jsonl"
     path.write_text('{"partial":true}', encoding="utf-8")
-    _observe(path)
-    lines = path.read_text(encoding="utf-8").splitlines()
-    assert lines[0] == '{"partial":true}'
-    assert len(lines) == 2
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match="fresh evidence path"):
+        JsonlDistanceShadowEvidence(path)
+    assert path.read_bytes() == before
 
-    report = summarize_distance_shadow(path)
-    assert report["invalid_records"] == 1
-    request = report["temporal_evidence"][
-        "qualification_to_quote_request_ms"
-    ]
-    received = report["temporal_evidence"][
-        "qualification_to_quote_received_ms"
-    ]
+    path = tmp_path / "fresh.jsonl"
+    _observe(path)
+    report = summarize_distance_shadow(path, invalid_observations=0)
+    request = report["temporal_evidence"]["qualification_to_quote_request_ms"]
+    received = report["temporal_evidence"]["qualification_to_quote_received_ms"]
     assert request["count"] == 1
-    assert received["count"] == 1
     assert request["p50"] == request["p95"] == request["max"]
     assert received["p50"] == received["p95"] == received["max"]
