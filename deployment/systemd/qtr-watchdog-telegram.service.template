@@ -3,7 +3,7 @@ Description=QTR Watchdog Telegram evidence projector (isolated)
 After=network-online.target
 Wants=network-online.target
 ConditionPathIsDirectory=__WATCHDOG_DATA_ROOT__
-ConditionPathIsFile=__WATCHDOG_DATA_ROOT__/events/events.jsonl
+ConditionPathIsRegularFile=__WATCHDOG_DATA_ROOT__/events/events.jsonl
 
 [Service]
 Type=exec
