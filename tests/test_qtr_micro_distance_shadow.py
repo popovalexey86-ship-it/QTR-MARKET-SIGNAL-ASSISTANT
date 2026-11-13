@@ -603,6 +603,53 @@ def test_dispatcher_journal_failure_and_queue_overflow_do_not_propagate(
     assert overflow.invalid_observations == 2
 
 
+
+def test_dispatcher_close_drains_queue_and_cancels_idle_worker(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "shutdown-evidence.jsonl"
+    observer = QtrMicroDistanceShadowObserver(
+        production_settings=_settings(),
+        price_reader=PriceReaderSpy(101.15),
+        evidence=JsonlDistanceShadowEvidence(path),
+        clock=Clock(),
+    )
+    dispatcher = DistanceShadowDispatcher(observer, clock=Clock())
+    snapshot = _snapshot(episode="shutdown")
+    plan = QtrSetupNotificationPlan(NOW, (snapshot.decision,), {})
+
+    async def exercise() -> None:
+        cycle_id = dispatcher.enqueue(plan, NOW)
+        assert cycle_id is not None
+
+        dispatcher.capture_context(
+            cycle_id,
+            snapshot.decision.candidate,
+            _context(),
+            NOW,
+        )
+        dispatcher.production_completed(cycle_id, NOW)
+
+        await dispatcher.wait()
+
+        worker = dispatcher._worker  # noqa: SLF001
+        assert worker is not None
+        assert worker.done() is False
+
+        await dispatcher.close()
+
+        assert dispatcher._worker is None  # noqa: SLF001
+        assert worker.done() is True
+
+        # Shutdown must be idempotent.
+        await dispatcher.close()
+
+    asyncio.run(exercise())
+
+    assert path.exists()
+    assert len(path.read_text(encoding="utf-8").splitlines()) == 1
+
+
 def test_journal_restart_boundary_and_temporal_report(tmp_path: Path) -> None:
     path = tmp_path / "evidence.jsonl"
     path.write_text('{"partial":true}', encoding="utf-8")

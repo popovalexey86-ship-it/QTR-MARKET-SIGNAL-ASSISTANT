@@ -64,6 +64,7 @@ from market_signal_assistant.telegram.bot import (
     execute_command,
 )
 from market_signal_assistant.telegram.qtr_setup_pilot import (
+    QtrSetupPilotLoop,
     QtrSetupPilotNotifier,
     format_qtr_setup_event,
     select_qtr_setup_decisions,
@@ -555,6 +556,66 @@ def test_readiness_shadow_hook_is_off_without_observer(tmp_path: Path) -> None:
     asyncio.run(run())
 
     assert len(sent) == 1
+
+
+
+def test_qtr_setup_loop_stop_closes_qualified_shadow_dispatcher(
+    tmp_path: Path,
+) -> None:
+    class Dispatcher:
+        def __init__(self) -> None:
+            self.wait_calls = 0
+            self.close_calls = 0
+
+        def enqueue(
+            self,
+            plan: QtrSetupNotificationPlan,
+            qualified_at: datetime,
+        ) -> str | None:
+            del plan, qualified_at
+            return None
+
+        def production_completed(
+            self,
+            production_cycle_id: str | None,
+            completed_at: datetime,
+        ) -> None:
+            del production_cycle_id, completed_at
+
+        async def wait(self) -> None:
+            self.wait_calls += 1
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    class Scanner:
+        def scan(self) -> tuple[QtrSetupCandidate, ...]:
+            return ()
+
+    dispatcher = Dispatcher()
+    notifier = QtrSetupPilotNotifier(
+        scanner=Scanner(),
+        notification_service=service(tmp_path),
+        audit_store=JsonlQtrSetupTelegramAuditStore(tmp_path / "shutdown-audit.jsonl"),
+        allowed_chat_ids=frozenset((1,)),
+        clock=lambda: NOW,
+        qualified_shadow_dispatcher=dispatcher,
+    )
+
+    async def send(chat_id: int, text: str) -> None:
+        del chat_id, text
+
+    loop = QtrSetupPilotLoop(
+        notifier,
+        send,
+        interval_seconds=300,
+    )
+
+    # stop() must clean up Shadow even when the periodic task is already absent.
+    asyncio.run(loop.stop())
+
+    assert dispatcher.wait_calls == 1
+    assert dispatcher.close_calls == 1
 
 
 def test_readiness_shadow_hook_is_audit_side_effect_only(tmp_path: Path) -> None:

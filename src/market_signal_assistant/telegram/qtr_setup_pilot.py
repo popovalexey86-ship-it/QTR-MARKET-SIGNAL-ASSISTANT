@@ -52,6 +52,8 @@ class QtrSetupQualifiedShadowDispatcher(Protocol):
 
     async def wait(self) -> None: ...
 
+    async def close(self) -> None: ...
+
 
 class QtrSetupPilotNotifier:
     def __init__(
@@ -221,7 +223,7 @@ class QtrSetupPilotNotifier:
             )
 
     async def wait_for_shadow_observer(self) -> None:
-        """Wait for the optional side effect during tests and graceful shutdown."""
+        """Wait for optional Shadow side effects without stopping the dispatcher."""
         task = self._shadow_task
         if task is not None:
             with contextlib.suppress(asyncio.CancelledError):
@@ -232,6 +234,13 @@ class QtrSetupPilotNotifier:
         dispatcher = self._qualified_shadow_dispatcher
         if dispatcher is not None:
             await dispatcher.wait()
+
+    async def close_shadow_observer(self) -> None:
+        """Flush Shadow work and stop its background dispatcher."""
+        await self.wait_for_shadow_observer()
+        dispatcher = self._qualified_shadow_dispatcher
+        if dispatcher is not None:
+            await dispatcher.close()
 
     def _write_audit(
         self,
@@ -276,13 +285,20 @@ class QtrSetupPilotLoop:
 
     async def stop(self) -> None:
         task = self._task
-        if task is None:
-            return
         self._task = None
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-        await self._notifier.wait_for_shadow_observer()
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        close_shadow_observer = getattr(
+            self._notifier,
+            "close_shadow_observer",
+            None,
+        )
+        if close_shadow_observer is not None:
+            await close_shadow_observer()
+        else:
+            await self._notifier.wait_for_shadow_observer()
 
     async def _run(self) -> None:
         while True:

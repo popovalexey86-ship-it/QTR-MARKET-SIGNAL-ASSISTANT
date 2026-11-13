@@ -743,6 +743,19 @@ class DistanceShadowDispatcher:
     async def wait(self) -> None:
         await self._queue.join()
 
+    async def close(self) -> None:
+        """Drain queued observations and stop the idle worker cleanly."""
+        await self._queue.join()
+        worker = self._worker
+        if worker is None:
+            return
+        self._worker = None
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
+
     async def _run(self) -> None:
         while True:
             queued = await self._queue.get()
