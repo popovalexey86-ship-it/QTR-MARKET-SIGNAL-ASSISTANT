@@ -304,6 +304,80 @@ class QtrMicroRuntime:
                 )
             return snapshot
 
+    async def _publish_blocked_distance_shadow_context(
+        self,
+        candidates: tuple[QtrSetupCandidate, ...],
+        production_cycle_id: str | None,
+    ) -> None:
+        """Publish factual read-only context while Micro execution is fail-closed.
+
+        This path never reconciles state, prepares an entry, or submits an order.
+        The Shadow observer may normalize operational execution gates internally,
+        while the captured context remains the factual production state.
+        """
+        publisher = self._distance_shadow_context_publisher
+        if (
+            publisher is None
+            or production_cycle_id is None
+            or self._client is None
+        ):
+            return
+
+        now = self._clock()
+        state = self._state_store.load(
+            today=now.date(),
+            trading_enabled=self._settings.enabled,
+        )
+
+        # Only bypass an execution preflight when there is an explicit local
+        # fail-closed state. Remote/API preflight failures remain evidence-missing.
+        if (
+            state.blocked_reason is None
+            or self._preflight_result.reason != state.blocked_reason
+        ):
+            return
+
+        try:
+            equity = await asyncio.to_thread(self._client.wallet_equity)
+        except Exception as error:
+            _LOGGER.warning(
+                "QTR distance Shadow blocked-context equity load failed (%s).",
+                type(error).__name__,
+            )
+            return
+
+        for candidate in candidates:
+            try:
+                position_mode = await asyncio.to_thread(
+                    self._client.position_mode,
+                    candidate.result.symbol,
+                )
+                if position_mode != "ONE_WAY":
+                    continue
+
+                rules = await asyncio.to_thread(
+                    self._client.instrument_rules,
+                    candidate.result.symbol,
+                )
+
+                publisher(
+                    production_cycle_id,
+                    candidate,
+                    FrozenRuntimeContext.capture(
+                        now=now,
+                        equity=equity,
+                        rules=rules,
+                        state=state,
+                        preflight=self._preflight_result,
+                    ),
+                    self._clock(),
+                )
+            except Exception as error:
+                _LOGGER.warning(
+                    "QTR distance Shadow blocked-context capture failed (%s).",
+                    type(error).__name__,
+                )
+
     async def handle_candidates(
         self,
         candidates: tuple[QtrSetupCandidate, ...],
@@ -311,6 +385,10 @@ class QtrMicroRuntime:
         production_cycle_id: str | None = None,
     ) -> None:
         if not self._preflight_result.ready:
+            await self._publish_blocked_distance_shadow_context(
+                candidates,
+                production_cycle_id,
+            )
             return
         if self._client is None or self._execution is None:
             return

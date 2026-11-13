@@ -262,6 +262,33 @@ class QtrMicroDistanceShadowObserver:
         )
         candidate_id = _candidate_id(snapshot)
         context_digest = _context_digest(context)
+
+        # Normalize only the exact local fail-closed execution gate.
+        # Any unrelated preflight blocker remains authoritative.
+        operational_gate_only = (
+            not context.preflight.ready
+            and context.state.blocked_reason is not None
+            and context.preflight.reason == context.state.blocked_reason
+        )
+        evaluation_state = (
+            replace(
+                context.state,
+                trading_enabled=True,
+                blocked_reason=None,
+            )
+            if operational_gate_only
+            else context.state
+        )
+        evaluation_preflight = (
+            replace(
+                context.preflight,
+                ready=True,
+                reason=None,
+            )
+            if operational_gate_only
+            else context.preflight
+        )
+
         initial: list[tuple[float, QtrMicroSettings, EntryDecision]] = []
         for threshold in DISTANCE_THRESHOLDS:
             branch_settings = replace(
@@ -276,8 +303,8 @@ class QtrMicroDistanceShadowObserver:
                         now=context.now,
                         equity=context.equity,
                         rules=context.rules,
-                        state=context.state,
-                        preflight=context.preflight,
+                        state=evaluation_state,
+                        preflight=evaluation_preflight,
                     ),
                 )
             )
@@ -334,8 +361,8 @@ class QtrMicroDistanceShadowObserver:
                     now=context.now,
                     equity=context.equity,
                     rules=context.rules,
-                    state=context.state,
-                    preflight=context.preflight,
+                    state=evaluation_state,
+                    preflight=evaluation_preflight,
                 )
             final_status = _final_status(price, prepared, revalidated)
             initial_result = _decision_result(prepared)
@@ -420,6 +447,13 @@ class QtrMicroDistanceShadowObserver:
                 "quality": event.quality_score,
                 "qualification_reason": snapshot.decision.reason.value,
                 "telegram_notification_independent": True,
+            },
+            "production_execution_gate": {
+                "preflight_ready": context.preflight.ready,
+                "preflight_reason": context.preflight.reason,
+                "state_trading_enabled": context.state.trading_enabled,
+                "state_blocked_reason": context.state.blocked_reason,
+                "normalized_for_shadow": operational_gate_only,
             },
             "candidate_price": candidate.result.current_price,
             "trigger_price": trigger,

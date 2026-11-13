@@ -1055,6 +1055,74 @@ def test_runtime_publishes_exact_shadow_context_before_submission(
     assert len(client.orders) == 1
 
 
+
+def test_runtime_fail_closed_still_publishes_shadow_context_without_order(
+    tmp_path: Path,
+) -> None:
+    block_reason = "journal recovery block"
+    client = FakeClient()
+    store = JsonQtrMicroStateStore(tmp_path / "blocked-shadow-state.json")
+    store.save(
+        state(
+            trading_enabled=False,
+            blocked_reason=block_reason,
+        )
+    )
+    published: list[tuple[str, QtrSetupCandidate, Any, datetime]] = []
+
+    def publish(
+        cycle_id: str,
+        item: QtrSetupCandidate,
+        context: Any,
+        captured_at: datetime,
+    ) -> None:
+        assert client.orders == []
+        published.append((cycle_id, item, context, captured_at))
+
+    runtime = QtrMicroRuntime(
+        settings=settings(),
+        client=client,
+        state_store=store,
+        allowed_chat_ids=frozenset(),
+        clock=lambda: NOW,
+        decision_audit=JsonlQtrMicroDecisionAudit(
+            tmp_path / "blocked-shadow-decisions.jsonl"
+        ),
+        runtime_audit=JsonlQtrMicroRuntimeAudit(
+            tmp_path / "blocked-shadow-runtime.jsonl"
+        ),
+        distance_shadow_context_publisher=publish,
+    )
+    item = candidate(episode="blocked-shadow-observation")
+
+    async def exercise() -> None:
+        result = await runtime.initialize()
+        assert result.ready is False
+        assert result.reason == block_reason
+        await runtime.handle_candidates(
+            (item,),
+            _discard_message,
+            "cycle-blocked-observation",
+        )
+
+    asyncio.run(exercise())
+
+    assert len(published) == 1
+    cycle_id, published_item, context, captured_at = published[0]
+    assert cycle_id == "cycle-blocked-observation"
+    assert published_item == item
+    assert captured_at == NOW
+
+    # Factual production state MUST remain blocked in captured evidence.
+    assert context.preflight.ready is False
+    assert context.preflight.reason == block_reason
+    assert context.state.trading_enabled is False
+    assert context.state.blocked_reason == block_reason
+
+    # Observation path must never cross the order boundary.
+    assert client.orders == []
+
+
 def test_ready_trade_eligible_creates_market_candidate_with_base_risk() -> None:
     plan = decision().plan
     assert plan is not None

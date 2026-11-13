@@ -249,6 +249,65 @@ def test_control_matches_production_engine_and_shadows_only_expand_distance(
     assert accepted[0]["plan_metadata"] == accepted[1]["plan_metadata"]
 
 
+
+def test_fail_closed_execution_gate_is_preserved_but_normalized_for_shadow(
+    tmp_path: Path,
+) -> None:
+    block_reason = "journal recovery block"
+    snapshot = _snapshot(distance=0.35)
+    blocked_state = replace(
+        empty_state(
+            today=NOW.date(),
+            trading_enabled=True,
+            equity=10_000,
+        ),
+        trading_enabled=False,
+        blocked_reason=block_reason,
+    )
+    context = FrozenRuntimeContext.capture(
+        now=NOW,
+        equity=10_000.0,
+        rules=RULES,
+        state=blocked_state,
+        preflight=PreflightResult(
+            False,
+            block_reason,
+            equity=10_000,
+        ),
+    )
+
+    path = tmp_path / "fail-closed-evidence.jsonl"
+    reader = PriceReaderSpy(101.15)
+    observer = QtrMicroDistanceShadowObserver(
+        production_settings=_settings(),
+        price_reader=reader,
+        evidence=JsonlDistanceShadowEvidence(path),
+        clock=Clock(),
+    )
+
+    record = observer.observe(snapshot, context)
+
+    gate = record["production_execution_gate"]
+    assert gate["preflight_ready"] is False
+    assert gate["preflight_reason"] == block_reason
+    assert gate["state_trading_enabled"] is False
+    assert gate["state_blocked_reason"] == block_reason
+    assert gate["normalized_for_shadow"] is True
+
+    # The experiment must compare distance, not simply reproduce the
+    # production execution block in every branch.
+    control = _branch(record, CONTROL_THRESHOLD)
+    assert control["initial_accepted"] is False
+    assert control["initial_skip_reason"] == "too_far"
+
+    for threshold in (0.40, 0.60):
+        branch = _branch(record, threshold)
+        assert branch["initial_accepted"] is True
+        assert branch["initial_skip_reason"] is None
+
+    assert reader.calls == [snapshot.decision.candidate.result.symbol]
+
+
 def test_risk_sizing_leverage_and_safety_are_identical_when_all_accept(
     tmp_path: Path,
 ) -> None:
