@@ -102,11 +102,11 @@ class JournalObservationSource:
         self._decision_analytics = analytics
         self._trades = trades
         self._trade_path = trade_path
-        self._trade_signature = self._file_signature(trade_path)
         self._observer = observer or ShadowObserver()
         self._decision_index.refresh()
 
         self._refresh_trades()
+
     def observe(self, *, generated_at: datetime) -> ShadowCliObservation:
         self._refresh_trades()
         self._decision_index.refresh()
@@ -114,7 +114,7 @@ class JournalObservationSource:
             generated_at=generated_at,
         )
         analytics = self._decision_analytics.snapshot(
-            self._trades.records(),
+            self._trades.snapshot(),
             generated_at=generated_at,
             recovery_warnings=(
                 *self._decision_index.recovery.warnings,
@@ -128,20 +128,7 @@ class JournalObservationSource:
         )
 
     def _refresh_trades(self) -> None:
-        signature = self._file_signature(self._trade_path)
-        if signature == self._trade_signature:
-            return
-        self._trades = ShadowTradeJournal(self._trade_path)
-        self._trade_signature = signature
-
-    @staticmethod
-    def _file_signature(path: Path) -> tuple[int, int, int, int] | None:
-        if not path.exists():
-            return None
-        stat = path.stat()
-        return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
-
-
+        self._trades.refresh()
 
     def metrics(self) -> JournalObservationMetrics:
         return JournalObservationMetrics(
@@ -367,8 +354,7 @@ def _status_text(status: ShadowServiceStatus) -> str:
 def _blocked_text(health: ShadowServiceHealth) -> str:
     reason = health.last_error or "Причина не указана."
     return (
-        "🧠 QTR MICRO SCALPER V2\n\n"
-        f"📡 Статус:\n🔴 Заблокирован\n\nПричина: {reason}"
+        f"🧠 QTR MICRO SCALPER V2\n\n📡 Статус:\n🔴 Заблокирован\n\nПричина: {reason}"
     )
 
 

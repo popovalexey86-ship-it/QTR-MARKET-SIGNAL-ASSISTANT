@@ -19,6 +19,9 @@ from market_signal_assistant.qtr_micro_scalper.shadow_journal import (
     ShadowTradeJournal,
     ShadowTradeRecord,
 )
+from market_signal_assistant.qtr_micro_scalper.shadow_journal_index import (
+    ShadowTradeIndexSnapshot,
+)
 from market_signal_assistant.qtr_micro_scalper.shadow_runtime import (
     ShadowRuntimeEventType,
 )
@@ -189,7 +192,7 @@ class IncrementalDecisionAnalytics:
 
     def snapshot(
         self,
-        trade_records: Iterable[ShadowTradeRecord],
+        trade_records: Iterable[ShadowTradeRecord] | ShadowTradeIndexSnapshot,
         *,
         generated_at: datetime,
         recovery_warnings: tuple[str, ...] = (),
@@ -203,14 +206,19 @@ class IncrementalDecisionAnalytics:
 
     def _snapshot_locked(
         self,
-        trade_records: Iterable[ShadowTradeRecord],
+        trade_records: Iterable[ShadowTradeRecord] | ShadowTradeIndexSnapshot,
         *,
         generated_at: datetime,
         recovery_warnings: tuple[str, ...],
     ) -> AnalyticsSnapshot:
         normalized_at = _utc(generated_at)
-        all_trades = _unique_trades(trade_records)
-        lifecycles = _lifecycles(all_trades)
+        if isinstance(trade_records, ShadowTradeIndexSnapshot):
+            trade_record_count = trade_records.record_count
+            lifecycles = _indexed_lifecycles(trade_records)
+        else:
+            all_trades = _unique_trades(trade_records)
+            trade_record_count = len(all_trades)
+            lifecycles = _lifecycles(all_trades)
         entries = tuple(
             sorted(
                 self._entries,
@@ -260,7 +268,7 @@ class IncrementalDecisionAnalytics:
         return AnalyticsSnapshot(
             generated_at=normalized_at,
             decision_journal_records=self._record_count,
-            trade_journal_records=len(all_trades),
+            trade_journal_records=trade_record_count,
             overall=_metrics_from_counts(self._overall, lifecycles),
             by_score_bucket=_aggregate_breakdown(
                 self._by_score,
@@ -323,10 +331,7 @@ class IncrementalDecisionAnalytics:
                 )
                 matched = True
         if not matched:
-            self._blocked_reasons["other"] = (
-                self._blocked_reasons.get("other", 0) + 1
-            )
-
+            self._blocked_reasons["other"] = self._blocked_reasons.get("other", 0) + 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -338,6 +343,8 @@ class _TradeLifecycle:
     completed: bool
     active: bool
     won: bool
+    history_events: frozenset[ShadowRuntimeEventType] | None = None
+    history_stop_reason: bool = False
 
 
 class ShadowAnalyticsEngine:
@@ -510,6 +517,25 @@ def _lifecycles(records: tuple[ShadowTradeRecord, ...]) -> tuple[_TradeLifecycle
     return tuple(result)
 
 
+def _indexed_lifecycles(
+    snapshot: ShadowTradeIndexSnapshot,
+) -> tuple[_TradeLifecycle, ...]:
+    return tuple(
+        _TradeLifecycle(
+            trade_id=state.latest.trade_id,
+            records=(state.first, state.latest),
+            latest=state.latest,
+            entered=state.entered,
+            completed=state.latest.stage in _TERMINAL_STAGES,
+            active=state.latest.stage in _ACTIVE_STAGES,
+            won=state.latest.outcome is ShadowOutcomeStatus.WIN,
+            history_events=state.event_types,
+            history_stop_reason=state.stop_reason_seen,
+        )
+        for state in snapshot.states
+    )
+
+
 def _match_entries(
     decisions: tuple[ShadowDecisionRecord, ...],
     lifecycles: tuple[_TradeLifecycle, ...],
@@ -636,7 +662,6 @@ def _aggregate_breakdown(
     )
 
 
-
 def _breakdown(
     decisions: tuple[ShadowDecisionRecord, ...],
     lifecycles: tuple[_TradeLifecycle, ...],
@@ -698,11 +723,15 @@ def _loss_reasons(
 ) -> tuple[AnalyticsReason, ...]:
     counts: dict[str, int] = defaultdict(int)
     for lifecycle in lifecycles:
-        events = {
-            event.event_type
-            for record in lifecycle.records
-            for event in record.events
-        }
+        events = (
+            lifecycle.history_events
+            if lifecycle.history_events is not None
+            else {
+                event.event_type
+                for record in lifecycle.records
+                for event in record.events
+            }
+        )
         if (
             lifecycle.latest.stage is ShadowTradeStage.EXPIRED
             or ShadowRuntimeEventType.EXPIRED in events
@@ -711,6 +740,7 @@ def _loss_reasons(
             counts["expired"] += 1
         elif (
             ShadowRuntimeEventType.STOPPED in events
+            or lifecycle.history_stop_reason
             or any(
                 "stop" in text.casefold() or "стоп" in text.casefold()
                 for record in lifecycle.records
