@@ -104,6 +104,9 @@ def test_first_launch_skips_old_events_and_restart_keeps_cursor(tmp_path: Path) 
     assert adapter.db.execute(
         "SELECT status FROM outbox WHERE event_id=?", (new_id,)
     ).fetchone() == ("SENT",)
+    assert adapter.db.execute(
+        "SELECT enqueued_at FROM outbox WHERE event_id=?", (new_id,)
+    ).fetchone() == (100.0,)
     adapter.close()
 
     restarted = _adapter(journal, db, sender, now=now)

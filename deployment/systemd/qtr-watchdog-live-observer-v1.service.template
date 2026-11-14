@@ -1,0 +1,30 @@
+[Unit]
+Description=QTR Watchdog Live Observer V1 (isolated public-market shadow)
+Wants=network-online.target
+After=network-online.target qtr-watchdog-telegram.service
+ConditionPathIsDirectory=__LIVE_DATA_ROOT__
+ConditionPathExists=__LIVE_DATA_ROOT__/events/events.jsonl
+
+[Service]
+Type=exec
+User=qtr
+Group=qtr
+WorkingDirectory=/opt/qtr/watchdog-shadow
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/qtr/watchdog-shadow/.venv/bin/python -m market_signal_assistant.watchdog.runtime.observer --data-root __LIVE_DATA_ROOT__ --adapter-state-db __LIVE_ADAPTER_STATE_ROOT__/delivery.sqlite3 --adapter-unit qtr-watchdog-telegram.service --symbols-per-loop 8 --api-calls-per-minute 60
+Restart=no
+TimeoutStopSec=120s
+KillSignal=SIGTERM
+KillMode=control-group
+SendSIGKILL=no
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=__LIVE_DATA_ROOT__
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

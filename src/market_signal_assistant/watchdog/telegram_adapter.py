@@ -164,8 +164,15 @@ class WatchdogTelegramAdapter:
             "payload_hash TEXT NOT NULL, text TEXT, status TEXT NOT NULL, "
             "attempts INTEGER NOT NULL DEFAULT 0, "
             "next_attempt REAL NOT NULL DEFAULT 0, "
-            "last_error TEXT)"
+            "last_error TEXT, enqueued_at REAL NOT NULL DEFAULT 0)"
         )
+        # Existing pilot state remains readable. An old pending row has unknown
+        # age (zero) and must be reviewed, never silently treated as fresh.
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(outbox)")}
+        if "enqueued_at" not in columns:
+            self.db.execute(
+                "ALTER TABLE outbox ADD COLUMN enqueued_at REAL NOT NULL DEFAULT 0"
+            )
         destination_hash = hashlib.sha256(chat_id.encode("utf-8")).hexdigest()
         existing_cursor = self.db.execute(
             "SELECT destination_hash FROM cursor WHERE id=1"
@@ -258,9 +265,10 @@ class WatchdogTelegramAdapter:
                         raise JournalChangedError("conflicting event_id")
                     if existing is None:
                         self.db.execute(
-                            "INSERT INTO outbox(event_id,payload_hash,text,status) "
-                            "VALUES(?,?,?,'PENDING')",
-                            (event.event_id, digest, format_event(event)),
+                            "INSERT INTO outbox("
+                            "event_id,payload_hash,text,status,enqueued_at) "
+                            "VALUES(?,?,?,'PENDING',?)",
+                            (event.event_id, digest, format_event(event), self.clock()),
                         )
                     updated = self.db.execute(
                         "UPDATE cursor SET device=?,inode=?,offset=? "
