@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Lock
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from market_signal_assistant.qtr_micro_scalper.scoring import (
     ScalperDirection,
@@ -25,6 +25,13 @@ from market_signal_assistant.qtr_micro_scalper.shadow_runtime import (
     ShadowRuntimeEvent,
     ShadowRuntimeEventType,
 )
+
+if TYPE_CHECKING:
+    from market_signal_assistant.qtr_micro_scalper.shadow_journal_index import (
+        ShadowTradeIndexMetrics,
+        ShadowTradeIndexSnapshot,
+    )
+
 
 DEFAULT_SHADOW_JOURNAL_PATH = (
     Path(__file__).resolve().parents[3]
@@ -115,15 +122,21 @@ class ShadowJournalRecovery:
 
 
 class ShadowTradeJournal:
-    """Thread-safe append-only JSONL journal with restart recovery."""
+    """Append-only writer with compact recovery and exact disk-backed deduplication.
+
+    records() is an explicitly offline compatibility API. Live callers use
+    snapshot()/record_count and never materialize historical rows.
+    """
 
     def __init__(self, path: Path = DEFAULT_SHADOW_JOURNAL_PATH) -> None:
+        from market_signal_assistant.qtr_micro_scalper.shadow_journal_index import (
+            ShadowTradeJournalIndex,
+        )
+
         self._path = path.resolve()
         self._lock = Lock()
-        recovery = recover_shadow_journal(self._path)
-        self._records = list(recovery.records)
-        self._record_ids = {record.record_id for record in recovery.records}
-        self._recovery = recovery
+        self._index = ShadowTradeJournalIndex(self._path)
+        self._index.refresh()
 
     @property
     def path(self) -> Path:
@@ -131,30 +144,61 @@ class ShadowTradeJournal:
 
     @property
     def recovery(self) -> ShadowJournalRecovery:
-        return self._recovery
+        return self._index.recovery
+
+    @property
+    def record_count(self) -> int:
+        return self._index.record_count
+
+    @property
+    def index_metrics(self) -> ShadowTradeIndexMetrics:
+        return self._index.metrics()
+
+    @property
+    def active_records(self) -> tuple[ShadowTradeRecord, ...]:
+        return self.snapshot().active_records
+
+    def refresh(self) -> int:
+        with self._lock:
+            return self._index.refresh()
+
+    def snapshot(self) -> ShadowTradeIndexSnapshot:
+        with self._lock:
+            self._index.refresh()
+            return self._index.snapshot()
 
     def append(self, record: ShadowTradeRecord) -> bool:
         line = serialize_shadow_trade_record(record)
         with self._lock:
-            if record.record_id in self._record_ids:
+            self._index.refresh()
+            # Preserve a crash tail verbatim, delimit it, then re-index before
+            # checking identity (a valid unterminated row may already be this ID).
+            if self._path.exists() and self._path.stat().st_size:
+                with self._path.open("rb") as source:
+                    source.seek(-1, 2)
+                    separated = source.read(1) == b"\n"
+                if not separated:
+                    with self._path.open("ab") as stream:
+                        stream.write(b"\n")
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    self._index.refresh()
+            if self._index.contains(record.record_id):
                 return False
             self._path.parent.mkdir(parents=True, exist_ok=True)
             with self._path.open("a", encoding="utf-8", newline="\n") as stream:
-                stream.write(line)
-                stream.write("\n")
+                stream.write(line + "\n")
                 stream.flush()
                 os.fsync(stream.fileno())
-            self._record_ids.add(record.record_id)
-            self._records.append(record)
+            self._index.refresh()
             return True
 
     def records(self) -> tuple[ShadowTradeRecord, ...]:
+        """Explicit full-history offline recovery; never used by live observation."""
         with self._lock:
-            return tuple(self._records)
+            return recover_shadow_journal(self._path).records
 
     def flush(self) -> None:
-        """Durably flush the append-only file; append already fsyncs each record."""
-
         with self._lock:
             if not self._path.exists():
                 return
@@ -162,19 +206,15 @@ class ShadowTradeJournal:
                 stream.flush()
                 os.fsync(stream.fileno())
 
+    def close(self) -> None:
+        with self._lock:
+            self._index.close()
+
     def latest(self, trade_id: str) -> ShadowTradeRecord | None:
         normalized = trade_id.strip()
         if not normalized:
             raise ValueError("Shadow trade id cannot be empty.")
-        with self._lock:
-            return next(
-                (
-                    record
-                    for record in reversed(self._records)
-                    if record.trade_id == normalized
-                ),
-                None,
-            )
+        return self._index.latest(normalized)
 
 
 def build_shadow_trade_record(

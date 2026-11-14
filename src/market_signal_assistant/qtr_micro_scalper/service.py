@@ -330,6 +330,13 @@ def build_shadow_service_from_environment(
         )
     )
     resolved_journal = journal or ShadowTradeJournal(journal_path)
+    unfinished = resolved_journal.active_records
+    if settings.enabled and unfinished:
+        raise RuntimeError(
+            f"Shadow recovery requires review: {len(unfinished)} unfinished trades "
+            "are preserved in the journal, but legacy rows do not contain a "
+            "complete resumable runtime state. No trade state was fabricated."
+        )
     resolved_decisions = decision_journal or ShadowDecisionJournal(
         decision_journal_path,
         retain_records=False,

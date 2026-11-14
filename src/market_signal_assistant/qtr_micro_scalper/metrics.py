@@ -13,6 +13,9 @@ from market_signal_assistant.qtr_micro_scalper.shadow_journal import (
     ShadowTradeJournal,
     ShadowTradeRecord,
 )
+from market_signal_assistant.qtr_micro_scalper.shadow_journal_index import (
+    ShadowTradeIndexSnapshot,
+)
 from market_signal_assistant.qtr_micro_scalper.shadow_runtime import (
     ShadowRuntimeEventType,
 )
@@ -96,7 +99,6 @@ class MetricsSnapshot:
 @dataclass(frozen=True, slots=True)
 class _TradeLifecycle:
     trade_id: str
-    records: tuple[ShadowTradeRecord, ...]
     latest: ShadowTradeRecord
     entered: bool
     closed: bool
@@ -119,8 +121,8 @@ class ShadowMetricsAggregator:
         generated_at: datetime,
         dimensions: Mapping[str, TradeMetricDimensions] | None = None,
     ) -> MetricsSnapshot:
-        return aggregate_shadow_metrics(
-            self._journal.records(),
+        return aggregate_shadow_metric_states(
+            self._journal.snapshot(),
             generated_at=generated_at,
             dimensions=dimensions,
         )
@@ -138,9 +140,57 @@ def aggregate_shadow_metrics(
     materialized = tuple(records)
     supplied_dimensions = dimensions or {}
     lifecycles = _lifecycles(materialized, supplied_dimensions)
+    return _snapshot(lifecycles, len(materialized), normalized_at)
+
+
+def aggregate_shadow_metric_states(
+    snapshot: ShadowTradeIndexSnapshot,
+    *,
+    generated_at: datetime,
+    dimensions: Mapping[str, TradeMetricDimensions] | None = None,
+) -> MetricsSnapshot:
+    supplied = dimensions or {}
+    lifecycles = tuple(
+        _TradeLifecycle(
+            trade_id=state.latest.trade_id,
+            latest=state.latest,
+            entered=state.entered,
+            closed=state.entered
+            and state.latest.stage
+            in {
+                ShadowTradeStage.CLOSED,
+                ShadowTradeStage.EXPIRED,
+            },
+            tp1_hit=state.tp1_stage_seen
+            or bool(
+                state.event_types
+                & {
+                    ShadowRuntimeEventType.TP1_REACHED,
+                    ShadowRuntimeEventType.TP2_REACHED,
+                }
+            ),
+            tp2_hit=ShadowRuntimeEventType.TP2_REACHED in state.event_types,
+            stopped=ShadowRuntimeEventType.STOPPED in state.event_types,
+            expired=(
+                state.latest.stage is ShadowTradeStage.EXPIRED
+                or ShadowRuntimeEventType.EXPIRED in state.event_types
+                or state.latest.outcome is ShadowOutcomeStatus.NOT_TRIGGERED
+            ),
+            dimensions=supplied.get(state.latest.trade_id, TradeMetricDimensions()),
+        )
+        for state in snapshot.states
+    )
+    return _snapshot(lifecycles, snapshot.record_count, _utc(generated_at))
+
+
+def _snapshot(
+    lifecycles: tuple[_TradeLifecycle, ...],
+    record_count: int,
+    normalized_at: datetime,
+) -> MetricsSnapshot:
     return MetricsSnapshot(
         generated_at=normalized_at,
-        journal_records=len(materialized),
+        journal_records=record_count,
         unique_trade_plans=len(lifecycles),
         overall=_summary(lifecycles),
         by_symbol=_breakdown(lifecycles, lambda item: item.latest.symbol),
@@ -201,7 +251,6 @@ def _lifecycles(
         lifecycles.append(
             _TradeLifecycle(
                 trade_id=trade_id,
-                records=ordered,
                 latest=latest,
                 entered=entered,
                 closed=closed,

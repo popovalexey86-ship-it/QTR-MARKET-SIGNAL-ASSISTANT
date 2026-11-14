@@ -358,7 +358,7 @@ class ShadowOrchestrator:
                 trade_updates=self._trade_updates,
                 trades_closed=self._trades_closed,
                 active_shadow_trades=len(self._runtime.active_trades()),
-                journal_records=len(self._journal.records()),
+                journal_records=self._journal.record_count,
                 events_emitted=self._events_emitted,
                 duplicates_suppressed=self._duplicates_suppressed,
                 errors=self._errors,
