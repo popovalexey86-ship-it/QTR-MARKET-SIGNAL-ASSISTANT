@@ -95,6 +95,11 @@ class ShadowTradeIndexSnapshot:
 
     @property
     def active_records(self) -> tuple[ShadowTradeRecord, ...]:
+        """Historical last-appended non-terminal rows, not resumable trades."""
+        return self.historical_unfinished_records
+
+    @property
+    def historical_unfinished_records(self) -> tuple[ShadowTradeRecord, ...]:
         return tuple(
             state.last_appended
             for state in self.states

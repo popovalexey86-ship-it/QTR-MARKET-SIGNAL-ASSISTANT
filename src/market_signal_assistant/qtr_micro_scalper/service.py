@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
 import signal
 from collections.abc import Callable, Sequence
@@ -24,6 +25,10 @@ from market_signal_assistant.qtr_micro_scalper.holding_experiment import (
     HoldingExperimentConfig,
     HoldingExperimentJournal,
     HoldingExperimentRuntime,
+)
+from market_signal_assistant.qtr_micro_scalper.legacy_recovery import (
+    LegacyShadowQuarantine,
+    classify_legacy_shadow_recovery,
 )
 from market_signal_assistant.qtr_micro_scalper.micro_profit_experiment import (
     DEFAULT_MICRO_PROFIT_EXPERIMENT_JOURNAL_PATH,
@@ -87,6 +92,7 @@ class ShadowServiceHealth:
     last_error: str | None
     reconnect_attempts: int
     pipeline_errors: int
+    legacy_quarantine_warning: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +105,10 @@ class ShadowServiceMetrics:
     stop_requests: int
     journal_flushes: int
     pipeline: LiveShadowPipelineMetrics
+    quarantined_legacy_trades: int = 0
+    resumable_active_trades: int = 0
+    runtime_restored_legacy_trades: int = 0
+    quarantined_trade_ids_and_stages: tuple[tuple[str, str], ...] = ()
 
 
 class ShadowPipeline(Protocol):
@@ -126,9 +136,12 @@ class ShadowService:
         *,
         config: ShadowServiceConfig | None = None,
         clock: Callable[[], datetime] | None = None,
+        legacy_quarantine: LegacyShadowQuarantine | None = None,
     ) -> None:
         self._pipeline = pipeline
         self._journal = journal
+        self._legacy_quarantine = legacy_quarantine or LegacyShadowQuarantine()
+        self._quarantine_reported = False
         self._settings = settings
         self._config = config or ShadowServiceConfig()
         self._clock = clock or (lambda: datetime.now(UTC))
@@ -157,6 +170,11 @@ class ShadowService:
             self._last_error = "Scalper V2 service is restricted to shadow mode."
             raise RuntimeError(self._last_error)
 
+        if not self._quarantine_reported:
+            warning = self._legacy_quarantine.warning
+            if warning is not None:
+                logging.getLogger(__name__).warning("%s", warning)
+            self._quarantine_reported = True
         self._status = ShadowServiceStatus.STARTING
         self._started_at = self._now()
         self._stop_requested = asyncio.Event()
@@ -209,6 +227,7 @@ class ShadowService:
             ),
             reconnect_attempts=self._reconnect_attempts,
             pipeline_errors=pipeline_metrics.errors,
+            legacy_quarantine_warning=self._legacy_quarantine.warning,
         )
 
     def metrics_snapshot(self) -> ShadowServiceMetrics:
@@ -221,6 +240,12 @@ class ShadowService:
             stop_requests=self._stop_requests,
             journal_flushes=self._journal_flushes,
             pipeline=self._pipeline.metrics(),
+            quarantined_legacy_trades=len(
+                self._legacy_quarantine.legacy_unresumable_records
+            ),
+            quarantined_trade_ids_and_stages=(
+                self._legacy_quarantine.trade_ids_and_stages
+            ),
         )
 
     async def wait(self) -> None:
@@ -324,13 +349,7 @@ def build_shadow_service_from_environment(
         )
     )
     resolved_journal = journal or ShadowTradeJournal(journal_path)
-    unfinished = resolved_journal.active_records
-    if settings.enabled and unfinished:
-        raise RuntimeError(
-            f"Shadow recovery requires review: {len(unfinished)} unfinished trades "
-            "are preserved in the journal, but legacy rows do not contain a "
-            "complete resumable runtime state. No trade state was fabricated."
-        )
+    legacy_quarantine = classify_legacy_shadow_recovery(resolved_journal)
     resolved_decisions = decision_journal or ShadowDecisionJournal(
         decision_journal_path,
         retain_records=False,
@@ -392,7 +411,9 @@ def build_shadow_service_from_environment(
         micro_profit_experiment=micro_profit_experiment,
         protected_runner=protected_runner,
     )
-    return ShadowService(pipeline, resolved_journal, settings)
+    return ShadowService(
+        pipeline, resolved_journal, settings, legacy_quarantine=legacy_quarantine
+    )
 
 async def serve(service: ShadowService) -> int:
     shutdown = asyncio.Event()
