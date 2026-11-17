@@ -6,12 +6,13 @@ import logging
 import os
 import signal
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
 
+from market_signal_assistant.qtr_micro_scalper.control_models import RuntimeDetails
 from market_signal_assistant.qtr_micro_scalper.decision_journal import (
     DEFAULT_DECISION_JOURNAL_PATH,
     ShadowDecisionJournal,
@@ -117,6 +118,8 @@ class ShadowServiceMetrics:
 
 
 class ShadowPipeline(Protocol):
+    def control_details(self) -> RuntimeDetails: ...
+
     async def start(self) -> None: ...
 
     async def stop(self) -> None: ...
@@ -148,6 +151,14 @@ class ShadowService:
         self._legacy_quarantine = legacy_quarantine or LegacyShadowQuarantine()
         self._quarantine_reported = False
         self._settings = settings
+        live_flag = os.getenv("QTR_SCALPER_V2_LIVE_ENABLED", "false").strip().lower()
+        self._control_live_enabled = (
+            False
+            if live_flag in {"false", "0", "no", "off"}
+            else True
+            if live_flag in {"true", "1", "yes", "on"}
+            else None
+        )
         self._config = config or ShadowServiceConfig()
         self._clock = clock or (lambda: datetime.now(UTC))
         self._status = ShadowServiceStatus.STOPPED
@@ -202,6 +213,11 @@ class ShadowService:
             await asyncio.gather(supervisor, return_exceptions=True)
         self._supervisor = None
         self._status = ShadowServiceStatus.STOPPED
+
+    def control_details(self) -> RuntimeDetails:
+        return replace(
+            self._pipeline.control_details(), live_enabled=self._control_live_enabled
+        )
 
     def health(self) -> ShadowServiceHealth:
         now = self._now()

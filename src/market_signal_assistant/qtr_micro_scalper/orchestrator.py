@@ -9,6 +9,11 @@ from enum import StrEnum
 from pathlib import Path
 from threading import Lock
 
+from market_signal_assistant.qtr_micro_scalper.control_models import (
+    MAX_ACTIVE_TRADES,
+    MAX_TEXT,
+    ActiveTrade,
+)
 from market_signal_assistant.qtr_micro_scalper.data.liquidity import (
     LiquidityIntelligence,
 )
@@ -338,6 +343,27 @@ class ShadowOrchestrator:
         )
         with self._lock:
             return tuple(self._process_bar_locked(bar) for bar in ordered)
+
+    def control_active_trades(self) -> tuple[int, tuple[ActiveTrade, ...]]:
+        """Project current runtime only; never hydrate or read journal history."""
+        with self._lock:
+            trades = self._runtime.active_trades()
+            return len(trades), tuple(
+                ActiveTrade(
+                    trade.trade_id[:MAX_TEXT],
+                    trade.symbol[:MAX_TEXT],
+                    trade.direction.value,
+                    trade.stage.value,
+                    trade.opportunity_score,
+                    trade.entry_price,
+                    trade.current_stop,
+                    trade.tp1_price,
+                    trade.tp2_price,
+                    trade.entry_at,
+                    trade.realized_r,
+                )
+                for trade in trades[:MAX_ACTIVE_TRADES]
+            )
 
     def events(self) -> tuple[ShadowOrchestratorEvent, ...]:
         with self._lock:

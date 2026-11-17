@@ -9,6 +9,11 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TypeAlias
 
+from market_signal_assistant.qtr_micro_scalper.control_models import (
+    MAX_SYMBOLS,
+    MAX_TEXT,
+    RuntimeDetails,
+)
 from market_signal_assistant.qtr_micro_scalper.data.liquidity import (
     LiquidityBookFrame,
     LiquidityIntelligenceLayer,
@@ -431,6 +436,27 @@ class LiveShadowPipeline:
                 else:
                     self._cleanup_symbol(symbol)
             self._symbols = normalized
+
+    def control_details(self) -> RuntimeDetails:
+        count, trades = self._orchestrator.control_active_trades()
+        return RuntimeDetails(
+            active_count=count,
+            active=trades,
+            symbols=tuple(
+                symbol[:MAX_TEXT] for symbol in sorted(self._symbols)[:MAX_SYMBOLS]
+            ),
+            holding_enabled=(
+                self._holding_experiment.enabled if self._holding_experiment else False
+            ),
+            micro_profit_enabled=(
+                self._micro_profit_experiment.enabled
+                if self._micro_profit_experiment
+                else False
+            ),
+            protected_runner_enabled=(
+                self._protected_runner.enabled if self._protected_runner else False
+            ),
+        )
 
     def active_symbols(self) -> tuple[str, ...]:
         return tuple(sorted(self._symbols))

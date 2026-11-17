@@ -15,6 +15,8 @@ from market_signal_assistant.qtr_micro_scalper.analytics import (
     DecisionAnalyticsCacheMetrics,
     IncrementalDecisionAnalytics,
 )
+from market_signal_assistant.qtr_micro_scalper.control_models import RuntimeDetails
+from market_signal_assistant.qtr_micro_scalper.control_plane import ScalperControlPlane
 from market_signal_assistant.qtr_micro_scalper.decision_journal import (
     DEFAULT_DECISION_JOURNAL_PATH,
     DecisionJournalIndex,
@@ -148,6 +150,8 @@ class ShadowCliRunner:
         refresh_seconds: float = 30.0,
         output: Callable[[str], None] = print,
         clock: Callable[[], datetime] | None = None,
+        control_plane: ScalperControlPlane | None = None,
+        control_details: Callable[[], RuntimeDetails] | None = None,
     ) -> None:
         if refresh_seconds <= 0:
             raise ValueError("Интервал обновления должен быть больше нуля.")
@@ -156,6 +160,9 @@ class ShadowCliRunner:
         self._refresh_seconds = refresh_seconds
         self._output = output
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._control_plane = control_plane
+        self._control_details = control_details or RuntimeDetails
+        self._last_observation: ShadowCliObservation | None = None
 
     async def run(
         self,
@@ -193,21 +200,55 @@ class ShadowCliRunner:
             except (OSError, RuntimeError, ValueError) as exc:
                 self._output(f"⚠️ Ошибка при остановке теневого сервиса: {exc}")
                 exit_code = 2
+            if self._control_plane is not None and self._last_observation is not None:
+                try:
+                    self._publish_control(
+                        self._service.health(),
+                        self._service.metrics_snapshot(),
+                        self._last_observation,
+                    )
+                except (OSError, RuntimeError, ValueError, TypeError):
+                    self._output("⚠️ Итоговый снимок Control Plane недоступен.")
             self._output("🛑 Теневой наблюдатель остановлен.")
         return exit_code
 
     def _print_refresh(self) -> None:
         try:
             observation = self._observations.observe(generated_at=self._now())
+            self._last_observation = observation
+            health = self._service.health()
+            metrics = self._service.metrics_snapshot()
             self._output(
                 format_cli_report(
-                    self._service.health(),
-                    self._service.metrics_snapshot(),
+                    health,
+                    metrics,
                     observation,
                 )
             )
+            self._publish_control(health, metrics, observation)
         except (OSError, RuntimeError, ValueError) as exc:
             self._output(f"⚠️ Нет данных: не удалось обновить наблюдение ({exc}).")
+
+    def _publish_control(
+        self,
+        health: ShadowServiceHealth,
+        metrics: ShadowServiceMetrics,
+        observation: ShadowCliObservation,
+    ) -> None:
+        if self._control_plane is None:
+            return
+        try:
+            snapshot = self._control_plane.build(
+                health,
+                metrics,
+                observation,
+                self._control_details(),
+                generated_at=self._now(),
+            )
+            if not self._control_plane.publish(snapshot):
+                self._output("⚠️ Публикация Control Plane недоступна.")
+        except (OSError, RuntimeError, ValueError, TypeError):
+            self._output("⚠️ Снимок Control Plane недоступен.")
 
     def _now(self) -> datetime:
         value = self._clock()
@@ -281,11 +322,12 @@ def build_cli_runner_from_environment(
         retain_records=False,
     )
     trade_journal = ShadowTradeJournal(trade_path)
+    service = build_shadow_service_from_environment(
+        journal=trade_journal,
+        decision_journal=decision_journal,
+    )
     return ShadowCliRunner(
-        build_shadow_service_from_environment(
-            journal=trade_journal,
-            decision_journal=decision_journal,
-        ),
+        service,
         JournalObservationSource(
             decision_journal_path=decision_path,
             trade_journal_path=trade_path,
@@ -295,6 +337,8 @@ def build_cli_runner_from_environment(
         ),
         refresh_seconds=refresh_seconds,
         output=output,
+        control_plane=ScalperControlPlane(refresh_seconds=refresh_seconds),
+        control_details=service.control_details,
     )
 
 
