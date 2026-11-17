@@ -156,7 +156,12 @@ class ShadowTradeJournal:
 
     @property
     def active_records(self) -> tuple[ShadowTradeRecord, ...]:
-        return self.snapshot().active_records
+        """Compatibility alias for historical state; never a hydration contract."""
+        return self.historical_unfinished_records
+
+    @property
+    def historical_unfinished_records(self) -> tuple[ShadowTradeRecord, ...]:
+        return self.snapshot().historical_unfinished_records
 
     def refresh(self) -> int:
         with self._lock:
@@ -279,6 +284,9 @@ def deserialize_shadow_trade_record(line: str) -> ShadowTradeRecord:
     if not isinstance(loaded, dict):
         raise ValueError("Shadow journal line must contain an object.")
     payload = cast(dict[str, object], loaded)
+    # Do not silently discard future checkpoint data and quarantine it as legacy.
+    if payload.keys() - ShadowTradeRecord.__dataclass_fields__.keys():
+        raise ValueError("Shadow journal contains unsupported schema fields.")
     try:
         expected_record_id = _string(payload, "record_id")
         events = tuple(_event_from_payload(item) for item in _list(payload, "events"))

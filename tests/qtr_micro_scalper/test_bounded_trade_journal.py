@@ -159,15 +159,16 @@ def test_recovery_retains_five_waiting_and_one_open_without_fabrication(
     assert len(journal.snapshot().states) == 10
 
 
-def test_live_start_refuses_to_discard_unresumable_legacy_state(
+def test_live_factory_quarantines_instead_of_discarding_unresumable_legacy_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     journal = ShadowTradeJournal(tmp_path / "trades.jsonl")
     assert journal.append(record("open", stage=ShadowTradeStage.OPEN))
     monkeypatch.setenv("QTR_SCALPER_V2_ENABLED", "true")
     monkeypatch.setenv("QTR_SCALPER_V2_SHADOW_MODE", "true")
-    with pytest.raises(RuntimeError, match="unfinished trades"):
-        build_shadow_service_from_environment(journal=journal)
+    service = build_shadow_service_from_environment(journal=journal)
+    assert service.metrics_snapshot().quarantined_legacy_trades == 1
+    assert service.metrics_snapshot().runtime_restored_legacy_trades == 0
     assert len(journal.active_records) == 1
 
 
