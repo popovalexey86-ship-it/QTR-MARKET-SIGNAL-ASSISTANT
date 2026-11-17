@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import stat
@@ -9,7 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import RLock
-from typing import Protocol
+from typing import BinaryIO, Protocol
 
 from market_signal_assistant.qtr_micro_scalper.inplay_bridge import ScalperTarget
 from market_signal_assistant.qtr_micro_scalper.setup_context import (
@@ -22,6 +23,10 @@ DEFAULT_VERIFIED_SETUP_PATH = (
     / "data"
     / "qtr_setup_telegram_pilot_audit.jsonl"
 )
+
+# Bound both read allocations and a pathological unterminated JSONL record.
+_SETUP_READ_CHUNK_BYTES = 64 * 1024
+_SETUP_MAX_LINE_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +77,8 @@ class JsonlVerifiedSetupProvider:
         self._file_identity: tuple[int, int] | None = None
         self._offset = 0
         self._pending = b""
+        self._discarding_oversized_line = False
+        self._oversize_warning_reported = False
         self._latest_by_symbol: dict[str, VerifiedSetupRecord] = {}
         self._bootstrap_scans = 0
         self._incremental_reads = 0
@@ -105,6 +112,7 @@ class JsonlVerifiedSetupProvider:
             self._refresh_locked()
 
             return self._latest_by_symbol.get(normalized)
+
     def latest_records(self) -> tuple[VerifiedSetupRecord, ...]:
         """Return one latest verified record per cached symbol."""
 
@@ -113,8 +121,8 @@ class JsonlVerifiedSetupProvider:
             return tuple(
                 self._latest_by_symbol[symbol]
                 for symbol in sorted(self._latest_by_symbol)
-
             )
+
     def _refresh_locked(self) -> None:
         try:
             metadata = self._path.stat()
@@ -142,63 +150,102 @@ class JsonlVerifiedSetupProvider:
                 if not stat.S_ISREG(metadata.st_mode):
                     self._reset_missing_locked()
                     return
-                data = stream.read()
+                self._begin_bootstrap_locked(metadata)
+                self._read_stream_locked(stream, metadata.st_size)
         except OSError:
             self._reset_missing_locked()
             return
+
+    def _begin_bootstrap_locked(self, metadata: os.stat_result) -> None:
         self._file_identity = _file_identity(metadata)
-        self._offset = len(data)
+        self._offset = 0
         self._pending = b""
+        self._discarding_oversized_line = False
         self._latest_by_symbol.clear()
         self._bootstrap_scans += 1
-        self._bytes_read += len(data)
-        self._consume_locked(data)
 
     def _read_increment_locked(self, expected_identity: tuple[int, int]) -> None:
         try:
             with self._path.open("rb") as stream:
                 metadata = os.fstat(stream.fileno())
+                if not stat.S_ISREG(metadata.st_mode):
+                    self._reset_missing_locked()
+                    return
                 identity = _file_identity(metadata)
                 if identity != expected_identity or metadata.st_size < self._offset:
                     self._reset_locked()
-                    data = stream.read()
-                    self._file_identity = identity
-                    self._offset = len(data)
-                    self._bootstrap_scans += 1
-                    self._bytes_read += len(data)
-                    self._consume_locked(data)
+                    self._begin_bootstrap_locked(metadata)
+                    self._read_stream_locked(stream, metadata.st_size)
                     return
                 stream.seek(self._offset)
-                data = stream.read()
+                if metadata.st_size > self._offset:
+                    self._read_stream_locked(stream, metadata.st_size, incremental=True)
         except OSError:
             return
-        if not data:
-            return
-        self._offset += len(data)
-        self._incremental_reads += 1
-        self._bytes_read += len(data)
-        self._consume_locked(data)
+
+    def _read_stream_locked(
+        self, stream: BinaryIO, stop_offset: int, *, incremental: bool = False
+    ) -> None:
+        # Read only through the fstat snapshot, so a busy writer cannot make a
+        # refresh chase appends forever. Offset includes a deferred partial line;
+        # _pending holds its bounded prefix until a later newline arrives.
+        while self._offset < stop_offset:
+            data = stream.read(min(_SETUP_READ_CHUNK_BYTES, stop_offset - self._offset))
+            if not data:
+                break
+            if incremental:
+                self._incremental_reads += 1
+                incremental = False
+            self._consume_locked(data)
+            self._offset += len(data)
+            self._bytes_read += len(data)
 
     def _consume_locked(self, data: bytes) -> None:
-        chunks = (self._pending + data).split(b"\n")
-        self._pending = chunks.pop()
-        for raw_line in chunks:
-            raw_line = raw_line.removesuffix(b"\r")
-            if not raw_line:
-                continue
-            try:
-                line = raw_line.decode("utf-8")
-            except UnicodeDecodeError:
+        start = 0
+        while start < len(data):
+            newline = data.find(b"\n", start)
+            end = len(data) if newline < 0 else newline
+            if self._discarding_oversized_line:
+                self._discarding_oversized_line = newline < 0
+            elif len(self._pending) + end - start > _SETUP_MAX_LINE_BYTES:
+                # Count once per oversized physical line, even over many reads
+                # or refreshes. Resume parsing only after its delimiter.
                 self._malformed_lines += 1
-                continue
-            record, malformed = _parse_record_line(line)
-            if malformed:
-                self._malformed_lines += 1
-            if record is None:
-                continue
-            current = self._latest_by_symbol.get(record.symbol)
-            if current is None or record.observed_at >= current.observed_at:
-                self._latest_by_symbol[record.symbol] = record
+                self._pending = b""
+                self._discarding_oversized_line = newline < 0
+                if not self._oversize_warning_reported:
+                    logging.getLogger(__name__).warning(
+                        "Setup audit line exceeds %s bytes; discarding through "
+                        "newline (historical file unchanged). Further oversized "
+                        "lines are counted in malformed_lines.",
+                        _SETUP_MAX_LINE_BYTES,
+                    )
+                    self._oversize_warning_reported = True
+            elif newline < 0:
+                self._pending += data[start:end]
+            else:
+                raw_line = self._pending + data[start:end]
+                self._pending = b""
+                self._consume_line_locked(raw_line)
+            start = end + 1
+
+    def _consume_line_locked(self, raw_line: bytes) -> None:
+        raw_line = raw_line.removesuffix(b"\r")
+        if not raw_line:
+            return
+        try:
+            line = raw_line.decode("utf-8")
+        except UnicodeDecodeError:
+            self._malformed_lines += 1
+            return
+        record, malformed = _parse_record_line(line)
+        if malformed:
+            self._malformed_lines += 1
+        if record is None:
+            return
+        current = self._latest_by_symbol.get(record.symbol)
+        if current is None or record.observed_at >= current.observed_at:
+            self._latest_by_symbol[record.symbol] = record
 
     def _reset_missing_locked(self) -> None:
         if (
@@ -213,6 +260,7 @@ class JsonlVerifiedSetupProvider:
         self._file_identity = None
         self._offset = 0
         self._pending = b""
+        self._discarding_oversized_line = False
         self._latest_by_symbol.clear()
         self._resets_rotations += 1
 
@@ -388,9 +436,7 @@ def _strings(value: object) -> tuple[str, ...]:
     if not isinstance(value, list):
         return ()
     strings = tuple(
-        item.strip()
-        for item in value
-        if isinstance(item, str) and item.strip()
+        item.strip() for item in value if isinstance(item, str) and item.strip()
     )
     return tuple(dict.fromkeys(strings))
 
