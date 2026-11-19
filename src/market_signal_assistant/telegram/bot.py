@@ -68,6 +68,10 @@ from market_signal_assistant.telegram.qtr_setup_pilot import (
 )
 from market_signal_assistant.telegram.qtr_trader import QtrTraderTelegramController
 from market_signal_assistant.telegram.trader_transport import TraderTelegramTransport
+from market_signal_assistant.telegram.scalper_commands import (
+    SCALPER_COMMANDS,
+    ScalperCommands,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -135,10 +139,14 @@ def execute_command(
     news_scan_interval_minutes: int = 60,
     qtr_setup_telegram_enabled: bool = False,
     qtr_micro_status: QtrMicroRuntimeStatus | None = None,
+    scalper_commands: ScalperCommands | None = None,
 ) -> TelegramExecution:
     if not is_allowed(chat_id, allowed_chat_ids, allow_all=allow_all):
         raise PermissionError("Chat is not allowed.")
     command = parse_command(text)
+    if command.name in SCALPER_COMMANDS:
+        messages = (scalper_commands or ScalperCommands()).execute(command.name)
+        return TelegramExecution(command, None, None, messages)
     if command.name in {"start", "help"}:
         return TelegramExecution(command, None, None, (HELP_TEXT,))
     if command.name == "status":
