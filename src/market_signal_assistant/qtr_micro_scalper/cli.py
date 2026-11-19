@@ -247,7 +247,8 @@ class ShadowCliRunner:
             )
             if not self._control_plane.publish(snapshot):
                 self._output("⚠️ Публикация Control Plane недоступна.")
-        except (OSError, RuntimeError, ValueError, TypeError):
+        except Exception:
+            # Operator projection/publication is never a runtime authority.
             self._output("⚠️ Снимок Control Plane недоступен.")
 
     def _now(self) -> datetime:

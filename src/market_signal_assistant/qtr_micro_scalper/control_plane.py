@@ -177,8 +177,10 @@ class ScalperControlPlane:
                 pipeline.retained_events,
                 pipeline.stale_data_suppressed,
                 self.last_publish_error,
+                details.recent_event_failures,
             ),
             version=VersionSection(SCHEMA_VERSION, self.code_sha),
+            recent_events=details.recent_events,
         )
 
     def publish(self, snapshot: ScalperControlSnapshot) -> bool:

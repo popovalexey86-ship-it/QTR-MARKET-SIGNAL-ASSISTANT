@@ -98,6 +98,7 @@ def test_immutable_model_roundtrip_and_no_lifecycle(tmp_path):
         "schema_version",
         "generated_at",
         "observed_at",
+        "recent_events",
         "stale_after_seconds",
         "runtime",
         "market",

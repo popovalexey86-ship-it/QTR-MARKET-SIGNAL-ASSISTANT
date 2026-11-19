@@ -439,7 +439,10 @@ class LiveShadowPipeline:
 
     def control_details(self) -> RuntimeDetails:
         count, trades = self._orchestrator.control_active_trades()
+        recent, failures = self._orchestrator.control_recent_events()
         return RuntimeDetails(
+            recent_events=recent,
+            recent_event_failures=failures,
             active_count=count,
             active=trades,
             symbols=tuple(

@@ -7,6 +7,8 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from threading import Lock
 
+from market_signal_assistant.qtr_micro_scalper.control_models import RecentEvent
+from market_signal_assistant.qtr_micro_scalper.operator_events import RecentEventFeed
 from market_signal_assistant.qtr_micro_scalper.scoring import (
     ScalperDecision,
     ScalperScore,
@@ -130,6 +132,8 @@ class ShadowRuntime:
         self._last_snapshot_at: dict[str, datetime] = {}
         self._journal: list[ShadowRuntimeEvent] = []
         self._lock = Lock()
+        self._operator_feed = RecentEventFeed()
+        self._operator_event_failures = 0
 
     def process_snapshot(
         self,
@@ -165,12 +169,27 @@ class ShadowRuntime:
             else:
                 self._active[updated.symbol] = updated
                 reason = f"Shadow trade advanced to {updated.stage.value}."
+            self._capture_operator_events(updated, runtime_events)
             return ShadowRuntimeUpdate(
                 trade=updated,
                 outcome=shadow_outcome(updated),
                 events=runtime_events,
                 reasons=(reason,),
             )
+
+    def _capture_operator_events(
+        self, trade: ShadowTrade, events: tuple[ShadowRuntimeEvent, ...]
+    ) -> None:
+        try:
+            self._operator_feed.capture(trade, events)
+        except Exception:
+            # Telemetry is explicitly non-authoritative. Never change the
+            # existing returned result, trading state, journal or error path.
+            self._operator_event_failures += 1
+
+    def operator_events(self) -> tuple[tuple[RecentEvent, ...], int]:
+        with self._lock:
+            return self._operator_feed.snapshot(), self._operator_event_failures
 
     def active_trades(self) -> tuple[ShadowTrade, ...]:
         with self._lock:
@@ -249,6 +268,7 @@ class ShadowRuntime:
         self._seen_trade_ids.add(trade.trade_id)
         self._active[trade.symbol] = trade
         self._journal.append(event)
+        self._capture_operator_events(trade, (event,))
         return ShadowRuntimeDecision(
             accepted=True,
             score=score,

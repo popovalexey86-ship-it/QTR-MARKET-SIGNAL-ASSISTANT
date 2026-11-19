@@ -13,6 +13,7 @@ from market_signal_assistant.qtr_micro_scalper.control_models import (
     MAX_ACTIVE_TRADES,
     MAX_TEXT,
     ActiveTrade,
+    RecentEvent,
 )
 from market_signal_assistant.qtr_micro_scalper.data.liquidity import (
     LiquidityIntelligence,
@@ -343,6 +344,9 @@ class ShadowOrchestrator:
         )
         with self._lock:
             return tuple(self._process_bar_locked(bar) for bar in ordered)
+
+    def control_recent_events(self) -> tuple[tuple[RecentEvent, ...], int]:
+        return self._runtime.operator_events()
 
     def control_active_trades(self) -> tuple[int, tuple[ActiveTrade, ...]]:
         """Project current runtime only; never hydrate or read journal history."""
