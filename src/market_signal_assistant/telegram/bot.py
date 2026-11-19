@@ -16,6 +16,7 @@ from market_signal_assistant.localized_argparse import RussianArgumentParser
 from market_signal_assistant.news.models import NewsReport
 from market_signal_assistant.news.notifications import NewsNotificationService
 from market_signal_assistant.news.provider import NewsDataError
+from market_signal_assistant.qtr_micro_scalper.control_store import ControlSnapshotStore
 from market_signal_assistant.settings import (
     EarlyDiscoverySettings,
     InPlayAutoSettings,
@@ -50,6 +51,11 @@ from market_signal_assistant.telegram.parsing import ParsedCommand, parse_comman
 from market_signal_assistant.telegram.scalper_commands import (
     SCALPER_COMMANDS,
     ScalperCommands,
+)
+from market_signal_assistant.telegram.scalper_notifications import (
+    ScalperCursorStore,
+    ScalperNotifier,
+    ScalperNotifyConfig,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -362,13 +368,44 @@ def _run_sdk_bot_handlers(
     timing_audit_loop: InPlayTimingAuditLoop | None = None
     early_discovery_loop: EarlyDiscoveryLoop | None = None
     news_auto_loop: NewsAutoLoop | None = None
+    scalper_notifier: ScalperNotifier | None = None
+    try:
+        scalper_config = ScalperNotifyConfig.from_environment()
+        if not all(
+            is_allowed(chat, settings.allowed_chat_ids, allow_all=settings.allow_all)
+            for chat in scalper_config.chat_ids
+        ):
+            raise ValueError("Unapproved Scalper notification recipient")
+    except (OSError, ValueError):
+        _LOGGER.warning("Scalper notifications disabled: invalid configuration")
+        scalper_config = ScalperNotifyConfig()
 
     async def start_auto(application: Any) -> None:
-        nonlocal auto_loop, timing_audit_loop, early_discovery_loop, news_auto_loop
+        nonlocal \
+            auto_loop, \
+            timing_audit_loop, \
+            early_discovery_loop, \
+            news_auto_loop, \
+            scalper_notifier
 
         async def send(chat_id: int, text: str) -> None:
             await application.bot.send_message(chat_id=chat_id, text=text)
 
+        if scalper_config.chat_ids and scalper_config.cursor_path is not None:
+            try:
+                snapshots = ControlSnapshotStore()
+                scalper_notifier = ScalperNotifier(
+                    snapshots,
+                    ScalperCursorStore(scalper_config.cursor_path, snapshots.path),
+                    scalper_config,
+                    send,
+                )
+                scalper_notifier.start()
+            except (OSError, RuntimeError, ValueError):
+                _LOGGER.warning(
+                    "Scalper notifications unavailable; "
+                    "interactive commands remain enabled"
+                )
         if auto_settings.enabled:
             notifier = InPlayAutoNotifier(
                 scanner=inplay_service,
@@ -412,6 +449,8 @@ def _run_sdk_bot_handlers(
 
     async def stop_auto(application: Any) -> None:
         del application
+        if scalper_notifier is not None:
+            await scalper_notifier.stop()
         if timing_audit_loop is not None:
             await timing_audit_loop.stop()
         if early_discovery_loop is not None:
@@ -422,7 +461,7 @@ def _run_sdk_bot_handlers(
             await auto_loop.stop()
 
     builder = ApplicationBuilder().token(settings.bot_token)
-    lifecycle_enabled = False
+    lifecycle_enabled = bool(scalper_config.chat_ids)
     if auto_settings.enabled and not settings.allowed_chat_ids:
         _LOGGER.warning(
             "Автосканирование IN PLAY не запущено: "

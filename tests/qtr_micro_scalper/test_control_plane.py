@@ -282,7 +282,7 @@ def test_namespaced_commands_use_authorized_existing_router(tmp_path, command):
     if command == "scalper_active":
         assert result.messages == ("Активных теневых сделок нет.",)
     if command == "scalper_recent":
-        assert "пока не опубликованы" in result.messages[0]
+        assert "Недавних событий" in result.messages[0]
     if command == "scalper_version":
         assert "a" * 40 in result.messages[0]
 

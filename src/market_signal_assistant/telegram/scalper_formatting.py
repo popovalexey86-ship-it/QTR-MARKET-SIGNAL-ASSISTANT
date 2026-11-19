@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from market_signal_assistant.qtr_micro_scalper.control_models import RecentEvent
 from market_signal_assistant.qtr_micro_scalper.control_store import (
     ControlRead,
     SnapshotState,
@@ -119,5 +120,43 @@ def format_scalper_command(command: str, read: ControlRead) -> tuple[str, ...]:
             f"Код/deploy SHA: {s.version.code_sha}\nОбновлено: {generated}"
         )
     else:
-        text = "Недавние события пока не опубликованы Control Plane."
+        if s.schema_version == 1:
+            text = "Снимок V1 не содержит ленты событий Operator V2."
+        elif not s.recent_events:
+            text = "Недавних событий Scalper нет."
+        else:
+            text = "Последние события Scalper (не текущие позиции)\n\n" + "\n\n".join(
+                format_recent_event(event) for event in reversed(s.recent_events[-10:])
+            )
     return split_messages(text)
+
+
+def format_recent_event(event: RecentEvent) -> str:
+    side = " " + event.side if event.side else ""
+    stamp = event.occurred_at.isoformat()
+    if event.event_type == "OPEN":
+        price = (
+            f" · entry {event.entry_price:g}" if event.entry_price is not None else ""
+        )
+        text = f"🟢 OPEN {event.symbol}{side}{price}"
+    elif event.event_type == "CLOSED":
+        icon = (
+            "🔴"
+            if event.status == "LOSS"
+            else "✅"
+            if event.status in {"WIN", "FLAT"}
+            else "⚪"
+        )
+        result = (
+            f" · {event.result_r:+.2f}R"
+            if event.result_r is not None
+            else " · R неизвестен"
+        )
+        outcome = " · " + event.status if event.status else ""
+        reason = " · " + event.reason if event.reason else ""
+        text = f"{icon} CLOSED {event.symbol}{outcome}{result}{reason}"
+    elif event.event_type in {"EXPIRED", "NOT_TRIGGERED"}:
+        text = f"⚪ {event.event_type} {event.symbol} · не активирован"
+    else:
+        text = f"🔎 ENTRY_CANDIDATE {event.symbol}{side} · теневой план"
+    return f"{text}\n{stamp}"
