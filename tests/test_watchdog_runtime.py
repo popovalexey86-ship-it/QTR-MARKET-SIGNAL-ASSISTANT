@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -11,7 +12,11 @@ import pytest
 from market_signal_assistant.derivatives.models import DerivativesSnapshot
 from market_signal_assistant.inplay.models import CatalogInstrument
 from market_signal_assistant.models import AssetClass, Candle, Instrument, MarketSeries
-from market_signal_assistant.providers import MarketDataError
+from market_signal_assistant.providers import (
+    CatalogDiagnostics,
+    CatalogRowRejection,
+    MarketDataError,
+)
 from market_signal_assistant.watchdog.aggregation import ExplainableAnomalyAggregator
 from market_signal_assistant.watchdog.baselines import (
     BaselineObservation,
@@ -297,7 +302,45 @@ def test_dynamic_universe_refresh_adds_and_removes_without_restart(
         "eligible": "1",
         "rejected": "0",
         "removed": "1",
+        "provider_invalid_rows": "0",
+        "provider_invalid_symbols": "0",
+        "provider_rejection_reasons": "",
     }
+
+
+def test_provider_row_rejection_is_visible_in_health_audit_and_transition(
+    tmp_path: Path,
+) -> None:
+    clock = MutableClock(NOW)
+    provider = FixtureProvider(clock, ("ABCUSDT",))
+    runtime = _runtime(tmp_path, provider, clock, with_retention=True)
+    runtime.run_once(now=NOW)
+
+    provider.symbols = ("NEWUSDT",)
+    provider.catalog_diagnostics = CatalogDiagnostics(
+        2, 1, (CatalogRowRejection("ABCUSDT", "invalid_bid1Price"),)
+    )
+    clock.now = NOW + timedelta(minutes=16)
+    health = runtime.run_once(now=clock.now)
+
+    assert health.catalog_invalid_rows == 1
+    assert health.catalog_invalid_rows_total == 1
+    assert health.catalog_affected_symbols == ("ABCUSDT",)
+    assert health.catalog_rejection_reasons == (("invalid_bid1Price", 1),)
+    refreshes = [
+        item for item in OperationalAuditJournal(
+            tmp_path / "operational" / "runtime.jsonl"
+        ).records() if item["event_type"] == "UNIVERSE_REFRESH"
+    ]
+    assert refreshes[-1]["details"]["provider_invalid_rows"] == "1"
+    assert refreshes[-1]["details"]["provider_rejection_reasons"] == (
+        "invalid_bid1Price=1"
+    )
+    transition_path = tmp_path / "operational" / "universe-transitions.jsonl"
+    with transition_path.open(encoding="utf-8") as stream:
+        transitions = [json.loads(line) for line in stream]
+    removal = [item for item in transitions if item["symbol"] == "ABCUSDT"][-1]
+    assert removal["rejection_reasons"] == ["provider_invalid_bid1Price"]
 
 
 def test_construction_has_no_provider_or_network_side_effects(tmp_path: Path) -> None:

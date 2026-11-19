@@ -134,6 +134,10 @@ class RuntimeHealthSnapshot:
     retained_counts: tuple[tuple[str, int], ...] = ()
     provider_failures: int = 0
     outcome_mode: str = "FULL"
+    catalog_invalid_rows: int = 0
+    catalog_invalid_rows_total: int = 0
+    catalog_affected_symbols: tuple[str, ...] = ()
+    catalog_rejection_reasons: tuple[tuple[str, int], ...] = ()
 
     def __post_init__(self) -> None:
         for field in (

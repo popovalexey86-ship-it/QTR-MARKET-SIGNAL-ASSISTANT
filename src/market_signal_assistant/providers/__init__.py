@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
@@ -21,6 +23,40 @@ from market_signal_assistant.models import (
 
 class MarketDataError(RuntimeError):
     """A safe provider-level market data failure."""
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogRowRejection:
+    symbol: str | None
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogDiagnostics:
+    instrument_rows: int
+    valid_instruments: int
+    rejected: tuple[CatalogRowRejection, ...]
+
+    @property
+    def invalid_rows(self) -> int:
+        return len(self.rejected)
+
+    @property
+    def affected_symbols(self) -> tuple[str, ...]:
+        return tuple(sorted({item.symbol for item in self.rejected if item.symbol}))
+
+    @property
+    def reason_counts(self) -> tuple[tuple[str, int], ...]:
+        counts: dict[str, int] = {}
+        for item in self.rejected:
+            counts[item.reason] = counts.get(item.reason, 0) + 1
+        return tuple(sorted(counts.items()))
+
+
+class _CatalogRowError(ValueError):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 class MarketDataProvider(Protocol):
@@ -96,6 +132,7 @@ class BybitPublicProvider:
         self._timeout = timeout
         self._request_gate = request_gate or (lambda: None)
         self._request_observer = request_observer or (lambda: None)
+        self.catalog_diagnostics: CatalogDiagnostics | None = None
 
     def load(
         self,
@@ -147,6 +184,7 @@ class BybitPublicProvider:
         )
 
     def list_instruments(self) -> tuple[CatalogInstrument, ...]:
+        self.catalog_diagnostics = None
         info_rows = self._list_linear_instrument_rows()
         tickers = self._request(
             "https://api.bybit.com/v5/market/tickers?category=linear"
@@ -157,24 +195,49 @@ class BybitPublicProvider:
             ticker_rows = tickers["result"]["list"]
             if not isinstance(ticker_rows, list):
                 raise ValueError
-            ticker_by_symbol = {
-                str(row["symbol"]): row
-                for row in ticker_rows
-                if isinstance(row, Mapping)
-            }
-            instruments = tuple(
-                _catalog_instrument(row, ticker_by_symbol)
-                for row in info_rows
-                if isinstance(row, Mapping)
+            ticker_by_symbol: dict[str, Mapping[str, Any]] = {}
+            duplicate_symbols: set[str] = set()
+            rejected: list[CatalogRowRejection] = []
+            for row in ticker_rows:
+                if not isinstance(row, Mapping):
+                    rejected.append(CatalogRowRejection(None, "invalid_ticker_row"))
+                    continue
+                symbol = row.get("symbol")
+                if not isinstance(symbol, str) or not symbol.strip():
+                    rejected.append(CatalogRowRejection(None, "invalid_ticker_symbol"))
+                    continue
+                if symbol in ticker_by_symbol:
+                    duplicate_symbols.add(symbol)
+                else:
+                    ticker_by_symbol[symbol] = row
+            instruments_list: list[CatalogInstrument] = []
+            for row in info_rows:
+                if not isinstance(row, Mapping):
+                    rejected.append(CatalogRowRejection(None, "invalid_instrument_row"))
+                    continue
+                symbol = row.get("symbol")
+                symbol_name = (
+                    symbol if isinstance(symbol, str) and symbol.strip() else None
+                )
+                try:
+                    if symbol_name in duplicate_symbols:
+                        raise _CatalogRowError("duplicate_ticker")
+                    instruments_list.append(_catalog_instrument(row, ticker_by_symbol))
+                except _CatalogRowError as error:
+                    rejected.append(CatalogRowRejection(symbol_name, error.reason))
+            self.catalog_diagnostics = CatalogDiagnostics(
+                len(info_rows), len(instruments_list), tuple(rejected)
             )
         except (KeyError, TypeError, ValueError):
             raise MarketDataError(
                 "Malformed Bybit instrument catalog response."
             ) from None
-        return instruments
+        if not instruments_list:
+            raise MarketDataError("Bybit instrument catalog has no valid instruments.")
+        return tuple(instruments_list)
 
-    def _list_linear_instrument_rows(self) -> list[Mapping[str, Any]]:
-        rows: list[Mapping[str, Any]] = []
+    def _list_linear_instrument_rows(self) -> list[object]:
+        rows: list[object] = []
         cursor: str | None = None
         seen_cursors: set[str] = set()
         while True:
@@ -193,7 +256,7 @@ class BybitPublicProvider:
                 next_cursor = result.get("nextPageCursor", "")
                 if not isinstance(page, list) or not isinstance(next_cursor, str):
                     raise ValueError
-                rows.extend(item for item in page if isinstance(item, Mapping))
+                rows.extend(page)
             except (KeyError, TypeError, ValueError):
                 raise MarketDataError(
                     "Malformed Bybit instrument catalog response."
@@ -229,28 +292,69 @@ def _catalog_instrument(
     row: Mapping[str, Any],
     ticker_by_symbol: Mapping[str, Mapping[str, Any]],
 ) -> CatalogInstrument:
+    symbol = _required_catalog_text(row, "symbol")
+    ticker = ticker_by_symbol.get(symbol)
+    if ticker is None:
+        raise _CatalogRowError("missing_ticker")
+    is_pre_listing = row.get("isPreListing")
+    if not isinstance(is_pre_listing, bool):
+        raise _CatalogRowError("invalid_isPreListing")
+    symbol_type = row.get("symbolType")
+    if not isinstance(symbol_type, str):
+        raise _CatalogRowError("invalid_symbolType")
     try:
-        symbol = str(row["symbol"])
-        ticker = ticker_by_symbol.get(symbol, {})
-        is_pre_listing = row["isPreListing"]
-        if not isinstance(is_pre_listing, bool):
-            raise ValueError
+        launch_time = _catalog_launch_time(row.get("launchTime"))
+    except MarketDataError:
+        raise _CatalogRowError("invalid_launchTime") from None
+    bid = _catalog_market_number(ticker, "bid1Price", positive=True)
+    ask = _catalog_market_number(ticker, "ask1Price", positive=True)
+    if ask < bid:
+        raise _CatalogRowError("crossed_top_of_book")
+    quote_coin = _required_catalog_text(row, "quoteCoin")
+    status = _required_catalog_text(row, "status")
+    turnover = _catalog_market_number(ticker, "turnover24h")
+    base_coin = _required_catalog_text(row, "baseCoin")
+    settle_coin = _required_catalog_text(row, "settleCoin")
+    contract_type = _required_catalog_text(row, "contractType")
+    try:
         return CatalogInstrument(
             symbol=symbol,
-            quote_coin=str(row["quoteCoin"]),
-            status=str(row["status"]),
-            turnover_24h=float(ticker.get("turnover24h", 0.0)),
-            bid=float(ticker.get("bid1Price", 0.0)),
-            ask=float(ticker.get("ask1Price", 0.0)),
-            base_coin=str(row["baseCoin"]),
-            settle_coin=str(row["settleCoin"]),
-            contract_type=str(row["contractType"]),
-            symbol_type=str(row["symbolType"]),
+            quote_coin=quote_coin,
+            status=status,
+            turnover_24h=turnover,
+            bid=bid,
+            ask=ask,
+            base_coin=base_coin,
+            settle_coin=settle_coin,
+            contract_type=contract_type,
+            symbol_type=symbol_type,
             is_pre_listing=is_pre_listing,
-            launch_time=_catalog_launch_time(row.get("launchTime")),
+            launch_time=launch_time,
         )
-    except (KeyError, TypeError, ValueError):
-        raise MarketDataError("Malformed Bybit instrument catalog response.") from None
+    except ValueError:
+        raise _CatalogRowError("invalid_catalog_metadata") from None
+
+
+def _required_catalog_text(row: Mapping[str, Any], field: str) -> str:
+    value = row.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise _CatalogRowError(f"invalid_{field}")
+    return value
+
+
+def _catalog_market_number(
+    row: Mapping[str, Any], field: str, *, positive: bool = False
+) -> float:
+    value = row.get(field)
+    if isinstance(value, bool) or value is None or value == "":
+        raise _CatalogRowError(f"invalid_{field}")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise _CatalogRowError(f"invalid_{field}") from None
+    if not math.isfinite(number) or number < 0 or (positive and number <= 0):
+        raise _CatalogRowError(f"invalid_{field}")
+    return number
 
 
 def _catalog_launch_time(value: object) -> datetime | None:

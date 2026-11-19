@@ -16,6 +16,7 @@ from typing import Protocol, TypeVar
 from market_signal_assistant.derivatives.models import DerivativesSnapshot
 from market_signal_assistant.inplay.models import CatalogInstrument
 from market_signal_assistant.models import AssetClass, Candle, Instrument, MarketSeries
+from market_signal_assistant.providers import CatalogDiagnostics
 from market_signal_assistant.watchdog.engine import WatchdogDetectionEngine
 from market_signal_assistant.watchdog.events.journal import WatchdogEventJournal
 from market_signal_assistant.watchdog.events.models import WatchdogEventEvidence
@@ -202,6 +203,8 @@ class WatchdogShadowRuntime:
         self._symbols_failed = 0
         self._provider_errors = 0
         self._provider_failures = 0
+        self._catalog_diagnostics: CatalogDiagnostics | None = None
+        self._catalog_invalid_rows_total = 0
         self._rate_limit_events = 0
         self._api_calls = 0
         self._api_call_times: deque[float] = deque()
@@ -608,6 +611,22 @@ class WatchdogShadowRuntime:
             retained_counts=self._retained_counts(),
             provider_failures=self._provider_failures,
             outcome_mode=self._outcome_mode,
+            catalog_invalid_rows=(
+                self._catalog_diagnostics.invalid_rows
+                if self._catalog_diagnostics is not None
+                else 0
+            ),
+            catalog_invalid_rows_total=self._catalog_invalid_rows_total,
+            catalog_affected_symbols=(
+                self._catalog_diagnostics.affected_symbols
+                if self._catalog_diagnostics is not None
+                else ()
+            ),
+            catalog_rejection_reasons=(
+                self._catalog_diagnostics.reason_counts
+                if self._catalog_diagnostics is not None
+                else ()
+            ),
         )
 
     def _retained_counts(self) -> tuple[tuple[str, int], ...]:
@@ -721,6 +740,7 @@ class WatchdogShadowRuntime:
             instruments = self._provider_call(
                 "universe", None, self._universe_provider.list_instruments
             )
+            self._record_catalog_diagnostics()
             snapshot = self._universe_builder.build(
                 instruments,
                 observed_at=now,
@@ -743,6 +763,7 @@ class WatchdogShadowRuntime:
                         baseline_samples=self._baseline_counts(now),
                     )
         except Exception as error:
+            self._record_catalog_diagnostics()
             self._degraded(f"universe:{type(error).__name__}", now)
             return
         current = {item.instrument.symbol for item in snapshot.eligible}
@@ -751,6 +772,10 @@ class WatchdogShadowRuntime:
                 item.instrument.symbol: item.tier.value for item in snapshot.eligible
             }
             rejected = dict(snapshot.rejected)
+            if self._catalog_diagnostics is not None:
+                for item in self._catalog_diagnostics.rejected:
+                    if item.symbol is not None:
+                        rejected.setdefault(item.symbol, (f"provider_{item.reason}",))
             available_at = max(_utc(self._clock()), now)
             for symbol in sorted(previous | current):
                 old = self._transition_membership.get(symbol)
@@ -803,8 +828,43 @@ class WatchdogShadowRuntime:
                 ("added", str(len(current - previous))),
                 ("removed", str(len(previous - current))),
                 ("rejected", str(len(snapshot.rejected))),
+                (
+                    "provider_invalid_rows",
+                    str(self._catalog_diagnostics.invalid_rows)
+                    if self._catalog_diagnostics is not None
+                    else "0",
+                ),
+                (
+                    "provider_invalid_symbols",
+                    str(len(self._catalog_diagnostics.affected_symbols))
+                    if self._catalog_diagnostics is not None
+                    else "0",
+                ),
+                (
+                    "provider_rejection_reasons",
+                    ",".join(
+                        f"{reason}={count}"
+                        for reason, count in self._catalog_diagnostics.reason_counts
+                    )
+                    if self._catalog_diagnostics is not None
+                    else "",
+                ),
             ),
         )
+
+    def _record_catalog_diagnostics(self) -> None:
+        if not hasattr(self._universe_provider, "catalog_diagnostics"):
+            return
+        diagnostics = getattr(self._universe_provider, "catalog_diagnostics", None)
+        if diagnostics is None:
+            self._catalog_diagnostics = None
+            return
+        if not isinstance(diagnostics, CatalogDiagnostics):
+            return
+        if diagnostics is self._catalog_diagnostics:
+            return
+        self._catalog_diagnostics = diagnostics
+        self._catalog_invalid_rows_total += diagnostics.invalid_rows
 
     def _skip_inactive_buckets(
         self, symbol: str, tier: str | None, now: datetime

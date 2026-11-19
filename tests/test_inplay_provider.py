@@ -176,3 +176,128 @@ def test_bybit_catalog_rejects_repeated_pagination_cursor() -> None:
 
     with pytest.raises(MarketDataError, match="repeated"):
         BybitPublicProvider(getter=getter).list_instruments()
+
+
+def _info_row(symbol: str) -> dict[str, object]:
+    return {
+        "symbol": symbol,
+        "baseCoin": symbol.removesuffix("USDT"),
+        "quoteCoin": "USDT",
+        "settleCoin": "USDT",
+        "contractType": "LinearPerpetual",
+        "symbolType": "",
+        "status": "Trading",
+        "isPreListing": False,
+    }
+
+
+def _ticker_row(symbol: str) -> dict[str, object]:
+    return {
+        "symbol": symbol,
+        "turnover24h": "125000000",
+        "bid1Price": "60000",
+        "ask1Price": "60006",
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("bid1Price", ""),
+        ("ask1Price", ""),
+        ("bid1Price", None),
+        ("ask1Price", float("nan")),
+        ("bid1Price", float("inf")),
+        ("turnover24h", "bad"),
+        ("turnover24h", -1),
+        ("ask1Price", 0),
+    ],
+)
+def test_bybit_catalog_isolates_invalid_ticker_row_and_recovers(
+    field: str, value: object
+) -> None:
+    bad = _ticker_row("BITOUSDT")
+    bad[field] = value
+    ticker_rows = [_ticker_row("BTCUSDT"), bad]
+
+    def getter(url: str, timeout: float) -> Mapping[str, Any]:
+        del timeout
+        rows = (
+            [_info_row("BTCUSDT"), _info_row("BITOUSDT")]
+            if "instruments-info" in url
+            else ticker_rows
+        )
+        return {"retCode": 0, "result": {"list": rows}}
+
+    provider = BybitPublicProvider(getter=getter)
+    instruments = provider.list_instruments()
+    assert [item.symbol for item in instruments] == ["BTCUSDT"]
+    assert instruments[0].bid == 60000
+    diagnostics = provider.catalog_diagnostics
+    assert diagnostics is not None
+    assert diagnostics.instrument_rows == 2
+    assert diagnostics.valid_instruments == 1
+    assert diagnostics.invalid_rows == 1
+    assert diagnostics.affected_symbols == ("BITOUSDT",)
+    assert diagnostics.reason_counts == ((f"invalid_{field}", 1),)
+
+    ticker_rows[1] = _ticker_row("BITOUSDT")
+    recovered = provider.list_instruments()
+    assert [item.symbol for item in recovered] == ["BTCUSDT", "BITOUSDT"]
+    assert provider.catalog_diagnostics is not None
+    assert provider.catalog_diagnostics.invalid_rows == 0
+
+
+@pytest.mark.parametrize(
+    "bad_row",
+    [
+        {"symbol": "BITOUSDT", "bid1Price": ""},
+        {"symbol": "BITOUSDT", "bid1Price": None},
+        {"symbol": "BITOUSDT", "bid1Price": "NaN"},
+    ],
+)
+def test_bybit_catalog_never_fabricates_missing_market_observations(
+    bad_row: dict[str, object]
+) -> None:
+    def getter(url: str, timeout: float) -> Mapping[str, Any]:
+        del timeout
+        rows = (
+            [_info_row("BITOUSDT")]
+            if "instruments-info" in url
+            else [bad_row]
+        )
+        return {"retCode": 0, "result": {"list": rows}}
+
+    provider = BybitPublicProvider(getter=getter)
+    with pytest.raises(MarketDataError, match="no valid instruments"):
+        provider.list_instruments()
+    assert provider.catalog_diagnostics is not None
+    assert provider.catalog_diagnostics.affected_symbols == ("BITOUSDT",)
+
+
+def test_bybit_catalog_empty_fails_closed() -> None:
+    def getter(url: str, timeout: float) -> Mapping[str, Any]:
+        del url, timeout
+        return {"retCode": 0, "result": {"list": []}}
+
+    with pytest.raises(MarketDataError, match="no valid instruments"):
+        BybitPublicProvider(getter=getter).list_instruments()
+
+
+def test_bybit_catalog_invalid_metadata_isolated_from_valid_instrument() -> None:
+    invalid = _info_row("BITOUSDT")
+    invalid["baseCoin"] = None
+
+    def getter(url: str, timeout: float) -> Mapping[str, Any]:
+        del timeout
+        rows = (
+            [_info_row("BTCUSDT"), invalid]
+            if "instruments-info" in url
+            else [_ticker_row("BTCUSDT"), _ticker_row("BITOUSDT")]
+        )
+        return {"retCode": 0, "result": {"list": rows}}
+
+    provider = BybitPublicProvider(getter=getter)
+    assert [item.symbol for item in provider.list_instruments()] == ["BTCUSDT"]
+    assert provider.catalog_diagnostics is not None
+    assert provider.catalog_diagnostics.reason_counts == (("invalid_baseCoin", 1),)
