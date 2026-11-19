@@ -11,12 +11,40 @@ from datetime import UTC, datetime
 from functools import cache
 from typing import cast, get_args, get_origin, get_type_hints
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+MAX_RECENT_EVENTS = 20
 MAX_SNAPSHOT_BYTES = 128 * 1024
 MAX_ACTIVE_TRADES = 20
 MAX_SYMBOLS = 50
 MAX_BLOCKERS = 10
 MAX_TEXT = 300
+
+
+@dataclass(frozen=True, slots=True)
+class RecentEvent:
+    event_id: str
+    event_type: str
+    occurred_at: datetime
+    symbol: str
+    trade_id: str | None
+    side: str | None
+    entry_price: float | None
+    exit_price: float | None
+    result_r: float | None
+    reason: str | None
+    status: str | None
+
+    @property
+    def order_key(self) -> str:
+        rank = {
+            "ENTRY_CANDIDATE": 0,
+            "OPEN": 1,
+            "CLOSED": 2,
+            "EXPIRED": 2,
+            "NOT_TRIGGERED": 2,
+        }[self.event_type]
+        stamp = self.occurred_at.astimezone(UTC).isoformat(timespec="microseconds")
+        return f"{stamp}|{rank}|{self.event_id}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +73,8 @@ class RuntimeDetails:
     micro_profit_enabled: bool | None = None
     protected_runner_enabled: bool | None = None
     live_enabled: bool | None = None
+    recent_events: tuple[RecentEvent, ...] = ()
+    recent_event_failures: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +144,7 @@ class ResourcesSection:
     retained_events: int
     stale_data_suppressed: int
     previous_publish_error: str | None
+    recent_event_failures: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +167,7 @@ class ScalperControlSnapshot:
     experiments: tuple[Experiment, ...]
     resources: ResourcesSection
     version: VersionSection
+    recent_events: tuple[RecentEvent, ...] = ()
 
 
 class UnsupportedControlSchema(ValueError):
@@ -164,10 +196,18 @@ def snapshot_from_bytes(data: bytes) -> ScalperControlSnapshot:
         raise ValueError("Control snapshot must be an object")
     if type(payload.get("schema_version")) is not int:
         raise ValueError("Missing/malformed control schema")
-    if payload["schema_version"] != SCHEMA_VERSION:
+    schema = payload["schema_version"]
+    if schema not in {1, SCHEMA_VERSION}:
         raise UnsupportedControlSchema("Unsupported control schema")
+    if schema == 1:
+        if "recent_events" in payload:
+            raise ValueError("Unexpected V2 fields in V1 snapshot")
+        payload["recent_events"] = []
+        if not isinstance(payload.get("resources"), dict):
+            raise ValueError("Malformed V1 resources")
+        payload["resources"] = dict(payload["resources"], recent_event_failures=0)
     result = cast(ScalperControlSnapshot, _decode(ScalperControlSnapshot, payload))
-    if result.version.schema_version != SCHEMA_VERSION:
+    if result.version.schema_version != schema:
         raise UnsupportedControlSchema("Inconsistent control schema")
     if not 1 <= result.stale_after_seconds <= 3600:
         raise ValueError("Invalid control freshness threshold")
@@ -233,6 +273,37 @@ def snapshot_from_bytes(data: bytes) -> ScalperControlSnapshot:
         "Protected Runner",
     }:
         raise ValueError("Invalid experiment identities")
+    if len(result.recent_events) > MAX_RECENT_EVENTS:
+        raise ValueError("Too many recent events")
+    keys = []
+    for event in result.recent_events:
+        if event.event_type not in {
+            "ENTRY_CANDIDATE",
+            "OPEN",
+            "CLOSED",
+            "EXPIRED",
+            "NOT_TRIGGERED",
+        }:
+            raise ValueError("Unsupported lifecycle event")
+        if (
+            not re.fullmatch(r"operator-[0-9a-f]{64}", event.event_id)
+            or not event.symbol
+        ):
+            raise ValueError("Invalid operator event identity")
+        if event.side not in {None, "LONG", "SHORT"}:
+            raise ValueError("Invalid operator side")
+        if event.status not in {None, "WIN", "LOSS", "FLAT", "NOT_TRIGGERED"}:
+            raise ValueError("Invalid operator outcome")
+        if any(
+            price is not None and price <= 0
+            for price in (event.entry_price, event.exit_price)
+        ):
+            raise ValueError("Invalid operator price")
+        keys.append(event.order_key)
+    if keys != sorted(keys) or len(
+        {event.event_id for event in result.recent_events}
+    ) != len(keys):
+        raise ValueError("Recent events must be unique and oldest first")
     return result
 
 
