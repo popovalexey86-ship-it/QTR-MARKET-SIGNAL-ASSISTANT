@@ -8,9 +8,11 @@ from market_signal_assistant.application.models import (
 )
 from market_signal_assistant.catalog import CRYPTO_PRESET, MARKETS_PRESET
 from market_signal_assistant.models import AssetClass, Instrument
+from market_signal_assistant.telegram.scalper_commands import SCALPER_COMMANDS
 
 SUPPORTED_COMMANDS = frozenset(
     {"start", "help", "screen", "crypto", "markets", "status", "inplay", "news"}
+    | SCALPER_COMMANDS
 )
 
 
@@ -27,7 +29,7 @@ def parse_command(text: str) -> ParsedCommand:
     name = tokens[0][1:].split("@", 1)[0].lower()
     if name not in SUPPORTED_COMMANDS:
         raise ValueError("команда не поддерживается. Используйте /help.")
-    if name in {"start", "help", "status", "inplay", "news"}:
+    if name in {"start", "help", "status", "inplay", "news"} | SCALPER_COMMANDS:
         if len(tokens) != 1:
             raise ValueError(f"команда /{name} не принимает параметры.")
         return ParsedCommand(name)
