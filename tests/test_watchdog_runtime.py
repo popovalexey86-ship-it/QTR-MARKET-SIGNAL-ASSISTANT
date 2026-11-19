@@ -39,6 +39,10 @@ from market_signal_assistant.watchdog.outcomes.scheduler import (
     JsonOutcomeCheckpointStore,
 )
 from market_signal_assistant.watchdog.runtime.audit import OperationalAuditJournal
+from market_signal_assistant.watchdog.runtime.control_snapshot import (
+    ControlSnapshotPublisher,
+    load_control_snapshot,
+)
 from market_signal_assistant.watchdog.runtime.detection_only import (
     DetectionOnlyOutcomes,
 )
@@ -216,6 +220,28 @@ def test_detection_only_preserves_event_evidence_without_outcome_graph(
     )
     assert resumed.run_once(now=NOW).events_today == 1
     assert len(WatchdogEventJournal(pilot_root / "events/events.jsonl").records()) == 1
+
+
+def test_detection_only_panel_snapshot_matches_event_and_does_not_change_runtime(
+    tmp_path: Path,
+) -> None:
+    clock = MutableClock(NOW)
+    provider = FixtureProvider(clock, ("ABCUSDT",))
+    publisher = ControlSnapshotPublisher(tmp_path / "state/control-panel.json")
+    runtime = _runtime(
+        tmp_path, provider, clock, detection_only=True, control_snapshot=publisher
+    )
+    health = runtime.run_once(now=NOW)
+    payload = load_control_snapshot(tmp_path / "state/control-panel.json")
+    assert payload is not None
+    assert payload["eligible_count"] == 1
+    assert payload["symbols"][0]["symbol"] == "ABCUSDT"
+    event = WatchdogEventJournal(tmp_path / "events/events.jsonl").records()[0]
+    assert payload["symbols"][0]["event_id"] == event.event_id
+    assert payload["symbols"][0]["score"] == event.anomaly_score
+    assert health.control_snapshot_failures == 0
+    assert health.pending_outcomes == 0
+    assert not (tmp_path / "outcomes").exists()
 
 def test_symbol_failure_is_isolated_without_global_degradation(tmp_path: Path) -> None:
     clock = MutableClock(NOW)
@@ -781,6 +807,7 @@ def _runtime(
     derivatives_provider: FailingDerivativesProvider | None = None,
     with_retention: bool = False,
     detection_only: bool = False,
+    control_snapshot: ControlSnapshotPublisher | None = None,
 ) -> WatchdogShadowRuntime:
     baselines = RollingBaselineEngine(
         JsonBaselineStore(root / "state" / "baselines.json"),
@@ -875,6 +902,7 @@ def _runtime(
         baseline_retained_counts=lambda: baselines.retained_counts,
         universe_transitions=transitions,
         inactive_retention=retention,
+        control_snapshot=control_snapshot,
     )
 
 

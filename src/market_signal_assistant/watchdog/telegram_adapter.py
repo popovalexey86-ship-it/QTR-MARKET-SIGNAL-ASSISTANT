@@ -70,9 +70,7 @@ class TelegramHttpSender:
                     raise DeliveryError("API_RESPONSE", retry_after=30) from None
                 if not isinstance(payload, dict) or payload.get("ok") is not True:
                     code = (
-                        payload.get("error_code")
-                        if isinstance(payload, dict)
-                        else None
+                        payload.get("error_code") if isinstance(payload, dict) else None
                     )
                     if code == 429:
                         raise DeliveryError(
@@ -142,6 +140,7 @@ class WatchdogTelegramAdapter:
         chat_id: str,
         minimum_spacing_seconds: float = 1.0,
         clock: Callable[[], float] = time.time,
+        panel_enabled: bool = False,
     ) -> None:
         if not token or not chat_id or minimum_spacing_seconds <= 0:
             raise ValueError("Telegram credentials and positive spacing are required")
@@ -153,6 +152,7 @@ class WatchdogTelegramAdapter:
         self.chat_id = chat_id
         self.spacing = minimum_spacing_seconds
         self.clock = clock
+        self.panel_enabled = panel_enabled
         state_db.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(state_db, isolation_level=None, timeout=10)
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -170,6 +170,17 @@ class WatchdogTelegramAdapter:
             "next_attempt REAL NOT NULL DEFAULT 0, "
             "last_error TEXT, enqueued_at REAL NOT NULL DEFAULT 0)"
         )
+        if panel_enabled:
+            self.db.execute(
+                "CREATE TABLE IF NOT EXISTS panel_events ("
+                "event_id TEXT PRIMARY KEY, detected_ts REAL NOT NULL, "
+                "symbol TEXT NOT NULL, score REAL NOT NULL, "
+                "anomaly_types TEXT NOT NULL)"
+            )
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS panel_events_time "
+                "ON panel_events(detected_ts)"
+            )
         # Existing pilot state remains readable. An old pending row has unknown
         # age (zero) and must be reviewed, never silently treated as fresh.
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(outbox)")}
@@ -193,8 +204,13 @@ class WatchdogTelegramAdapter:
             self.db.execute(
                 "INSERT INTO cursor(id,device,inode,offset,skip_partial,"
                 "destination_hash) VALUES(1,?,?,?,?,?)",
-                (stat.st_dev, stat.st_ino, stat.st_size, skip_partial,
-                 destination_hash),
+                (
+                    stat.st_dev,
+                    stat.st_ino,
+                    stat.st_size,
+                    skip_partial,
+                    destination_hash,
+                ),
             )
         elif existing_cursor[0] != destination_hash:
             self.db.close()
@@ -274,6 +290,21 @@ class WatchdogTelegramAdapter:
                             "event_id,payload_hash,text,status,enqueued_at) "
                             "VALUES(?,?,?,'PENDING',?)",
                             (event.event_id, digest, format_event(event), self.clock()),
+                        )
+                    if self.panel_enabled:
+                        self.db.execute(
+                            "INSERT OR IGNORE INTO panel_events("
+                            "event_id,detected_ts,symbol,score,anomaly_types) "
+                            "VALUES(?,?,?,?,?)",
+                            (
+                                event.event_id,
+                                event.detected_at.timestamp(),
+                                event.symbol,
+                                event.anomaly_score,
+                                json.dumps(
+                                    [item.value for item in event.anomaly_types]
+                                ),
+                            ),
                         )
                     updated = self.db.execute(
                         "UPDATE cursor SET device=?,inode=?,offset=? "

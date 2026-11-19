@@ -33,6 +33,9 @@ from market_signal_assistant.watchdog.outcomes.scheduler import (
     JsonOutcomeCheckpointStore,
 )
 from market_signal_assistant.watchdog.runtime.audit import OperationalAuditJournal
+from market_signal_assistant.watchdog.runtime.control_snapshot import (
+    ControlSnapshotPublisher,
+)
 from market_signal_assistant.watchdog.runtime.detection_only import (
     DetectionOnlyOutcomes,
     ensure_dataset_mode,
@@ -154,8 +157,10 @@ def build_bybit_shadow_runtime(
         settings.api_calls_per_minute,
         on_wait=lambda delay: holder["runtime"].record_throttle_wait(delay),
     )
+
     def observer() -> None:
         holder["runtime"].record_api_call()
+
     market = BybitPublicProvider(
         timeout=settings.provider_timeout,
         request_gate=budget.acquire,
@@ -213,9 +218,7 @@ def build_bybit_shadow_runtime(
         outcomes=outcome_scheduler,
         outcome_mode="DETECTION_ONLY" if detection_only else "FULL",
         cursors=cursors,
-        audit=OperationalAuditJournal(
-            data_root / "operational" / "runtime.jsonl"
-        ),
+        audit=OperationalAuditJournal(data_root / "operational" / "runtime.jsonl"),
         health_store=JsonRuntimeHealthStore(data_root / "state" / "health.json"),
         config=settings,
         polling=polling,
@@ -230,6 +233,11 @@ def build_bybit_shadow_runtime(
         baseline_retained_counts=lambda: baselines.retained_counts,
         universe_transitions=transitions,
         inactive_retention=retention,
+        control_snapshot=(
+            ControlSnapshotPublisher(data_root / "state" / "control-panel.json")
+            if detection_only
+            else None
+        ),
     )
     holder["runtime"] = runtime
     return ShadowRuntimeBundle(runtime, budget)

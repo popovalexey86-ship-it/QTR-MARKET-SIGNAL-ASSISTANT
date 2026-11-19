@@ -1,0 +1,29 @@
+[Unit]
+Description=QTR Watchdog Telegram control panel and evidence projector (isolated)
+After=network-online.target
+Wants=network-online.target
+ConditionPathIsDirectory=__WATCHDOG_DATA_ROOT__
+ConditionPathExists=__WATCHDOG_DATA_ROOT__/events/events.jsonl
+
+[Service]
+Type=exec
+User=qtr
+Group=qtr
+WorkingDirectory=__WATCHDOG_CHECKOUT__
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/qtr/watchdog-telegram.env
+ExecStart=__PYTHON__ -m market_signal_assistant.watchdog.runtime.telegram --event-journal __WATCHDOG_DATA_ROOT__/events/events.jsonl --state-db __ADAPTER_STATE_ROOT__/delivery.sqlite3 --panel-root __WATCHDOG_DATA_ROOT__ --poll-seconds 2 --minimum-spacing-seconds 1
+Restart=no
+TimeoutStopSec=30s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=__WATCHDOG_DATA_ROOT__
+ReadWritePaths=__ADAPTER_STATE_ROOT__
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

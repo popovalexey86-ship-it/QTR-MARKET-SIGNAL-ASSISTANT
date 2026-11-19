@@ -138,6 +138,7 @@ class RuntimeHealthSnapshot:
     catalog_invalid_rows_total: int = 0
     catalog_affected_symbols: tuple[str, ...] = ()
     catalog_rejection_reasons: tuple[tuple[str, int], ...] = ()
+    control_snapshot_failures: int = 0
 
     def __post_init__(self) -> None:
         for field in (

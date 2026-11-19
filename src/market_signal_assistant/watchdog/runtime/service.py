@@ -28,6 +28,10 @@ from market_signal_assistant.watchdog.runtime.audit import (
     OperationalEvent,
     OperationalEventType,
 )
+from market_signal_assistant.watchdog.runtime.control_snapshot import (
+    ControlSnapshotError,
+    ControlSnapshotPublisher,
+)
 from market_signal_assistant.watchdog.runtime.detection_only import (
     DetectionOnlyOutcomes,
 )
@@ -148,6 +152,7 @@ class WatchdogShadowRuntime:
         baseline_retained_counts: Callable[[], tuple[int, int, int]] | None = None,
         universe_transitions: UniverseTransitionJournal | None = None,
         inactive_retention: InactiveRetention | None = None,
+        control_snapshot: ControlSnapshotPublisher | None = None,
     ) -> None:
         self._universe_provider = universe_provider
         self._market_provider = market_provider
@@ -179,6 +184,8 @@ class WatchdogShadowRuntime:
             universe_transitions.current() if universe_transitions is not None else {}
         )
         self._inactive_retention = inactive_retention
+        self._control_snapshot = control_snapshot
+        self._control_snapshot_failures = 0
         self._scheduler = CompletedBucketScheduler(self._config.maximum_catchup_buckets)
         self._retry = RetryPolicy(
             self._config.retry_attempts,
@@ -611,6 +618,7 @@ class WatchdogShadowRuntime:
             retained_counts=self._retained_counts(),
             provider_failures=self._provider_failures,
             outcome_mode=self._outcome_mode,
+            control_snapshot_failures=self._control_snapshot_failures,
             catalog_invalid_rows=(
                 self._catalog_diagnostics.invalid_rows
                 if self._catalog_diagnostics is not None
@@ -661,6 +669,12 @@ class WatchdogShadowRuntime:
             ),
             ("inflight_symbols", inflight_symbols),
             ("inflight_futures", inflight_futures),
+            (
+                "control_snapshot_symbols",
+                self._control_snapshot.retained_count
+                if self._control_snapshot is not None
+                else 0,
+            ),
             ("event_journal_ram_index", self._events.retained_index_entries),
             ("outcome_journal_ram_index", outcome_journal_index),
             ("price_journal_ram_index", price_journal_index),
@@ -973,6 +987,17 @@ class WatchdogShadowRuntime:
                             event_count += 1
                         self._outcomes.register(evidence)
                     self._cursors.save(symbol, interval, boundary)
+                    if self._control_snapshot is not None:
+                        try:
+                            close = (
+                                _last_completed_candle(series, detected_at).close
+                                if result.snapshot.completed_candle_count
+                                else None
+                            )
+                            self._control_snapshot.capture(entry, result, close=close)
+                        except (ValueError, TypeError):
+                            # Read-model failure cannot mark a valid bucket failed.
+                            self._control_snapshot_failures += 1
                     processed += 1
                 pending_symbols = {
                     item.symbol for item in self._outcomes.pending_horizons()
@@ -1243,6 +1268,14 @@ class WatchdogShadowRuntime:
             self._outcomes.recover_pending()
             if self._indexes is not None:
                 self._indexes.ensure()
+            if self._control_snapshot is not None and self._universe is not None:
+                try:
+                    self._control_snapshot.publish(
+                        self._universe, now=_utc(self._clock())
+                    )
+                except (OSError, ControlSnapshotError):
+                    # The optional panel must not change detection or cursors.
+                    self._control_snapshot_failures += 1
             self._write_health()
 
     def _mark_started(self, now: datetime) -> None:
@@ -1253,12 +1286,14 @@ class WatchdogShadowRuntime:
         self._audit(
             OperationalEventType.RUNTIME_START,
             self._started_at,
-            ((
-                "mode",
-                "detection-only"
-                if self._outcome_mode == "DETECTION_ONLY"
-                else "shadow-only",
-            ),),
+            (
+                (
+                    "mode",
+                    "detection-only"
+                    if self._outcome_mode == "DETECTION_ONLY"
+                    else "shadow-only",
+                ),
+            ),
         )
         self._audit(
             OperationalEventType.RECOVERY,
