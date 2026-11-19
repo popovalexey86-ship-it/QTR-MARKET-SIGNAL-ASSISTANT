@@ -12,6 +12,8 @@ from pathlib import Path
 from statistics import fmean, pstdev
 from typing import Any
 
+from market_signal_assistant.watchdog.jsonl_io import read_bounded_line
+
 BASELINE_SCHEMA_VERSION = 2
 
 
@@ -72,7 +74,11 @@ class JsonBaselineStore:
     def path(self) -> Path:
         return self._path
 
-    def load(self) -> tuple[BaselineObservation, ...]:
+    def load(
+        self, *, maximum_samples: int = 240
+    ) -> tuple[BaselineObservation, ...]:
+        if maximum_samples <= 0:
+            raise ValueError("Baseline maximum_samples must be positive.")
         if not self._path.exists():
             snapshot: tuple[BaselineObservation, ...] = ()
         else:
@@ -97,13 +103,9 @@ class JsonBaselineStore:
                 raise BaselineStateError(
                     "Watchdog baseline state is invalid."
                 ) from error
-        return self._merge_updates(snapshot)
+        return self._merge_bounded(snapshot, maximum_samples)
 
     def save(self, observations: tuple[BaselineObservation, ...]) -> None:
-        payload = {
-            "version": BASELINE_SCHEMA_VERSION,
-            "observations": [_observation_to_json(item) for item in observations],
-        }
         temporary: Path | None = None
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -116,7 +118,19 @@ class JsonBaselineStore:
                 delete=False,
             ) as stream:
                 temporary = Path(stream.name)
-                json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
+                stream.write(
+                    '{"observations":['
+                )
+                for index, item in enumerate(observations):
+                    if index:
+                        stream.write(",")
+                    json.dump(
+                        _observation_to_json(item),
+                        stream,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                stream.write(f'],"version":{BASELINE_SCHEMA_VERSION}}}')
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, self._path)
@@ -155,43 +169,68 @@ class JsonBaselineStore:
         if not self._updates_path.exists():
             return 0
         with self._updates_path.open("rb") as stream:
-            return sum(1 for line in stream if line.endswith(b"\n"))
+            count = 0
+            while raw := read_bounded_line(stream):
+                if not raw.endswith(b"\n"):
+                    raise BaselineStateError("Incomplete baseline update log.")
+                count += 1
+            return count
 
-    def _merge_updates(
-        self, snapshot: tuple[BaselineObservation, ...]
+    def _merge_bounded(
+        self, snapshot: tuple[BaselineObservation, ...], maximum_samples: int
     ) -> tuple[BaselineObservation, ...]:
-        if not self._updates_path.exists():
-            return snapshot
-        merged = list(snapshot)
-        identities = {
-            (item.symbol, item.scope, item.feature, item.available_at): item
-            for item in snapshot
+        rings: dict[tuple[str, str, str], deque[BaselineObservation]] = {}
+
+        def retain(item: BaselineObservation) -> None:
+            key = (item.symbol, item.scope, item.feature)
+            ring = rings.setdefault(key, deque(maxlen=maximum_samples))
+            if ring and item.available_at <= ring[-1].available_at:
+                if item == ring[-1]:
+                    return
+                raise BaselineStateError("Baseline update chronology is invalid.")
+            ring.append(item)
+
+        for item in sorted(snapshot, key=lambda value: value.available_at):
+            retain(item)
+        # A crash after replacing the compact snapshot but before unlinking the
+        # update log leaves an overlapping, otherwise valid log to replay.
+        snapshot_last = {
+            key: ring[-1].available_at for key, ring in rings.items()
         }
-        try:
-            with self._updates_path.open("r", encoding="utf-8") as stream:
-                for raw in stream:
-                    if not raw.endswith("\n"):
-                        continue
-                    item = _observation_from_json(json.loads(raw))
-                    key = (item.symbol, item.scope, item.feature, item.available_at)
-                    existing = identities.get(key)
-                    if existing is not None:
-                        if existing != item:
-                            raise ValueError
-                        continue
-                    identities[key] = item
-                    merged.append(item)
-        except (
-            OSError,
-            ValueError,
-            TypeError,
-            KeyError,
-            json.JSONDecodeError,
-        ) as error:
-            raise BaselineStateError(
-                "Watchdog baseline updates are invalid."
-            ) from error
-        return tuple(merged)
+        snapshot_items = {
+            (key, item.available_at): item
+            for key, ring in rings.items()
+            for item in ring
+        }
+        log_last: dict[tuple[str, str, str], datetime] = {}
+        if self._updates_path.exists():
+            try:
+                with self._updates_path.open("rb") as stream:
+                    while raw := read_bounded_line(stream):
+                        if not raw.endswith(b"\n"):
+                            raise BaselineStateError("Incomplete baseline update log.")
+                        item = _observation_from_json(json.loads(raw))
+                        key = (item.symbol, item.scope, item.feature)
+                        previous = log_last.get(key)
+                        if previous is not None and item.available_at <= previous:
+                            raise BaselineStateError(
+                                "Baseline update chronology is invalid."
+                            )
+                        log_last[key] = item.available_at
+                        floor = snapshot_last.get(key)
+                        if floor is not None and item.available_at <= floor:
+                            existing = snapshot_items.get((key, item.available_at))
+                            if existing is not None and existing != item:
+                                raise BaselineStateError(
+                                    "Baseline update conflicts with snapshot."
+                                )
+                            continue
+                        retain(item)
+            except (OSError, ValueError, TypeError, KeyError) as error:
+                raise BaselineStateError(
+                    "Watchdog baseline updates are invalid."
+                ) from error
+        return tuple(item for ring in rings.values() for item in ring)
 
 
 class RollingBaselineEngine:
@@ -212,7 +251,10 @@ class RollingBaselineEngine:
         self._rings: dict[
             tuple[str, str, str], deque[BaselineObservation]
         ] = {}
-        for item in sorted(store.load(), key=lambda value: value.available_at):
+        for item in sorted(
+            store.load(maximum_samples=maximum_samples),
+            key=lambda value: value.available_at,
+        ):
             self._ring_for(item).append(item)
         self._pending_updates = store.pending_update_count
         if self._pending_updates >= maximum_samples * 4:

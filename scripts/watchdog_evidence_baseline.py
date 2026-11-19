@@ -11,6 +11,10 @@ from market_signal_assistant.watchdog.evidence_baseline import (
     render_report,
     render_rows_jsonl,
 )
+from market_signal_assistant.watchdog.offline_budget import (
+    add_budget_arguments,
+    enforce_budget,
+)
 
 
 def main() -> int:
@@ -19,8 +23,15 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rows-output", type=Path)
     parser.add_argument("--verify-sqlite", action="store_true")
+    add_budget_arguments(parser)
     args = parser.parse_args()
     provenance = DatasetProvenance.from_manifest(args.manifest)
+    enforce_budget(
+        parser,
+        roots=(provenance.path,),
+        max_input_mib=args.max_input_mib,
+        max_address_space_mib=args.max_address_space_mib,
+    )
     output = args.output.resolve()
     if output.is_relative_to(provenance.path):
         parser.error("Report must be written outside the immutable source dataset.")

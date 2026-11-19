@@ -6,6 +6,10 @@ import json
 import tracemalloc
 from pathlib import Path
 
+from market_signal_assistant.watchdog.offline_budget import (
+    add_budget_arguments,
+    enforce_budget,
+)
 from market_signal_assistant.watchdog.runtime.composition import (
     build_bybit_shadow_runtime,
 )
@@ -16,7 +20,14 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("data_root", type=Path)
     parser.add_argument("--top", type=int, default=20)
+    add_budget_arguments(parser)
     args = parser.parse_args()
+    enforce_budget(
+        parser,
+        roots=(args.data_root,),
+        max_input_mib=args.max_input_mib,
+        max_address_space_mib=args.max_address_space_mib,
+    )
 
     # A single frame is sufficient for module attribution and avoids making
     # the diagnostic itself dominate RSS on large forensic datasets.

@@ -3,7 +3,26 @@
 This is an **offline deployment review artifact**. No runtime, unit, Telegram
 request, or data root is started or created by this document. The observer uses
 the existing public-market shadow composition with 8 symbols per loop and a
-60-call/minute API budget. It does not change detectors, state, or outcomes.
+60-call/minute API budget. The pilot unit selects `--detection-only`: detectors,
+scoring, PIT checks, state transitions and event evidence keep their contracts,
+while the outcome scheduler is not constructed.
+
+## Detection-only dataset contract
+
+- Use a new empty data root. The supervisor pins `DETECTION_ONLY` in
+  `state/runtime-mode.json` before the worker starts. A missing or corrupt mode
+  manifest after events have been recorded, a mode switch, or any pending,
+  price-observation or outcome state blocks recovery. Never reuse an Evidence
+  V1/V2 or full-outcome data root.
+- The worker persists the same deterministic event evidence before acknowledging
+  a bucket cursor. No pending graph, raw-price journal, outcome journal or
+  `state/pending.json` is produced. Health reports `outcome_mode=DETECTION_ONLY`
+  and zero pending outcomes. An event can be sent by the separate Telegram
+  adapter only after its append-only journal record exists.
+- Restart after a clean stop reopens the event journal and acknowledged bucket
+  cursors. Missing or corrupt cursor/checkpoint evidence fails closed. This
+  dataset cannot be used as an Evidence Baseline outcome cohort: it contains
+  detections only, with no `+1/+5/+15/+30/+60m` outcomes.
 
 ## Pair and source switch
 
@@ -42,7 +61,7 @@ the existing public-market shadow composition with 8 symbols per loop and a
 - Existing runtime disk-pressure threshold is 1 GiB or 5% free. The supervisor
   stops earlier, below 4 GiB or 10% free. Startup requires >=1 GiB
   MemAvailable; operation requires >=512 MiB. These are operational reserves,
-  not changes to runtime detection or outcome semantics.
+  not changes to runtime detection semantics.
 - Outbox stops the pair at >1000 outstanding rows or oldest enqueue age >1h.
   A BLOCKED row stops it immediately. Telegram 429/5xx/network retries remain
   adapter behavior; a prolonged outage becomes observable backlog. Old rows

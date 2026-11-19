@@ -249,7 +249,19 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("root", type=Path)
     parser.add_argument("--systemd-log", type=Path)
+    from market_signal_assistant.watchdog.offline_budget import (
+        add_budget_arguments,
+        enforce_budget,
+    )
+
+    add_budget_arguments(parser)
     args = parser.parse_args()
+    enforce_budget(
+        parser,
+        roots=(args.root,) + ((args.systemd_log,) if args.systemd_log else ()),
+        max_input_mib=args.max_input_mib,
+        max_address_space_mib=args.max_address_space_mib,
+    )
     print(
         json.dumps(build_report(args.root, args.systemd_log), indent=2, sort_keys=True)
     )

@@ -25,6 +25,9 @@ class WatchdogPriceJournal:
     def recovery(self) -> JournalRecovery:
         return self._journal.recovery
 
+    def assert_complete(self) -> None:
+        self._journal.assert_complete()
+
     def append(self, point: PriceObservation) -> bool:
         return self._journal.append(point.observation_id, _payload(point))
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import signal
 import tempfile
@@ -60,6 +61,10 @@ def main(argv: list[str] | None = None) -> int:
         stale_after_seconds=args.liveness_timeout_seconds,
     )
     target = args.duration_hours * 3600.0
+    if checkpoint and abs(float(checkpoint["target_seconds"]) - target) > 1e-6:
+        raise SoakLivenessError(
+            "soak checkpoint target differs from requested duration"
+        )
     if confirmed.accumulated_seconds >= target:
         print(json.dumps(inspect(args.data_root), sort_keys=True, default=str))
         return 0
@@ -193,12 +198,48 @@ def _health_time(value: object) -> datetime | None:
 
 def _load_checkpoint(path: Path) -> dict[str, Any]:
     if not path.exists():
+        root = path.parent.parent
+        if any(
+            (root / relative).exists()
+            for relative in (
+                "state/health.json",
+                "state/buckets.json",
+                "state/pending.json",
+                "state/symbols.json",
+                "state/baselines.json",
+                "state/observer.json",
+                "events/events.jsonl",
+                "outcomes/outcomes.jsonl",
+                "outcomes/price_observations.jsonl",
+            )
+        ):
+            raise SoakLivenessError("soak checkpoint missing for existing data")
         return {}
     try:
         value: Any = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return value if isinstance(value, dict) and value.get("version") == 1 else {}
+        if not isinstance(value, dict) or value.get("version") != 1:
+            raise ValueError("schema")
+        seconds = value["accumulated_seconds"]
+        target = value["target_seconds"]
+        if any(
+            isinstance(item, bool)
+            or not isinstance(item, (int, float))
+            or not math.isfinite(item)
+            or item < 0
+            for item in (seconds, target)
+        ) or target <= 0:
+            raise ValueError("duration")
+        for field in ("segment_started_at", "checkpointed_at"):
+            _health_time(value[field])
+        if not isinstance(value["status"], str) or not value["status"]:
+            raise ValueError("status")
+        if isinstance(value["pid"], bool) or not isinstance(value["pid"], int):
+            raise ValueError("pid")
+    except (OSError, ValueError, KeyError, TypeError, SoakLivenessError) as error:
+        raise SoakLivenessError(
+            "soak checkpoint invalid; recovery requires review"
+        ) from error
+    return value
 
 
 def _save_checkpoint(

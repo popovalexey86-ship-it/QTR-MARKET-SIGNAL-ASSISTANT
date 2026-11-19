@@ -21,6 +21,7 @@ from typing import TypeVar, cast
 
 from market_signal_assistant.watchdog.events.journal import _event_from_payload
 from market_signal_assistant.watchdog.events.models import WatchdogEventEvidence
+from market_signal_assistant.watchdog.jsonl_io import read_bounded_line
 from market_signal_assistant.watchdog.models import watchdog_event_id
 from market_signal_assistant.watchdog.outcomes.journal import _from_payload
 from market_signal_assistant.watchdog.outcomes.models import (
@@ -174,7 +175,9 @@ def _jsonl(path: Path, issues: list[str]) -> Iterator[tuple[int, dict[str, objec
         issues.append(f"missing source: {path.name}")
         return
     with path.open("rb") as stream:
-        for line_number, line in enumerate(stream, 1):
+        line_number = 0
+        while line := read_bounded_line(stream):
+            line_number += 1
             if not line.endswith(b"\n"):
                 issues.append(f"{path.name}:{line_number}: unterminated JSONL line")
             try:

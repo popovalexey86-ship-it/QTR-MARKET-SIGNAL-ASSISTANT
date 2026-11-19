@@ -29,6 +29,10 @@ from market_signal_assistant.watchdog.journal import JournalConflictError
 from market_signal_assistant.watchdog.runtime.composition import (
     build_bybit_shadow_runtime,
 )
+from market_signal_assistant.watchdog.runtime.detection_only import (
+    RuntimeModeError,
+    ensure_dataset_mode,
+)
 from market_signal_assistant.watchdog.runtime.index import IndexRecoveryError
 from market_signal_assistant.watchdog.runtime.liveness import (
     ConfirmedHealthyClock,
@@ -39,6 +43,7 @@ from market_signal_assistant.watchdog.runtime.lock import (
     SingleInstanceLock,
 )
 from market_signal_assistant.watchdog.runtime.models import ShadowRuntimeConfig
+from market_signal_assistant.watchdog.runtime.schedule import BucketCursorError
 from market_signal_assistant.watchdog.runtime.soak import _runtime_liveness
 
 INTEGRITY_EXIT = 78
@@ -428,7 +433,13 @@ def supervise(
         return code
 
 
-def worker(root: Path, symbols_per_loop: int, api_calls_per_minute: int) -> int:
+def worker(
+    root: Path,
+    symbols_per_loop: int,
+    api_calls_per_minute: int,
+    *,
+    detection_only: bool = False,
+) -> int:
     stop = Event()
 
     def request_stop(_signum: int, _frame: object) -> None:
@@ -443,6 +454,7 @@ def worker(root: Path, symbols_per_loop: int, api_calls_per_minute: int) -> int:
                 maximum_symbols_per_loop=symbols_per_loop,
                 api_calls_per_minute=api_calls_per_minute,
             ),
+            detection_only=detection_only,
         ).runtime
     except Exception as error:  # noqa: BLE001 - classify recovery failure
         return _failure_exit(error)
@@ -478,6 +490,8 @@ def _failure_exit(error: Exception) -> int:
             (
                 DuplicateInstanceError,
                 IndexRecoveryError,
+                BucketCursorError,
+                RuntimeModeError,
                 JournalConflictError,
                 sqlite3.DatabaseError,
                 ValueError,
@@ -508,12 +522,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--symbols-per-loop", type=int, default=8)
     parser.add_argument("--api-calls-per-minute", type=int, default=60)
     parser.add_argument("--worker", action="store_true")
+    parser.add_argument("--detection-only", action="store_true")
     args = parser.parse_args(argv)
     if args.symbols_per_loop <= 0 or args.api_calls_per_minute <= 0:
         parser.error("polling and API limits must be positive")
     root = args.data_root.resolve()
     if args.worker:
-        return worker(root, args.symbols_per_loop, args.api_calls_per_minute)
+        return worker(
+            root,
+            args.symbols_per_loop,
+            args.api_calls_per_minute,
+            detection_only=args.detection_only,
+        )
     if args.adapter_state_db is None:
         parser.error("--adapter-state-db is required for supervisor")
     if not root.is_dir():
@@ -536,6 +556,7 @@ def main(argv: list[str] | None = None) -> int:
             verify_integrity=True,
         )
         check_adapter(state)
+        ensure_dataset_mode(root, detection_only=args.detection_only)
         load_checkpoint(root / "state/observer.json", root)
     except ObserverFailure as error:
         print(f"observer preflight blocked: {error}")
@@ -557,6 +578,7 @@ def main(argv: list[str] | None = None) -> int:
                 str(args.symbols_per_loop),
                 "--api-calls-per-minute",
                 str(args.api_calls_per_minute),
+                *(["--detection-only"] if args.detection_only else []),
             ]
         )
 

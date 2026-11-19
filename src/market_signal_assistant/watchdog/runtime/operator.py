@@ -3,11 +3,13 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
-from collections import Counter
+from collections import Counter, deque
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from market_signal_assistant.watchdog.jsonl_io import read_bounded_line
 from market_signal_assistant.watchdog.runtime.storage import StorageMonitor
 
 
@@ -20,8 +22,16 @@ def inspect(data_root: Path, *, now: datetime | None = None) -> dict[str, object
         if last_loop_raw is not None
         else None
     )
-    audit = _jsonl(data_root / "operational" / "runtime.jsonl")
-    gaps = _jsonl(data_root / "operational" / "gaps.jsonl")
+    audit_types: Counter[str] = Counter()
+    audit_count = 0
+    for item in _jsonl(data_root / "operational" / "runtime.jsonl"):
+        audit_count += 1
+        audit_types[str(item.get("event_type"))] += 1
+    gaps: deque[dict[str, Any]] = deque(maxlen=100)
+    gap_count = 0
+    for item in _jsonl(data_root / "operational" / "gaps.jsonl"):
+        gap_count += 1
+        gaps.append(item)
     states = _json(data_root / "state" / "symbols.json")
     baselines = _json(data_root / "state" / "baselines.json")
     storage = StorageMonitor(data_root).snapshot(recorded_at=current)
@@ -37,13 +47,15 @@ def inspect(data_root: Path, *, now: datetime | None = None) -> dict[str, object
             last_loop is None
             or current - last_loop.astimezone(UTC) > timedelta(minutes=5)
         ),
-        "audit_records": len(audit),
-        "audit_types": dict(Counter(str(item.get("event_type")) for item in audit)),
+        "audit_records": audit_count,
+        "audit_types": dict(audit_types),
         "state_symbols": len(states.get("symbols", [])) if states else 0,
         "baseline_observations": (
             len(baselines.get("observations", [])) if baselines else 0
         ),
-        "gaps": gaps,
+        "gaps": list(gaps),
+        "gaps_total": gap_count,
+        "gaps_truncated": gap_count > len(gaps),
         "storage": {
             "total_bytes": storage.total_bytes,
             "jsonl_bytes": storage.jsonl_bytes,
@@ -71,21 +83,24 @@ def _json(path: Path) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _jsonl(path: Path) -> list[dict[str, Any]]:
+def _jsonl(path: Path) -> Iterator[dict[str, Any]]:
     if not path.exists():
-        return []
-    result: list[dict[str, Any]] = []
+        return
     with path.open("rb") as stream:
-        for raw in stream:
+        line_number = 0
+        while raw := read_bounded_line(stream):
+            line_number += 1
             if not raw.endswith(b"\n"):
-                continue
+                raise ValueError(f"Incomplete immutable journal {path}:{line_number}")
             try:
                 item: Any = json.loads(raw.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                continue
-            if isinstance(item, dict):
-                result.append(item)
-    return result
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ValueError(
+                    f"Corrupt immutable journal {path}:{line_number}"
+                ) from error
+            if not isinstance(item, dict):
+                raise ValueError(f"Invalid immutable journal {path}:{line_number}")
+            yield item
 
 
 def _read_index(path: Path) -> dict[str, object]:

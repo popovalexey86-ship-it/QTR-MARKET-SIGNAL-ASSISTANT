@@ -33,6 +33,10 @@ from market_signal_assistant.watchdog.outcomes.scheduler import (
     JsonOutcomeCheckpointStore,
 )
 from market_signal_assistant.watchdog.runtime.audit import OperationalAuditJournal
+from market_signal_assistant.watchdog.runtime.detection_only import (
+    DetectionOnlyOutcomes,
+    ensure_dataset_mode,
+)
 from market_signal_assistant.watchdog.runtime.gaps import GapLedger
 from market_signal_assistant.watchdog.runtime.health import JsonRuntimeHealthStore
 from market_signal_assistant.watchdog.runtime.index import (
@@ -49,7 +53,10 @@ from market_signal_assistant.watchdog.runtime.retention import (
     InactiveSymbolArchive,
 )
 from market_signal_assistant.watchdog.runtime.retry import ApiRequestBudget
-from market_signal_assistant.watchdog.runtime.schedule import JsonBucketCursorStore
+from market_signal_assistant.watchdog.runtime.schedule import (
+    BucketCursorError,
+    JsonBucketCursorStore,
+)
 from market_signal_assistant.watchdog.runtime.service import WatchdogShadowRuntime
 from market_signal_assistant.watchdog.runtime.storage import (
     StorageMonitor,
@@ -72,6 +79,30 @@ class ShadowRuntimeBundle:
     request_budget: ApiRequestBudget
 
 
+def _has_prior_progress(root: Path) -> bool:
+    if any(
+        (root / relative).exists()
+        for relative in (
+            "state/health.json",
+            "state/symbols.json",
+            "state/baselines.json",
+            "state/baselines.updates.jsonl",
+            "state/pending.json",
+            "state/soak.json",
+            "state/inactive.sqlite3",
+        )
+    ):
+        return True
+    return any(
+        path.exists() and path.stat().st_size > 0
+        for path in (
+            root / "events/events.jsonl",
+            root / "outcomes/outcomes.jsonl",
+            root / "outcomes/price_observations.jsonl",
+        )
+    )
+
+
 def build_bybit_shadow_runtime(
     data_root: Path,
     *,
@@ -79,8 +110,43 @@ def build_bybit_shadow_runtime(
     polling: PollingPolicy | None = None,
     universe_policy: UniversePolicy | None = None,
     clock: Callable[[], datetime] | None = None,
+    detection_only: bool = False,
 ) -> ShadowRuntimeBundle:
     """Compose the public-data runtime without starting it or opening sockets."""
+    ensure_dataset_mode(data_root, detection_only=detection_only)
+    events = WatchdogEventJournal(data_root / "events" / "events.jsonl")
+    events.assert_complete()
+    outcome_scheduler: ForwardOutcomeScheduler | DetectionOnlyOutcomes
+    sources: tuple[JournalIndexSource, ...]
+    if detection_only:
+        outcome_scheduler = DetectionOnlyOutcomes(events)
+        sources = (JournalIndexSource("events", events.path, "event_id"),)
+    else:
+        outcome_journal = WatchdogOutcomeJournal(
+            data_root / "outcomes" / "outcomes.jsonl"
+        )
+        price_journal = WatchdogPriceJournal(
+            data_root / "outcomes" / "price_observations.jsonl"
+        )
+        for critical in (outcome_journal, price_journal):
+            critical.assert_complete()
+        outcome_scheduler = ForwardOutcomeScheduler(
+            events,
+            outcome_journal,
+            JsonOutcomeCheckpointStore(data_root / "state" / "pending.json"),
+            prices=price_journal,
+        )
+        sources = (
+            JournalIndexSource("events", events.path, "event_id"),
+            JournalIndexSource("prices", price_journal.path, "observation_id"),
+            JournalIndexSource("outcomes", outcome_journal.path, "outcome_id"),
+        )
+    if not (data_root / "state" / "buckets.json").exists() and _has_prior_progress(
+        data_root
+    ):
+        raise BucketCursorError(
+            "Bucket cursor missing for existing runtime; recovery requires review."
+        )
     settings = config or ShadowRuntimeConfig()
     runtime_clock = clock or (lambda: datetime.now(UTC))
     holder: dict[str, WatchdogShadowRuntime] = {}
@@ -118,19 +184,6 @@ def build_bybit_shadow_runtime(
         WatchdogStateMachine(),
         states,
     )
-    events = WatchdogEventJournal(data_root / "events" / "events.jsonl")
-    outcome_journal = WatchdogOutcomeJournal(
-        data_root / "outcomes" / "outcomes.jsonl"
-    )
-    price_journal = WatchdogPriceJournal(
-        data_root / "outcomes" / "price_observations.jsonl"
-    )
-    outcome_scheduler = ForwardOutcomeScheduler(
-        events,
-        outcome_journal,
-        JsonOutcomeCheckpointStore(data_root / "state" / "pending.json"),
-        prices=price_journal,
-    )
     cursors = JsonBucketCursorStore(data_root / "state" / "buckets.json")
     transitions = UniverseTransitionJournal(
         data_root / "operational" / "universe-transitions.jsonl"
@@ -144,11 +197,7 @@ def build_bybit_shadow_runtime(
     )
     indexes = WatchdogIndexManager(
         data_root / "state" / "evidence.sqlite3",
-        (
-            JournalIndexSource("events", events.path, "event_id"),
-            JournalIndexSource("prices", price_journal.path, "observation_id"),
-            JournalIndexSource("outcomes", outcome_journal.path, "outcome_id"),
-        ),
+        sources,
     )
     runtime = WatchdogShadowRuntime(
         universe_provider=market,
@@ -162,6 +211,7 @@ def build_bybit_shadow_runtime(
         states=states,
         events=events,
         outcomes=outcome_scheduler,
+        outcome_mode="DETECTION_ONLY" if detection_only else "FULL",
         cursors=cursors,
         audit=OperationalAuditJournal(
             data_root / "operational" / "runtime.jsonl"

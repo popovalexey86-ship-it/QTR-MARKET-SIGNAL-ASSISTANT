@@ -133,6 +133,7 @@ class RuntimeHealthSnapshot:
     committed_after_timeout: int = 0
     retained_counts: tuple[tuple[str, int], ...] = ()
     provider_failures: int = 0
+    outcome_mode: str = "FULL"
 
     def __post_init__(self) -> None:
         for field in (

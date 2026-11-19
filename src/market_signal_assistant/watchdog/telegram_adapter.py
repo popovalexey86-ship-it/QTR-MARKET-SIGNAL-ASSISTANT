@@ -19,6 +19,10 @@ from typing import Protocol, cast
 
 from market_signal_assistant.watchdog.events.journal import _event_from_payload
 from market_signal_assistant.watchdog.events.models import WatchdogEventEvidence
+from market_signal_assistant.watchdog.jsonl_io import (
+    JsonlLineTooLong,
+    read_bounded_line,
+)
 
 _LABELS = {
     "COMPRESSION": "Сжатие диапазона",
@@ -218,11 +222,12 @@ class WatchdogTelegramAdapter:
         with self.journal.open("rb") as stream:
             stream.seek(offset)
             while count < limit:
-                line = stream.readline(1024 * 1024 + 1)
+                try:
+                    line = read_bounded_line(stream)
+                except JsonlLineTooLong as error:
+                    raise JournalChangedError("event line exceeds limit") from error
                 if not line:
                     break
-                if len(line) > 1024 * 1024:
-                    raise JournalChangedError("event line exceeds limit")
                 if not line.endswith(b"\n"):
                     break  # writer is still completing this line
                 if skip_partial:

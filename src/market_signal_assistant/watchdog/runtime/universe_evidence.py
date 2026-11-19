@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -83,34 +82,30 @@ class UniverseTransitionJournal:
         current: dict[str, tuple[str, str | None]] = {}
         if not self._path.exists():
             return current
-        with self._path.open(encoding="utf-8") as stream:
-            for line in stream:
-                if not line.endswith("\n"):
-                    continue
-                value: Any = json.loads(line)
-                symbol = str(value["symbol"])
-                if value["new_eligible"]:
-                    current[symbol] = (str(value["new_tier"]), value["new_state"])
-                else:
-                    current.pop(symbol, None)
+        for value in self._journal.iter_records():
+            symbol = str(value["symbol"])
+            if value["new_eligible"]:
+                state = value["new_state"]
+                current[symbol] = (
+                    str(value["new_tier"]),
+                    None if state is None else str(state),
+                )
+            else:
+                current.pop(symbol, None)
         return current
 
     def last_removals(self, symbols: set[str]) -> dict[str, datetime]:
         removed: dict[str, datetime] = {}
         if not self._path.exists():
             return removed
-        with self._path.open(encoding="utf-8") as stream:
-            for line in stream:
-                if not line.endswith("\n"):
-                    continue
-                value: Any = json.loads(line)
-                symbol = str(value["symbol"])
-                if symbol not in symbols:
-                    continue
-                if value["new_eligible"]:
-                    removed.pop(symbol, None)
-                else:
-                    removed[symbol] = datetime.fromisoformat(value["observed_at"])
+        for value in self._journal.iter_records():
+            symbol = str(value["symbol"])
+            if symbol not in symbols:
+                continue
+            if value["new_eligible"]:
+                removed.pop(symbol, None)
+            else:
+                removed[symbol] = datetime.fromisoformat(str(value["observed_at"]))
         return removed
 
     @property

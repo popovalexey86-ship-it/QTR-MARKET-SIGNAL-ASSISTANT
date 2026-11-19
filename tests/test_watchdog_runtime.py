@@ -34,6 +34,9 @@ from market_signal_assistant.watchdog.outcomes.scheduler import (
     JsonOutcomeCheckpointStore,
 )
 from market_signal_assistant.watchdog.runtime.audit import OperationalAuditJournal
+from market_signal_assistant.watchdog.runtime.detection_only import (
+    DetectionOnlyOutcomes,
+)
 from market_signal_assistant.watchdog.runtime.gaps import GapLedger
 from market_signal_assistant.watchdog.runtime.health import JsonRuntimeHealthStore
 from market_signal_assistant.watchdog.runtime.models import ShadowRuntimeConfig
@@ -173,6 +176,41 @@ def test_runtime_persists_event_outcomes_and_restart_state(tmp_path: Path) -> No
         "UNIVERSE_REFRESH",
     }
 
+
+def test_detection_only_preserves_event_evidence_without_outcome_graph(
+    tmp_path: Path,
+) -> None:
+    clock = MutableClock(NOW)
+    full_root = tmp_path / "full"
+    pilot_root = tmp_path / "pilot"
+    full = _runtime(full_root, FixtureProvider(clock, ("ABCUSDT",)), clock)
+    pilot = _runtime(
+        pilot_root,
+        FixtureProvider(clock, ("ABCUSDT",)),
+        clock,
+        detection_only=True,
+    )
+
+    full_health = full.run_once(now=NOW)
+    pilot_health = pilot.run_once(now=NOW)
+    assert full_health.events_today == pilot_health.events_today == 1
+    assert full_health.pending_outcomes == 5
+    assert pilot_health.pending_outcomes == 0
+    assert pilot_health.outcome_mode == "DETECTION_ONLY"
+    assert WatchdogEventJournal(full_root / "events/events.jsonl").records() == (
+        WatchdogEventJournal(pilot_root / "events/events.jsonl").records()
+    )
+    assert not (pilot_root / "state/pending.json").exists()
+    assert not (pilot_root / "outcomes").exists()
+
+    resumed = _runtime(
+        pilot_root,
+        FixtureProvider(clock, ("ABCUSDT",)),
+        clock,
+        detection_only=True,
+    )
+    assert resumed.run_once(now=NOW).events_today == 1
+    assert len(WatchdogEventJournal(pilot_root / "events/events.jsonl").records()) == 1
 
 def test_symbol_failure_is_isolated_without_global_degradation(tmp_path: Path) -> None:
     clock = MutableClock(NOW)
@@ -699,6 +737,7 @@ def _runtime(
     config: ShadowRuntimeConfig | None = None,
     derivatives_provider: FailingDerivativesProvider | None = None,
     with_retention: bool = False,
+    detection_only: bool = False,
 ) -> WatchdogShadowRuntime:
     baselines = RollingBaselineEngine(
         JsonBaselineStore(root / "state" / "baselines.json"),
@@ -723,13 +762,18 @@ def _runtime(
         JsonWatchdogStateStore(root / "state" / "symbols.json")
     )
     events = WatchdogEventJournal(root / "events" / "events.jsonl")
-    outcome_journal = WatchdogOutcomeJournal(root / "outcomes" / "outcomes.jsonl")
-    outcomes = ForwardOutcomeScheduler(
-        events,
-        outcome_journal,
-        JsonOutcomeCheckpointStore(root / "state" / "pending.json"),
-        prices=WatchdogPriceJournal(root / "outcomes" / "price_observations.jsonl"),
-    )
+    if detection_only:
+        outcomes = DetectionOnlyOutcomes(events)
+    else:
+        outcome_journal = WatchdogOutcomeJournal(root / "outcomes" / "outcomes.jsonl")
+        outcomes = ForwardOutcomeScheduler(
+            events,
+            outcome_journal,
+            JsonOutcomeCheckpointStore(root / "state" / "pending.json"),
+            prices=WatchdogPriceJournal(
+                root / "outcomes" / "price_observations.jsonl"
+            ),
+        )
     cursors = JsonBucketCursorStore(root / "state" / "buckets.json")
     transitions = (
         UniverseTransitionJournal(root / "operational" / "universe-transitions.jsonl")
@@ -770,6 +814,7 @@ def _runtime(
         states=states,
         events=events,
         outcomes=outcomes,
+        outcome_mode="DETECTION_ONLY" if detection_only else "FULL",
         cursors=cursors,
         audit=OperationalAuditJournal(root / "operational" / "runtime.jsonl"),
         health_store=JsonRuntimeHealthStore(root / "state" / "health.json"),

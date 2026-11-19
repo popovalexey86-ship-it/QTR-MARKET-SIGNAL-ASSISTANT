@@ -11,6 +11,11 @@ from pathlib import Path
 from threading import Lock
 from typing import cast
 
+from market_signal_assistant.watchdog.jsonl_io import (
+    MAX_RECORD_BYTES,
+    read_bounded_line,
+)
+
 
 class JournalConflictError(RuntimeError):
     """A logical record ID was reused with different immutable evidence."""
@@ -89,12 +94,28 @@ class ImmutableJsonlJournal:
         """Historical logical IDs retained in Python RAM (always zero)."""
         return 0
 
+    def assert_complete(self) -> None:
+        """Reject damaged critical evidence before runtime recovery uses it."""
+        with self._lock, self._connection() as connection:
+            self._sync_index(connection)
+            if (
+                connection.execute("SELECT 1 FROM corrupted LIMIT 1").fetchone()
+                or self._metadata(connection, "partial_tail") == "1"
+            ):
+                raise ValueError(
+                    f"Immutable journal is corrupt or incomplete: {self._path}"
+                )
+
     def append(self, record_id: str, payload: dict[str, object]) -> bool:
         if not record_id.strip() or payload.get(self._id_field) != record_id:
             raise ValueError("Journal record ID is invalid.")
         normalized = _normalize(payload)
+        line = _encode(normalized).encode("utf-8")
+        if len(line) + 1 > MAX_RECORD_BYTES:
+            raise ValueError("Journal record exceeds size limit.")
         digest = _digest(normalized)
         with self._lock, self._connection() as connection:
+            self._sync_index(connection)
             self._finalize_valid_tail_if_present(connection)
             self._sync_index(connection)
             existing = self._lookup(connection, record_id)
@@ -108,7 +129,6 @@ class ImmutableJsonlJournal:
                     )
                 return False
             needs_separator = self._needs_separator()
-            line = _encode(normalized).encode("utf-8")
             with self._path.open("ab") as stream:
                 if needs_separator:
                     stream.write(b"\n")
@@ -130,19 +150,17 @@ class ImmutableJsonlJournal:
     def iter_records(self) -> Iterator[dict[str, object]]:
         if not self._path.exists():
             return
-        seen: set[str] = set()
-        with self._path.open("rb") as stream:
-            for raw_line in stream:
-                if not raw_line.endswith(b"\n"):
-                    continue
-                payload = _decode(raw_line)
-                if payload is None:
-                    continue
-                record_id = payload.get(self._id_field)
-                if not isinstance(record_id, str) or record_id in seen:
-                    continue
-                seen.add(record_id)
-                yield payload
+        with self._connection() as connection:
+            self._sync_index(connection)
+            with self._path.open("rb") as stream:
+                for (offset,) in connection.execute(
+                    "SELECT byte_offset FROM records ORDER BY byte_offset"
+                ):
+                    stream.seek(int(offset))
+                    payload = _decode(read_bounded_line(stream))
+                    if payload is None:
+                        raise OSError("Indexed journal record is not readable.")
+                    yield payload
 
     def contains(self, record_id: str) -> bool:
         with self._lock, self._connection() as connection:
@@ -186,22 +204,27 @@ class ImmutableJsonlJournal:
             with self._connection() as owned:
                 self._sync_index(owned)
             return
-        source_size = self._path.stat().st_size if self._path.exists() else 0
+        source_stat = self._path.stat() if self._path.exists() else None
+        source_size = source_stat.st_size if source_stat is not None else 0
         scanned_offset = int(self._metadata(connection, "scanned_offset") or 0)
         line_number = int(self._metadata(connection, "line_number") or 0)
+        prior_device = self._metadata(connection, "source_device")
+        prior_inode = self._metadata(connection, "source_inode")
+        if prior_device is not None and (
+            source_stat is None
+            or (str(source_stat.st_dev), str(source_stat.st_ino))
+            != (prior_device, prior_inode)
+        ):
+            raise ValueError("Immutable journal source was replaced or removed.")
         if source_size < scanned_offset:
-            with connection:
-                connection.execute("DELETE FROM records")
-                connection.execute("DELETE FROM corrupted")
-                connection.execute("DELETE FROM metadata")
-            scanned_offset = line_number = 0
+            raise ValueError("Immutable journal source was truncated.")
         partial_tail = False
         if self._path.exists():
             with self._path.open("rb") as stream, connection:
                 stream.seek(scanned_offset)
                 while True:
                     offset = stream.tell()
-                    raw_line = stream.readline()
+                    raw_line = read_bounded_line(stream)
                     if not raw_line:
                         scanned_offset = offset
                         break
@@ -234,14 +257,30 @@ class ImmutableJsonlJournal:
                                 attempted_payload=payload,
                             )
                         continue
-                    connection.execute(
-                        "INSERT INTO records VALUES (?, ?, ?)",
+                    inserted = connection.execute(
+                        "INSERT OR IGNORE INTO records VALUES (?, ?, ?)",
                         (record_id, digest, offset),
                     )
+                    if inserted.rowcount == 0:
+                        concurrent = self._lookup(connection, record_id)
+                        if concurrent is None or concurrent[0] != digest:
+                            raise JournalConflictError(
+                                journal_path=self._path,
+                                record_id=record_id,
+                                existing_payload=(
+                                    self._read_at(concurrent[1])
+                                    if concurrent is not None
+                                    else {}
+                                ),
+                                attempted_payload=payload,
+                            )
         with connection:
             self._set_metadata(connection, "scanned_offset", str(scanned_offset))
             self._set_metadata(connection, "line_number", str(line_number))
             self._set_metadata(connection, "partial_tail", "1" if partial_tail else "0")
+            if source_stat is not None:
+                self._set_metadata(connection, "source_device", str(source_stat.st_dev))
+                self._set_metadata(connection, "source_inode", str(source_stat.st_ino))
 
     @staticmethod
     def _metadata(connection: sqlite3.Connection, key: str) -> str | None:
@@ -273,7 +312,7 @@ class ImmutableJsonlJournal:
     def _read_at(self, offset: int) -> dict[str, object]:
         with self._path.open("rb") as stream:
             stream.seek(offset)
-            payload = _decode(stream.readline())
+            payload = _decode(read_bounded_line(stream))
         if payload is None:
             raise OSError("Indexed journal record is not readable.")
         return payload
@@ -284,7 +323,7 @@ class ImmutableJsonlJournal:
         scanned_offset = int(self._metadata(connection, "scanned_offset") or 0)
         with self._path.open("rb") as stream:
             stream.seek(scanned_offset)
-            tail = stream.read()
+            tail = read_bounded_line(stream)
         payload = _decode(tail)
         if payload is None or not isinstance(payload.get(self._id_field), str):
             return

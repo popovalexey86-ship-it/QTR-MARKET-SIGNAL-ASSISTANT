@@ -10,6 +10,10 @@ from statistics import median
 from typing import Any
 
 from market_signal_assistant.watchdog.events.journal import WatchdogEventJournal
+from market_signal_assistant.watchdog.offline_budget import (
+    add_budget_arguments,
+    enforce_budget,
+)
 from market_signal_assistant.watchdog.outcomes.journal import WatchdogOutcomeJournal
 from market_signal_assistant.watchdog.outcomes.statistics import (
     WatchdogDescriptiveStatistics,
@@ -73,7 +77,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--output", type=Path)
+    add_budget_arguments(parser)
     args = parser.parse_args(argv)
+    enforce_budget(
+        parser,
+        roots=(args.data_root,),
+        max_input_mib=args.max_input_mib,
+        max_address_space_mib=args.max_address_space_mib,
+    )
     payload = build_baseline_report(args.data_root)
     encoded = json.dumps(payload, sort_keys=True, default=str, indent=2)
     if args.output is None:

@@ -27,6 +27,9 @@ from market_signal_assistant.watchdog.runtime.audit import (
     OperationalEvent,
     OperationalEventType,
 )
+from market_signal_assistant.watchdog.runtime.detection_only import (
+    DetectionOnlyOutcomes,
+)
 from market_signal_assistant.watchdog.runtime.gaps import GapLedger, SchedulingGap
 from market_signal_assistant.watchdog.runtime.health import JsonRuntimeHealthStore
 from market_signal_assistant.watchdog.runtime.index import WatchdogIndexManager
@@ -124,7 +127,8 @@ class WatchdogShadowRuntime:
         engine: WatchdogDetectionEngine,
         states: WatchdogStateRepository,
         events: WatchdogEventJournal,
-        outcomes: ForwardOutcomeScheduler,
+        outcomes: ForwardOutcomeScheduler | DetectionOnlyOutcomes,
+        outcome_mode: str = "FULL",
         cursors: JsonBucketCursorStore,
         audit: OperationalAuditJournal,
         health_store: JsonRuntimeHealthStore,
@@ -153,6 +157,7 @@ class WatchdogShadowRuntime:
         self._states = states
         self._events = events
         self._outcomes = outcomes
+        self._outcome_mode = outcome_mode
         self._cursors = cursors
         self._audit_journal = audit
         self._health_store = health_store
@@ -602,6 +607,7 @@ class WatchdogShadowRuntime:
             committed_after_timeout=self._committed_after_timeout,
             retained_counts=self._retained_counts(),
             provider_failures=self._provider_failures,
+            outcome_mode=self._outcome_mode,
         )
 
     def _retained_counts(self) -> tuple[tuple[str, int], ...]:
@@ -1187,7 +1193,12 @@ class WatchdogShadowRuntime:
         self._audit(
             OperationalEventType.RUNTIME_START,
             self._started_at,
-            (("mode", "shadow-only"),),
+            ((
+                "mode",
+                "detection-only"
+                if self._outcome_mode == "DETECTION_ONLY"
+                else "shadow-only",
+            ),),
         )
         self._audit(
             OperationalEventType.RECOVERY,

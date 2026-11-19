@@ -211,6 +211,7 @@ def test_soak_supervisor_returns_nonzero_and_freezes_checkpoint_on_worker_death(
         ),
         encoding="utf-8",
     )
+    soak._save_checkpoint(state / "soak.json", 0.0, 3.6, NOW, "running")
 
     exit_code = soak.main(
         [

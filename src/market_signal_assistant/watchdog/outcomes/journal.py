@@ -27,6 +27,9 @@ class WatchdogOutcomeJournal:
     def recovery(self) -> JournalRecovery:
         return self._journal.recovery
 
+    def assert_complete(self) -> None:
+        self._journal.assert_complete()
+
     def append(self, outcome: ForwardOutcome) -> bool:
         return self._journal.append(outcome.outcome_id, _payload(outcome))
 
