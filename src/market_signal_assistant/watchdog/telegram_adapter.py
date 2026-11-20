@@ -23,6 +23,11 @@ from market_signal_assistant.watchdog.jsonl_io import (
     JsonlLineTooLong,
     read_bounded_line,
 )
+from market_signal_assistant.watchdog.telegram_alert_policy import (
+    DIGEST_SECONDS,
+    WINDOW_SECONDS,
+    decide_alert,
+)
 
 _LABELS = {
     "COMPRESSION": "Сжатие диапазона",
@@ -141,6 +146,7 @@ class WatchdogTelegramAdapter:
         minimum_spacing_seconds: float = 1.0,
         clock: Callable[[], float] = time.time,
         panel_enabled: bool = False,
+        alert_policy_enabled: bool = False,
     ) -> None:
         if not token or not chat_id or minimum_spacing_seconds <= 0:
             raise ValueError("Telegram credentials and positive spacing are required")
@@ -153,6 +159,7 @@ class WatchdogTelegramAdapter:
         self.spacing = minimum_spacing_seconds
         self.clock = clock
         self.panel_enabled = panel_enabled
+        self.alert_policy_enabled = alert_policy_enabled
         state_db.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(state_db, isolation_level=None, timeout=10)
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -170,6 +177,37 @@ class WatchdogTelegramAdapter:
             "next_attempt REAL NOT NULL DEFAULT 0, "
             "last_error TEXT, enqueued_at REAL NOT NULL DEFAULT 0)"
         )
+        if alert_policy_enabled:
+            outbox_columns = {
+                row[1] for row in self.db.execute("PRAGMA table_info(outbox)")
+            }
+            if "priority" not in outbox_columns:
+                self.db.execute(
+                    "ALTER TABLE outbox ADD COLUMN priority INTEGER NOT NULL DEFAULT 0"
+                )
+            self.db.execute(
+                "CREATE TABLE IF NOT EXISTS alert_policy_last ("
+                "symbol TEXT PRIMARY KEY, detected_ts REAL NOT NULL, "
+                "score REAL NOT NULL)"
+            )
+            self.db.execute(
+                "CREATE TABLE IF NOT EXISTS alert_policy_sent ("
+                "event_id TEXT PRIMARY KEY, detected_ts REAL NOT NULL)"
+            )
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS alert_policy_sent_time "
+                "ON alert_policy_sent(detected_ts)"
+            )
+            self.db.execute(
+                "CREATE TABLE IF NOT EXISTS alert_policy_digest ("
+                "period INTEGER PRIMARY KEY, suppressed INTEGER NOT NULL, "
+                "top_symbol TEXT NOT NULL, top_score REAL NOT NULL, "
+                "emitted INTEGER NOT NULL DEFAULT 0)"
+            )
+            self.db.execute(
+                "CREATE TABLE IF NOT EXISTS alert_policy_stats ("
+                "reason TEXT PRIMARY KEY, count INTEGER NOT NULL)"
+            )
         if panel_enabled:
             self.db.execute(
                 "CREATE TABLE IF NOT EXISTS panel_events ("
@@ -285,12 +323,97 @@ class WatchdogTelegramAdapter:
                     if existing is not None and existing[0] != digest:
                         raise JournalChangedError("conflicting event_id")
                     if existing is None:
-                        self.db.execute(
-                            "INSERT INTO outbox("
-                            "event_id,payload_hash,text,status,enqueued_at) "
-                            "VALUES(?,?,?,'PENDING',?)",
-                            (event.event_id, digest, format_event(event), self.clock()),
-                        )
+                        should_send = True
+                        if self.alert_policy_enabled:
+                            now = self.clock()
+                            previous = self.db.execute(
+                                "SELECT detected_ts,score FROM alert_policy_last "
+                                "WHERE symbol=?",
+                                (event.symbol,),
+                            ).fetchone()
+                            sent_last_day = self.db.execute(
+                                "SELECT count(*) FROM alert_policy_sent "
+                                "WHERE detected_ts>?",
+                                (event.detected_at.timestamp() - WINDOW_SECONDS,),
+                            ).fetchone()[0]
+                            decision = decide_alert(
+                                event,
+                                now=now,
+                                previous=previous,
+                                sent_last_day=sent_last_day,
+                            )
+                            should_send = decision.send
+                            self.db.execute(
+                                "INSERT INTO alert_policy_stats(reason,count) "
+                                "VALUES(?,1) ON CONFLICT(reason) DO UPDATE "
+                                "SET count=count+1",
+                                (decision.reason,),
+                            )
+                            if should_send:
+                                self.db.execute(
+                                    "INSERT INTO alert_policy_sent VALUES(?,?)",
+                                    (event.event_id, event.detected_at.timestamp()),
+                                )
+                                self.db.execute(
+                                    "INSERT INTO alert_policy_last VALUES(?,?,?) "
+                                    "ON CONFLICT(symbol) DO UPDATE SET "
+                                    "detected_ts=excluded.detected_ts,score=excluded.score",
+                                    (
+                                        event.symbol,
+                                        event.detected_at.timestamp(),
+                                        event.anomaly_score,
+                                    ),
+                                )
+                            elif decision.reason != "EXPIRED_OR_FUTURE":
+                                period = (
+                                    int(event.detected_at.timestamp()) // DIGEST_SECONDS
+                                )
+                                self.db.execute(
+                                    "INSERT INTO alert_policy_digest("
+                                    "period,suppressed,top_symbol,top_score) "
+                                    "VALUES(?,1,?,?) ON CONFLICT(period) DO UPDATE SET "
+                                    "suppressed=suppressed+1,"
+                                    "top_symbol=CASE WHEN excluded.top_score>top_score "
+                                    "THEN excluded.top_symbol ELSE top_symbol END,"
+                                    "top_score=max(top_score,excluded.top_score)",
+                                    (period, event.symbol, event.anomaly_score),
+                                )
+                        if should_send:
+                            if self.alert_policy_enabled:
+                                self.db.execute(
+                                    "INSERT INTO outbox("
+                                    "event_id,payload_hash,text,status,"
+                                    "enqueued_at,priority) "
+                                    "VALUES(?,?,?,'PENDING',?,?)",
+                                    (
+                                        event.event_id,
+                                        digest,
+                                        format_event(event),
+                                        self.clock(),
+                                        2 if event.anomaly_score >= 60 else 1,
+                                    ),
+                                )
+                            else:
+                                self.db.execute(
+                                    "INSERT INTO outbox("
+                                    "event_id,payload_hash,text,status,enqueued_at) "
+                                    "VALUES(?,?,?,'PENDING',?)",
+                                    (
+                                        event.event_id,
+                                        digest,
+                                        format_event(event),
+                                        self.clock(),
+                                    ),
+                                )
+                        else:
+                            # Keep the event ID/hash durable so a later duplicate
+                            # or conflicting journal record cannot evade dedup.
+                            self.db.execute(
+                                "INSERT INTO outbox("
+                                "event_id,payload_hash,text,status,enqueued_at) "
+                                "VALUES(?, ?, NULL, 'SUPPRESSED', ?)",
+                                (event.event_id, digest, self.clock()),
+                            )
                     if self.panel_enabled:
                         self.db.execute(
                             "INSERT OR IGNORE INTO panel_events("
@@ -331,10 +454,11 @@ class WatchdogTelegramAdapter:
             if now < next_send:
                 self.db.execute("COMMIT")
                 return False
+            ordering = "priority DESC,rowid" if self.alert_policy_enabled else "rowid"
             row = self.db.execute(
                 "SELECT event_id,text,attempts FROM outbox WHERE "
                 "(status='PENDING' OR (status='INFLIGHT' AND next_attempt<=?)) "
-                "AND next_attempt<=? ORDER BY rowid LIMIT 1",
+                f"AND next_attempt<=? ORDER BY {ordering} LIMIT 1",
                 (now, now),
             ).fetchone()
             if row is None:
@@ -383,4 +507,51 @@ class WatchdogTelegramAdapter:
         return True
 
     def run_once(self) -> tuple[int, bool]:
-        return self.collect(), self.deliver_one()
+        collected = self.collect()
+        if self.alert_policy_enabled:
+            self._emit_digest()
+        return collected, self.deliver_one()
+
+    def _emit_digest(self) -> None:
+        now = self.clock()
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            rows = self.db.execute(
+                "SELECT period,suppressed,top_symbol,top_score "
+                "FROM alert_policy_digest WHERE emitted=0 AND ? >= "
+                "(period+1)*? ORDER BY period",
+                (now, DIGEST_SECONDS),
+            ).fetchall()
+            for period, count, symbol, score in rows:
+                end = (period + 1) * DIGEST_SECONDS
+                if now - end <= 3600:
+                    message = (
+                        "🐺 QTR Watchdog — сводка за 6 часов\n"
+                        f"Второстепенных/повторных событий: {count}\n"
+                        f"Наибольший score: {symbol}, {score:.1f}/100\n"
+                        "Исходные события сохранены в журнале."
+                    )
+                    digest_id = f"watchdog:digest:{period}"
+                    self.db.execute(
+                        "INSERT OR IGNORE INTO outbox("
+                        "event_id,payload_hash,text,status,enqueued_at) "
+                        "VALUES(?,?,?,'PENDING',?)",
+                        (
+                            digest_id,
+                            hashlib.sha256(message.encode()).hexdigest(),
+                            message,
+                            now,
+                        ),
+                    )
+                self.db.execute(
+                    "UPDATE alert_policy_digest SET emitted=1 WHERE period=?",
+                    (period,),
+                )
+            self.db.execute(
+                "DELETE FROM alert_policy_digest WHERE emitted=1 AND period<?",
+                (int((now - 48 * 3600) // DIGEST_SECONDS),),
+            )
+            self.db.execute("COMMIT")
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise

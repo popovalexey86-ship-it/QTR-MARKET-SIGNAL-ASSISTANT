@@ -31,6 +31,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--poll-seconds", type=float, default=2.0)
     parser.add_argument("--minimum-spacing-seconds", type=float, default=1.0)
     parser.add_argument("--panel-root", type=Path)
+    parser.add_argument("--alert-policy-v1", action="store_true")
     args = parser.parse_args(argv)
     if args.poll_seconds <= 0 or args.minimum_spacing_seconds <= 0:
         parser.error("poll and spacing must be positive")
@@ -64,6 +65,7 @@ def main(argv: list[str] | None = None) -> int:
         chat_id=chat_id,
         minimum_spacing_seconds=args.minimum_spacing_seconds,
         panel_enabled=args.panel_root is not None,
+        alert_policy_enabled=args.alert_policy_v1,
     )
     panel = (
         WatchdogControlPanel(
