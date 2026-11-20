@@ -71,6 +71,21 @@ _TYPE_LABELS = {
     "OI_SHOCK": "аномалия открытого интереса",
     "FUNDING_ANOMALY": "аномальная ставка финансирования",
 }
+_TIER_LABELS = {
+    "CORE": "основной",
+    "ACTIVE": "активный",
+    "STANDARD": "стандартный",
+    "COLD_START": "новый, идёт прогрев",
+}
+_REJECTION_LABELS = {
+    "spread": "слишком широкий спред",
+    "spread_above_maximum": "слишком широкий спред",
+    "not_trading": "торги недоступны",
+    "not_linear_usdt_perpetual": "не линейный бессрочный контракт USDT",
+    "turnover_below_minimum": "недостаточный оборот",
+    "missing_top_of_book": "нет котировок покупки или продажи",
+    "not_launched_yet": "торги ещё не начались",
+}
 
 
 def _types_ru(values: object) -> str:
@@ -584,7 +599,10 @@ class WatchdogControlPanel:
                     [],
                 )
                 detail = (
-                    ", ".join(map(str, rejection))
+                    ", ".join(
+                        _REJECTION_LABELS.get(str(reason), f"код проверки: {reason}")
+                        for reason in rejection
+                    )
                     or "нет подтверждённой причины в снимке"
                 )
                 return f"🔎 {symbol}: вне доступного списка. Причина: {detail}.", MENU
@@ -607,7 +625,8 @@ class WatchdogControlPanel:
                 "Состояние: "
                 f"{_STATE_LABELS.get(str(symbol_row.get('state')), 'нет данных')}; "
                 f"сила аномалии: {symbol_score:.1f}/100",
-                f"Категория инструмента: {symbol_row.get('tier')}; "
+                "Категория инструмента: "
+                f"{_TIER_LABELS.get(str(symbol_row.get('tier')), 'нет данных')}; "
                 f"базовая история: {baseline}",
                 f"Аномалии последней оценки: {symbol_types}",
                 f"Время: {detected}; возраст: {_age_text(_age(now, detected))}",

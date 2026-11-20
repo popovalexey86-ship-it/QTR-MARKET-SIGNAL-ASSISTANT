@@ -216,7 +216,7 @@ def test_routing_russian_menu_current_vs_history_and_status(tmp_path: Path) -> N
         ("/inplay", "AAAUSDT"),
         ("/top", "BBBUSDT"),
         ("/symbol AAAUSDT", "Цена за 1 мин: +2.00%"),
-        ("/symbol BADUSDT", "spread"),
+        ("/symbol BADUSDT", "широкий спред"),
         ("/symbol MISSINGUSDT", "вне доступного списка"),
         ("/scan", "Последний доступный снимок"),
         ("/events", "история"),
