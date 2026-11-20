@@ -17,10 +17,18 @@ from market_signal_assistant.watchdog.telegram_alert_policy import decide_alert
 class Sender:
     def __init__(self) -> None:
         self.messages: list[str] = []
+        self.keyboards: list[list[list[dict[str, str]]] | None] = []
 
-    def send(self, token: str, chat_id: str, text: str) -> None:
+    def send(
+        self,
+        token: str,
+        chat_id: str,
+        text: str,
+        keyboard: list[list[dict[str, str]]] | None = None,
+    ) -> None:
         assert (token, chat_id) == ("test-token", "123")
         self.messages.append(text)
+        self.keyboards.append(keyboard)
 
 
 def _event(minute: int, score: float = 65.0) -> WatchdogEventEvidence:
@@ -63,6 +71,29 @@ def test_policy_distinguishes_secondary_cooldown_transition_escalation_and_ttl()
     )
     assert not decide_alert(
         _event(1, 70), now=now + 60, previous=(now, 65), sent_last_day=1
+    ).send
+    separate = replace(
+        _event(60, 52),
+        anomaly_types=(AnomalyType.COMPRESSION, AnomalyType.RANGE_BUILDUP),
+    )
+    assert (
+        decide_alert(
+            separate,
+            now=separate.detected_at.timestamp(),
+            previous=(now, 65),
+            sent_last_day=1,
+        ).reason
+        == "NEW_EPISODE"
+    )
+    early = replace(
+        _event(10, 52),
+        anomaly_types=(AnomalyType.COMPRESSION, AnomalyType.RANGE_BUILDUP),
+    )
+    assert not decide_alert(
+        early,
+        now=early.detected_at.timestamp(),
+        previous=(now, 65),
+        sent_last_day=1,
     ).send
     assert not decide_alert(
         replace(transition, state_after=WatchdogState.NORMAL),
@@ -158,4 +189,29 @@ def test_priority_sends_strongest_pending_alert_first(tmp_path: Path) -> None:
     _append(journal, stronger)
     assert adapter.run_once() == (2, True)
     assert "DEFUSDT" in sender.messages[0]
+    adapter.close()
+
+
+def test_selected_alert_expires_before_delayed_delivery(tmp_path: Path) -> None:
+    journal = tmp_path / "events.jsonl"
+    journal.touch()
+    sender = Sender()
+    now = [NOW.timestamp() + 30]
+    adapter = WatchdogTelegramAdapter(
+        journal,
+        tmp_path / "delivery.sqlite3",
+        sender=sender,
+        token="test-token",
+        chat_id="123",
+        clock=lambda: now[0],
+        alert_policy_enabled=True,
+    )
+    _append(journal, _event(0, 80))
+    assert adapter.collect() == 1
+    now[0] = NOW.timestamp() + 601
+    assert not adapter.deliver_one()
+    assert adapter.db.execute(
+        "SELECT status,last_error FROM outbox"
+    ).fetchone() == ("SUPPRESSED", "EXPIRED_BEFORE_SEND")
+    assert sender.messages == []
     adapter.close()

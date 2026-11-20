@@ -14,23 +14,30 @@ it only with `--alert-policy-v1` after a separate deployment review.
 - An immediate alert requires score >=55, or a transition into WATCH with at
   least two anomaly types and score >=50.
 - Each symbol has a 12-hour cooldown. A score >=60 may break it only after 30
-  minutes and a score increase of at least 15 points.
+  minutes and a score increase of at least 15 points. A confirmed NORMAL→WATCH
+  transition with at least two anomaly types and score >=50 can also break the
+  cooldown after 30 minutes; this preserves distinct observed episodes.
 - At most 36 immediate alerts are selected in a rolling 24-hour window.
-- Suppressed current events contribute to a six-hour digest. A digest names the
-  highest-score symbol and count, never an inferred trading recommendation.
+- Suppressed current events contribute to a six-hour digest. With the Control
+  Panel enabled, it reports the total number of events, three common detector
+  types, up to five current instruments from a fresh snapshot and separate
+  historical leaders. Without a fresh snapshot it says so explicitly.
   Digests that are more than one hour late expire without delivery. This means
   at most four digest messages in 24 hours, or 40 total selected messages when
   the immediate cap is reached.
+- Selected alerts also expire 10 minutes after detection if Telegram delivery
+  is delayed; the immutable event and its outbox evidence remain.
 - Within the pending outbox, score >=60 alerts have priority over other
   immediate alerts; digests have the lowest priority. The existing at-least-once
   Telegram delivery contract and its documented ambiguous-acknowledgment
   duplicate risk remain unchanged.
 
-The thresholds apply only to notification selection. They were sized with a
-read-only replay of the 2026-11-19/20 live event journal: 4,560 events over
-about 14 hours became 19 immediate alerts and two due digests. This is an
-observed replay result, not a forecast of future market conditions or a live
-delivery validation. A separate review is required before enabling the flag.
+The thresholds apply only to notification selection. A later read-only replay
+of the 2026-11-19/20 live event journal through 08:31 UTC covered 6,198 unique
+events: the original policy selected 25 immediate alerts; the unified policy
+selected 29, including four new NORMAL→WATCH episodes. This is an observed
+replay result, not a forecast or live delivery validation. No event was removed
+from the journal. A separate review is required before deployment.
 
 ## Paused live adapter
 

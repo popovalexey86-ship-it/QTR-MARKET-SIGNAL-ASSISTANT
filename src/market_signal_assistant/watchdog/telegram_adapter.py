@@ -12,10 +12,11 @@ import sqlite3
 import time
 import urllib.error
 import urllib.request
+from collections import Counter
 from collections.abc import Callable, Mapping
-from datetime import UTC
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 from market_signal_assistant.watchdog.events.journal import _event_from_payload
 from market_signal_assistant.watchdog.events.models import WatchdogEventEvidence
@@ -23,10 +24,22 @@ from market_signal_assistant.watchdog.jsonl_io import (
     JsonlLineTooLong,
     read_bounded_line,
 )
+from market_signal_assistant.watchdog.runtime.control_snapshot import (
+    ControlSnapshotError,
+    load_control_snapshot,
+)
 from market_signal_assistant.watchdog.telegram_alert_policy import (
     DIGEST_SECONDS,
     WINDOW_SECONDS,
     decide_alert,
+)
+from market_signal_assistant.watchdog.telegram_presentation import (
+    alert_keyboard,
+    compact_alert,
+    detail_text,
+    detail_token,
+    digest_keyboard,
+    display_timezone,
 )
 
 _LABELS = {
@@ -53,14 +66,29 @@ class DeliveryError(Exception):
 
 
 class TelegramSender(Protocol):
-    def send(self, token: str, chat_id: str, text: str) -> None: ...
+    def send(
+        self,
+        token: str,
+        chat_id: str,
+        text: str,
+        keyboard: list[list[dict[str, str]]] | None = None,
+    ) -> None: ...
 
 
 class TelegramHttpSender:
     """Only sendMessage; API errors never include URL, token, or response text."""
 
-    def send(self, token: str, chat_id: str, text: str) -> None:
-        body = json.dumps({"chat_id": chat_id, "text": text}).encode("utf-8")
+    def send(
+        self,
+        token: str,
+        chat_id: str,
+        text: str,
+        keyboard: list[list[dict[str, str]]] | None = None,
+    ) -> None:
+        payload: dict[str, object] = {"chat_id": chat_id, "text": text}
+        if keyboard:
+            payload["reply_markup"] = {"inline_keyboard": keyboard}
+        body = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
             f"https://api.telegram.org/bot{token}/sendMessage",
             data=body,
@@ -147,6 +175,8 @@ class WatchdogTelegramAdapter:
         clock: Callable[[], float] = time.time,
         panel_enabled: bool = False,
         alert_policy_enabled: bool = False,
+        display_timezone_name: str = "Europe/Moscow",
+        panel_root: Path | None = None,
     ) -> None:
         if not token or not chat_id or minimum_spacing_seconds <= 0:
             raise ValueError("Telegram credentials and positive spacing are required")
@@ -160,6 +190,9 @@ class WatchdogTelegramAdapter:
         self.clock = clock
         self.panel_enabled = panel_enabled
         self.alert_policy_enabled = alert_policy_enabled
+        display_timezone(display_timezone_name)
+        self.display_timezone_name = display_timezone_name
+        self.panel_root = panel_root
         state_db.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(state_db, isolation_level=None, timeout=10)
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -185,6 +218,10 @@ class WatchdogTelegramAdapter:
                 self.db.execute(
                     "ALTER TABLE outbox ADD COLUMN priority INTEGER NOT NULL DEFAULT 0"
                 )
+            if "expires_at" not in outbox_columns:
+                self.db.execute("ALTER TABLE outbox ADD COLUMN expires_at REAL")
+            if "keyboard" not in outbox_columns:
+                self.db.execute("ALTER TABLE outbox ADD COLUMN keyboard TEXT")
             self.db.execute(
                 "CREATE TABLE IF NOT EXISTS alert_policy_last ("
                 "symbol TEXT PRIMARY KEY, detected_ts REAL NOT NULL, "
@@ -213,11 +250,22 @@ class WatchdogTelegramAdapter:
                 "CREATE TABLE IF NOT EXISTS panel_events ("
                 "event_id TEXT PRIMARY KEY, detected_ts REAL NOT NULL, "
                 "symbol TEXT NOT NULL, score REAL NOT NULL, "
-                "anomaly_types TEXT NOT NULL)"
+                "anomaly_types TEXT NOT NULL, details TEXT, detail_token TEXT)"
             )
             self.db.execute(
                 "CREATE INDEX IF NOT EXISTS panel_events_time "
                 "ON panel_events(detected_ts)"
+            )
+            panel_columns = {
+                row[1] for row in self.db.execute("PRAGMA table_info(panel_events)")
+            }
+            if "details" not in panel_columns:
+                self.db.execute("ALTER TABLE panel_events ADD COLUMN details TEXT")
+            if "detail_token" not in panel_columns:
+                self.db.execute("ALTER TABLE panel_events ADD COLUMN detail_token TEXT")
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS panel_events_detail "
+                "ON panel_events(detail_token)"
             )
         # Existing pilot state remains readable. An old pending row has unknown
         # age (zero) and must be reviewed, never silently treated as fresh.
@@ -322,6 +370,7 @@ class WatchdogTelegramAdapter:
                     ).fetchone()
                     if existing is not None and existing[0] != digest:
                         raise JournalChangedError("conflicting event_id")
+                    selected_for_panel = False
                     if existing is None:
                         should_send = True
                         if self.alert_policy_enabled:
@@ -343,6 +392,7 @@ class WatchdogTelegramAdapter:
                                 sent_last_day=sent_last_day,
                             )
                             should_send = decision.send
+                            selected_for_panel = should_send
                             self.db.execute(
                                 "INSERT INTO alert_policy_stats(reason,count) "
                                 "VALUES(?,1) ON CONFLICT(reason) DO UPDATE "
@@ -383,14 +433,21 @@ class WatchdogTelegramAdapter:
                                 self.db.execute(
                                     "INSERT INTO outbox("
                                     "event_id,payload_hash,text,status,"
-                                    "enqueued_at,priority) "
-                                    "VALUES(?,?,?,'PENDING',?,?)",
+                                    "enqueued_at,priority,expires_at,keyboard) "
+                                    "VALUES(?,?,?,'PENDING',?,?,?,?)",
                                     (
                                         event.event_id,
                                         digest,
-                                        format_event(event),
+                                        compact_alert(
+                                            event,
+                                            reason=decision.reason,
+                                            now=now,
+                                            timezone_name=self.display_timezone_name,
+                                        ),
                                         self.clock(),
                                         2 if event.anomaly_score >= 60 else 1,
+                                        event.detected_at.timestamp() + 600,
+                                        json.dumps(alert_keyboard(event)),
                                     ),
                                 )
                             else:
@@ -417,8 +474,8 @@ class WatchdogTelegramAdapter:
                     if self.panel_enabled:
                         self.db.execute(
                             "INSERT OR IGNORE INTO panel_events("
-                            "event_id,detected_ts,symbol,score,anomaly_types) "
-                            "VALUES(?,?,?,?,?)",
+                            "event_id,detected_ts,symbol,score,anomaly_types,"
+                            "details,detail_token) VALUES(?,?,?,?,?,?,?)",
                             (
                                 event.event_id,
                                 event.detected_at.timestamp(),
@@ -427,6 +484,10 @@ class WatchdogTelegramAdapter:
                                 json.dumps(
                                     [item.value for item in event.anomaly_types]
                                 ),
+                                detail_text(event) if selected_for_panel else None,
+                                detail_token(event.event_id)
+                                if selected_for_panel
+                                else None,
                             ),
                         )
                     updated = self.db.execute(
@@ -455,8 +516,11 @@ class WatchdogTelegramAdapter:
                 self.db.execute("COMMIT")
                 return False
             ordering = "priority DESC,rowid" if self.alert_policy_enabled else "rowid"
+            expiry_column = "expires_at" if self.alert_policy_enabled else "NULL"
+            keyboard_column = "keyboard" if self.alert_policy_enabled else "NULL"
             row = self.db.execute(
-                "SELECT event_id,text,attempts FROM outbox WHERE "
+                f"SELECT event_id,text,attempts,{expiry_column},"
+                f"{keyboard_column} FROM outbox WHERE "
                 "(status='PENDING' OR (status='INFLIGHT' AND next_attempt<=?)) "
                 f"AND next_attempt<=? ORDER BY {ordering} LIMIT 1",
                 (now, now),
@@ -464,7 +528,15 @@ class WatchdogTelegramAdapter:
             if row is None:
                 self.db.execute("COMMIT")
                 return False
-            event_id, message, attempts = row
+            event_id, message, attempts, expires_at, keyboard_json = row
+            if expires_at is not None and now > float(expires_at):
+                self.db.execute(
+                    "UPDATE outbox SET status='SUPPRESSED',text=NULL,"
+                    "last_error='EXPIRED_BEFORE_SEND' WHERE event_id=?",
+                    (event_id,),
+                )
+                self.db.execute("COMMIT")
+                return False
             self.db.execute(
                 "UPDATE outbox SET status='INFLIGHT',attempts=?,next_attempt=? "
                 "WHERE event_id=?",
@@ -478,7 +550,15 @@ class WatchdogTelegramAdapter:
             self.db.execute("ROLLBACK")
             raise
         try:
-            self.sender.send(self.token, self.chat_id, str(message))
+            if keyboard_json is not None:
+                self.sender.send(
+                    self.token,
+                    self.chat_id,
+                    str(message),
+                    json.loads(keyboard_json),
+                )
+            else:
+                self.sender.send(self.token, self.chat_id, str(message))
         except DeliveryError as error:
             if error.kind == "CLIENT_ERROR":
                 # Keep the pending evidence; operator must repair config.
@@ -525,22 +605,19 @@ class WatchdogTelegramAdapter:
             for period, count, symbol, score in rows:
                 end = (period + 1) * DIGEST_SECONDS
                 if now - end <= 3600:
-                    message = (
-                        "🐺 QTR Watchdog — сводка за 6 часов\n"
-                        f"Второстепенных/повторных событий: {count}\n"
-                        f"Наибольший score: {symbol}, {score:.1f}/100\n"
-                        "Исходные события сохранены в журнале."
-                    )
+                    message = self._digest_text(period, count, symbol, score, now)
                     digest_id = f"watchdog:digest:{period}"
                     self.db.execute(
                         "INSERT OR IGNORE INTO outbox("
-                        "event_id,payload_hash,text,status,enqueued_at) "
-                        "VALUES(?,?,?,'PENDING',?)",
+                        "event_id,payload_hash,text,status,enqueued_at,"
+                        "expires_at,keyboard) VALUES(?,?,?,'PENDING',?,?,?)",
                         (
                             digest_id,
                             hashlib.sha256(message.encode()).hexdigest(),
                             message,
                             now,
+                            now + 600,
+                            json.dumps(digest_keyboard()),
                         ),
                     )
                 self.db.execute(
@@ -555,3 +632,100 @@ class WatchdogTelegramAdapter:
         except Exception:
             self.db.execute("ROLLBACK")
             raise
+
+    def _digest_text(
+        self,
+        period: int,
+        suppressed: int,
+        top_symbol: str,
+        top_score: float,
+        now: float,
+    ) -> str:
+        start = period * DIGEST_SECONDS
+        end = (period + 1) * DIGEST_SECONDS
+        total = suppressed
+        type_counts: Counter[str] = Counter()
+        historical: list[str] = []
+        if self.panel_enabled:
+            total = int(
+                self.db.execute(
+                    "SELECT count(*) FROM panel_events WHERE detected_ts>=? "
+                    "AND detected_ts<?",
+                    (start, end),
+                ).fetchone()[0]
+            )
+            for (types_json,) in self.db.execute(
+                "SELECT anomaly_types FROM panel_events WHERE detected_ts>=? "
+                "AND detected_ts<?",
+                (start, end),
+            ):
+                type_counts.update(json.loads(types_json))
+            historical = [
+                str(row[0])
+                for row in self.db.execute(
+                    "SELECT symbol FROM panel_events WHERE detected_ts>=? "
+                    "AND detected_ts<? GROUP BY symbol "
+                    "ORDER BY max(score) DESC LIMIT 5",
+                    (start, end),
+                )
+            ]
+        current: list[str] | None = None
+        if self.panel_root is not None:
+            try:
+                snapshot = load_control_snapshot(
+                    self.panel_root / "state/control-panel.json"
+                )
+                published = (
+                    datetime.fromisoformat(snapshot["published_at"]).timestamp()
+                    if snapshot is not None
+                    else None
+                )
+                if published is not None and 0 <= now - published <= 120:
+                    current_rows: list[dict[str, Any]] = []
+                    assert snapshot is not None
+                    for row in snapshot.get("symbols", []):
+                        interval = str(row.get("interval"))
+                        maximum = {"1m": 180, "5m": 420, "15m": 1020}.get(interval)
+                        detected = datetime.fromisoformat(
+                            str(row.get("detected_at"))
+                        ).timestamp()
+                        if (
+                            maximum is not None
+                            and 0 <= now - detected <= maximum
+                            and row.get("state")
+                            in {"WATCH", "IN_PLAY", "HIGH_ATTENTION"}
+                            and row.get("anomaly_types")
+                        ):
+                            current_rows.append(row)
+                    current = [
+                        str(row.get("symbol"))
+                        for row in sorted(
+                            current_rows,
+                            key=lambda row: -float(row.get("score", 0)),
+                        )[:5]
+                    ]
+            except (ControlSnapshotError, KeyError, TypeError, ValueError):
+                current = None
+        current_text = (
+            "Нет свежих данных"
+            if current is None
+            else ", ".join(current)
+            if current
+            else "активных аномалий нет"
+        )
+        types_text = (
+            ", ".join(
+                f"{_LABELS.get(kind, kind)}: {amount}"
+                for kind, amount in type_counts.most_common(3)
+            )
+            or "нет данных"
+        )
+        historical_text = ", ".join(historical) or f"{top_symbol} ({top_score:.1f})"
+        return (
+            "🐺 Watchdog — сводка за 6 часов\n"
+            f"Обнаружено событий: {total}; без отдельного уведомления: {suppressed}\n"
+            f"Актуальные инструменты: {current_text}\n"
+            f"Типы событий: {types_text}\n"
+            f"Исторические лидеры окна: {historical_text}\n"
+            "Текущее состояние основано только на свежем снимке."
+        )[:3800]

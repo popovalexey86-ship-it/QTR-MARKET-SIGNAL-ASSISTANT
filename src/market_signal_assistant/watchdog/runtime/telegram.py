@@ -12,6 +12,10 @@ from pathlib import Path
 from market_signal_assistant.watchdog.runtime.control_snapshot import (
     ControlSnapshotError,
 )
+from market_signal_assistant.watchdog.runtime.lock import (
+    DuplicateInstanceError,
+    SingleInstanceLock,
+)
 from market_signal_assistant.watchdog.telegram_adapter import (
     DeliveryError,
     JournalChangedError,
@@ -32,6 +36,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--minimum-spacing-seconds", type=float, default=1.0)
     parser.add_argument("--panel-root", type=Path)
     parser.add_argument("--alert-policy-v1", action="store_true")
+    parser.add_argument("--display-timezone", default="Europe/Moscow")
     args = parser.parse_args(argv)
     if args.poll_seconds <= 0 or args.minimum_spacing_seconds <= 0:
         parser.error("poll and spacing must be positive")
@@ -57,30 +62,44 @@ def main(argv: list[str] | None = None) -> int:
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
-    adapter = WatchdogTelegramAdapter(
-        args.event_journal,
-        args.state_db,
-        sender=TelegramHttpSender(),
-        token=token,
-        chat_id=chat_id,
-        minimum_spacing_seconds=args.minimum_spacing_seconds,
-        panel_enabled=args.panel_root is not None,
-        alert_policy_enabled=args.alert_policy_v1,
-    )
-    panel = (
-        WatchdogControlPanel(
-            adapter.db,
-            args.panel_root,
-            transport=TelegramControlHttp(),
-            token=token,
-            chat_id=chat_id,
-            allowed_user_ids=allowed_users,
-            minimum_spacing_seconds=args.minimum_spacing_seconds,
-        )
-        if args.panel_root is not None
-        else None
+    lock = SingleInstanceLock(
+        args.state_db.with_suffix(args.state_db.suffix + ".consumer.lock")
     )
     try:
+        lock.acquire()
+    except DuplicateInstanceError:
+        print("watchdog telegram stopped: another consumer owns this SQLite state")
+        return 2
+    try:
+        adapter = WatchdogTelegramAdapter(
+            args.event_journal,
+            args.state_db,
+            sender=TelegramHttpSender(),
+            token=token,
+            chat_id=chat_id,
+            minimum_spacing_seconds=args.minimum_spacing_seconds,
+            panel_enabled=args.panel_root is not None,
+            alert_policy_enabled=args.alert_policy_v1,
+            display_timezone_name=args.display_timezone,
+            panel_root=args.panel_root,
+        )
+    except Exception:
+        lock.release()
+        raise
+    try:
+        panel = (
+            WatchdogControlPanel(
+                adapter.db,
+                args.panel_root,
+                transport=TelegramControlHttp(),
+                token=token,
+                chat_id=chat_id,
+                allowed_user_ids=allowed_users,
+                minimum_spacing_seconds=args.minimum_spacing_seconds,
+            )
+            if args.panel_root is not None
+            else None
+        )
         while not stop.is_set():
             try:
                 adapter.run_once()
@@ -104,6 +123,7 @@ def main(argv: list[str] | None = None) -> int:
             stop.wait(args.poll_seconds)
     finally:
         adapter.close()
+        lock.release()
     return 0
 
 

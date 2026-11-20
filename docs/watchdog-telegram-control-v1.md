@@ -40,23 +40,26 @@ Do not use these steps during the current Observer soak. After separate approval
 1. Verify the candidate SHA, Linux quality gates, Observer health, adapter
    outbox and SQLite integrity. Confirm the approved Observer and adapter
    checkout paths and that no other process calls `getUpdates` for this token.
-2. Prepare the panel-enabled adapter command using the existing event journal,
-   the existing Telegram state database, and `--panel-root` pointing to the
-   matching Observer data root. Configure
+2. Prepare the unified adapter command using a fresh Observer event journal,
+   a new separate Telegram SQLite state, `--alert-policy-v1`, and `--panel-root`
+   pointing to the matching new Observer data root. Preserve the old SQLite
+   and cursor without migration or replay. Configure
    `QTR_WATCHDOG_TELEGRAM_ALLOWED_USER_IDS` in the protected environment file.
    Preserve token and chat ID unchanged. Do not log or copy credentials.
    Render `deployment/systemd/qtr-watchdog-telegram-control-v1.service.template`
    with approved checkout, interpreter, data and state paths; verify the
    rendered unit with `systemd-analyze verify` before replacing any adapter.
-3. Stop only the old adapter gracefully, preserve its unit/config/SQLite, and
-   start the panel-enabled adapter. Keep the Observer running only if the
-   separately authorized change window permits it; otherwise defer rollout.
+3. After the 24-hour soak, preserve the old adapter unit/config/SQLite. The
+   frozen adapter must be terminated without resuming backlog delivery. Verify
+   it has no in-flight request before a controlled TERM/CONT stop; if that
+   cannot be established, stop and review. Start exactly one unified adapter
+   against the new empty journal before starting the new Observer.
 4. Check alert outbox/cursor, panel cursor, SQLite `quick_check`, and a read-only
    `/status` request. Verify one updates consumer and automatic alerts. An old
    event journal is not replayed. Do not create test market anomalies.
-5. Roll back by stopping only the panel-enabled adapter and restoring the old
-   adapter command. Preserve SQLite; panel tables are additive. If command
-   bootstrap or alert delivery is uncertain, stop and review evidence.
+5. Roll back by stopping the new Observer and unified adapter while preserving
+   both new datasets. Never resume the old unfiltered adapter or its backlog.
+   If command bootstrap or alert delivery is uncertain, stop and review.
 
 No systemd unit or running service is changed by this candidate. Credentials,
 chat IDs and runtime datasets are not included in this repository change.

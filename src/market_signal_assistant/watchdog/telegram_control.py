@@ -41,6 +41,46 @@ MENU = (
     (("❓ Справка", "cmd:help"),),
 )
 
+_STATUS_LABELS = {
+    "HEALTHY": "работает",
+    "WARM-UP": "прогрев данных",
+    "DEGRADED": "работает с ограничениями",
+    "STALE": "данные устарели",
+    "OFFLINE": "не работает",
+}
+_SNAPSHOT_LABELS = {
+    "FRESH": "свежий",
+    "UNKNOWN": "отсутствует",
+    "INVALID": "повреждён",
+    "STALE": "устарел",
+}
+_STATE_LABELS = {
+    "NORMAL": "обычное наблюдение",
+    "WATCH": "под наблюдением",
+    "IN_PLAY": "активный инструмент",
+    "HIGH_ATTENTION": "повышенное внимание",
+    "COOLDOWN": "пауза после события",
+}
+_TYPE_LABELS = {
+    "COMPRESSION": "сжатие волатильности",
+    "RANGE_BUILDUP": "формирование диапазона",
+    "VOLUME_SHOCK": "аномальный объём",
+    "VOLUME_ACCELERATION": "ускорение объёма",
+    "PRICE_ACCELERATION": "ценовой импульс",
+    "VOLATILITY_EXPANSION": "расширение волатильности",
+    "OI_SHOCK": "аномалия открытого интереса",
+    "FUNDING_ANOMALY": "аномальная ставка финансирования",
+}
+
+
+def _types_ru(values: object) -> str:
+    if not isinstance(values, list):
+        return "нет"
+    return (
+        ", ".join(_TYPE_LABELS.get(str(value), str(value)) for value in values)
+        or "нет"
+    )
+
 
 class ControlTransport(Protocol):
     def get_updates(self, token: str, offset: int) -> list[dict[str, Any]]: ...
@@ -215,8 +255,8 @@ def _metric_lines(row: Mapping[str, Any]) -> list[str]:
     for key, label, unit in (
         ("price_change_1", "Цена", "%"),
         ("volume_acceleration_3", "Ускорение объёма", "×"),
-        ("open_interest_change", "OI", "%"),
-        ("funding_rate", "Funding", "%"),
+        ("open_interest_change", "Открытый интерес", "%"),
+        ("funding_rate", "Ставка финансирования", "%"),
     ):
         value = values.get(key)
         if (
@@ -225,7 +265,10 @@ def _metric_lines(row: Mapping[str, Any]) -> list[str]:
             and math.isfinite(value)
         ):
             shown = value * 100 if unit == "%" else value
-            interval = f" за {row.get('interval')}" if key == "price_change_1" else ""
+            period = {"1m": "1 мин", "5m": "5 мин", "15m": "15 мин"}.get(
+                str(row.get("interval")), "период не указан"
+            )
+            interval = f" за {period}" if key == "price_change_1" else ""
             lines.append(f"{label}{interval}: {shown:+.2f}{unit}")
     return lines
 
@@ -391,10 +434,26 @@ class WatchdogControlPanel:
                 "/scan показывает последний снимок; новых API-запросов нет.",
                 MENU,
             )
+        if command.startswith("/detail "):
+            token = command[8:].strip().lower()
+            if len(token) != 24 or any(ch not in "0123456789abcdef" for ch in token):
+                return "⚠️ Неверный идентификатор подробностей.", MENU
+            row = self.db.execute(
+                "SELECT details FROM panel_events WHERE detail_token=? "
+                "AND detected_ts>=? LIMIT 1",
+                (token, now_ts - EVENT_WINDOW),
+            ).fetchone()
+            if row is None or row[0] is None:
+                return "Подробности недоступны; исходный журнал сохранён.", MENU
+            return str(row[0])[:MAX_REPLY], MENU
         if command == "/status":
             counts = self._counts()
             uptime = _age(now, health.get("started_at")) if health else None
             observer_status = supervisor.get("status") if supervisor else "нет данных"
+            observer_text = (
+                "работает" if observer_status == "running" else "не работает"
+                if observer_status != "нет данных" else "нет данных"
+            )
             processed = (
                 health.get("symbols_processed", "нет данных")
                 if health
@@ -422,19 +481,20 @@ class WatchdogControlPanel:
                 f"{counts.get('BLOCKED', 0)}"
             )
             text = (
-                f"📡 Watchdog: {state}\n"
-                f"Observer: {observer_status}\n"
-                f"Control Snapshot: {snapshot_state}\n"
-                "Telegram adapter: активен\n"
-                f"Uptime: {_age_text(uptime)}\n"
-                f"Market update: {_age_text(market_age)} назад\n"
-                f"Eligible: {eligible if eligible is not None else 'нет данных'}; "
-                f"baseline-ready: {ready if ready is not None else 'нет данных'}\n"
+                f"📡 Наблюдатель: {_STATUS_LABELS[state]}\n"
+                f"Процесс наблюдения: {observer_text}\n"
+                f"Снимок рынка: {_SNAPSHOT_LABELS[snapshot_state]}\n"
+                "Telegram-бот: работает\n"
+                f"Время работы: {_age_text(uptime)}\n"
+                f"Обновление рынка: {_age_text(market_age)} назад\n"
+                "Доступных инструментов: "
+                f"{eligible if eligible is not None else 'нет данных'}; "
+                f"с прогретой базой: {ready if ready is not None else 'нет данных'}\n"
                 f"Обработано: {processed}\n"
-                f"RSS: {rss} MiB\n"
-                f"API errors: {api_errors}; rate limits: {limits}\n"
-                f"Events today: {events_today}\n"
-                f"Telegram SENT/PENDING/FAILED: {deliveries}"
+                f"Память процесса: {rss} МиБ\n"
+                f"Ошибки API: {api_errors}; лимиты API: {limits}\n"
+                f"Событий сегодня: {events_today}\n"
+                f"Уведомления доставлено/ожидает/ошибка: {deliveries}"
             )
             return text, MENU
         if command in {"/market", "/scan"}:
@@ -450,7 +510,8 @@ class WatchdogControlPanel:
             published = snapshot.get("published_at") if snapshot else "нет данных"
             type_counts = (
                 ", ".join(
-                    f"{key} {value}" for key, value in sorted(active_types.items())
+                    f"{_TYPE_LABELS.get(key, key)} {value}"
+                    for key, value in sorted(active_types.items())
                 )
                 or "нет"
             )
@@ -458,13 +519,15 @@ class WatchdogControlPanel:
             if not current_available or (not fresh and eligible != 0):
                 active_count = type_counts = top = "Нет свежих данных"
             text = (
-                f"{prefix} — {state}\n"
-                f"Control Snapshot: {snapshot_state}; время: {published}\n"
-                f"Eligible: {eligible if eligible is not None else 'нет данных'}; "
-                f"baseline-ready: {ready if ready is not None else 'нет данных'}\n"
+                f"{prefix} — {_STATUS_LABELS[state]}\n"
+                f"Снимок рынка: {_SNAPSHOT_LABELS[snapshot_state]}; "
+                f"время: {published}\n"
+                "Доступных инструментов: "
+                f"{eligible if eligible is not None else 'нет данных'}; "
+                f"с прогретой базой: {ready if ready is not None else 'нет данных'}\n"
                 f"Текущие аномалии: {active_count}\n"
                 f"По типам: {type_counts}\n"
-                f"Последний market update: {_age_text(market_age)} назад\n"
+                f"Последнее обновление рынка: {_age_text(market_age)} назад\n"
                 f"Наиболее активные: {top}"
             )
             return text, MENU
@@ -477,9 +540,9 @@ class WatchdogControlPanel:
             title = (
                 "🔥 Актуальные аномалии"
                 if command == "/inplay"
-                else "🏆 ТОП-10 текущего score"
+                else "🏆 ТОП-10 по текущей силе аномалии"
             )
-            lines = [f"{title} — {state}"]
+            lines = [f"{title} — {_STATUS_LABELS[state]}"]
             if not selected:
                 if current_available and (fresh or eligible == 0):
                     lines.append(
@@ -490,7 +553,7 @@ class WatchdogControlPanel:
                     lines.append("Нет свежих данных для этого раздела.")
             for row in selected:
                 age = _age(now, row.get("detected_at"))
-                row_types = ",".join(map(str, row.get("anomaly_types", []))) or "нет"
+                row_types = _types_ru(row.get("anomaly_types"))
                 lines.append(
                     f"{row.get('symbol')} · {float(row.get('score', 0)):.1f} · "
                     f"{row_types} · {_age_text(age)}"
@@ -500,14 +563,15 @@ class WatchdogControlPanel:
         if command.startswith("/symbol "):
             symbol = command[8:].strip().upper()
             if not symbol.isalnum() or len(symbol) > 25:
-                return "⚠️ Укажите SYMBOL буквами и цифрами.", MENU
-            if snapshot is None:
-                return "⚠️ Снимок Watchdog недоступен.", MENU
+                return "⚠️ Укажите символ буквами и цифрами.", MENU
+            if snapshot_state != "FRESH" or not current_available:
+                return "⚠️ Нет свежих данных об инструменте.", MENU
+            assert snapshot is not None
             eligible_symbols = snapshot.get("eligible_symbols", [])
             if symbol not in eligible_symbols:
                 if snapshot.get("eligible_truncated", 0):
                     return (
-                        f"🔎 {symbol}: полный eligible universe не помещается "
+                        f"🔎 {symbol}: полный список инструментов не помещается "
                         "в снимок; статус не подтверждён.",
                         MENU,
                     )
@@ -523,32 +587,35 @@ class WatchdogControlPanel:
                     ", ".join(map(str, rejection))
                     or "нет подтверждённой причины в снимке"
                 )
-                return f"🔎 {symbol}: вне eligible universe. Причина: {detail}.", MENU
+                return f"🔎 {symbol}: вне доступного списка. Причина: {detail}.", MENU
             symbol_row: dict[str, Any] | None = next(
                 (item for item in rows if item.get("symbol") == symbol), None
             )
             if symbol_row is None:
-                return f"🔎 {symbol}: eligible, оценка ещё не опубликована.", MENU
+                return f"🔎 {symbol}: доступен, оценка ещё не опубликована.", MENU
             freshness = (
                 "АКТУАЛЬНО"
                 if _row_fresh(symbol_row, now) and state not in {"STALE", "OFFLINE"}
                 else "УСТАРЕЛО"
             )
-            symbol_types = (
-                ", ".join(map(str, symbol_row.get("anomaly_types", []))) or "нет"
-            )
+            symbol_types = _types_ru(symbol_row.get("anomaly_types"))
             symbol_score = float(symbol_row.get("score", 0))
-            baseline = "готов" if symbol_row.get("baseline_ready") else "WARM-UP"
+            baseline = "готов" if symbol_row.get("baseline_ready") else "прогрев"
             detected = symbol_row.get("detected_at")
             lines = [
                 f"🔎 {symbol} — {freshness}",
-                f"State: {symbol_row.get('state')}; score: {symbol_score:.1f}",
-                f"Tier: {symbol_row.get('tier')}; baseline: {baseline}",
+                "Состояние: "
+                f"{_STATE_LABELS.get(str(symbol_row.get('state')), 'нет данных')}; "
+                f"сила аномалии: {symbol_score:.1f}/100",
+                f"Категория инструмента: {symbol_row.get('tier')}; "
+                f"базовая история: {baseline}",
                 f"Аномалии последней оценки: {symbol_types}",
                 f"Время: {detected}; возраст: {_age_text(_age(now, detected))}",
             ]
             if isinstance(symbol_row.get("close"), (int, float)):
-                lines.append(f"Последний close: {float(symbol_row['close']):.6g}")
+                lines.append(
+                    f"Последняя цена закрытия: {float(symbol_row['close']):.6g}"
+                )
             lines.extend(_metric_lines(symbol_row))
             history = self.db.execute(
                 "SELECT detected_ts,score FROM panel_events WHERE symbol=? "
@@ -559,10 +626,10 @@ class WatchdogControlPanel:
             return "\n".join(lines), MENU
         if command == "/events":
             records = self._events(now_ts)
-            lines = ["🚨 События с включения панели (история, до 24h)"]
+            lines = ["🚨 События с включения панели (история, до 24 ч)"]
             for ts, symbol, score, types in records:
                 when = datetime.fromtimestamp(ts, UTC).strftime("%m-%d %H:%M UTC")
-                lines.append(f"{when} · {symbol} · {score:.1f} · {','.join(types)}")
+                lines.append(f"{when} · {symbol} · {score:.1f} · {_types_ru(types)}")
             if not records:
                 lines.append("Событий пока нет.")
             return "\n".join(lines), MENU
@@ -587,7 +654,8 @@ class WatchdogControlPanel:
             counts = self._counts()
             type_counts = (
                 ", ".join(
-                    f"{key} {value}" for key, value in sorted(event_types.items())
+                    f"{_TYPE_LABELS.get(key, key)} {value}"
+                    for key, value in sorted(event_types.items())
                 )
                 or "нет"
             )
@@ -600,19 +668,19 @@ class WatchdogControlPanel:
                 f"{counts.get('BLOCKED', 0)}"
             )
             return (
-                "📊 Events с включения панели, 1h/4h/24h: "
+                "📊 События с включения панели, за 1/4/24 ч: "
                 f"{totals[1]}/{totals[4]}/{totals[24]}\n"
-                f"Уникальных символов (24h): {len(symbols)}\n"
+                f"Уникальных инструментов (24 ч): {len(symbols)}\n"
                 f"Типы: {type_counts}\n"
-                f"Score buckets: {score_counts}\n"
-                f"Уведомления SENT/PENDING/FAILED: {deliveries}",
+                f"Распределение силы: {score_counts}\n"
+                f"Уведомления доставлено/ожидает/ошибка: {deliveries}",
                 MENU,
             )
         if command == "/settings":
             return (
                 "⚙️ Автоматические уведомления: включены.\n"
-                "Настройки текущего pilot доступны только для просмотра. "
-                "Отключение alerts не поддерживается, чтобы не терять события.",
+                "Настройки текущего пилота доступны только для просмотра. "
+                "Отключение уведомлений не поддерживается, чтобы не терять события.",
                 MENU,
             )
         return "Неизвестная команда. Используйте /help.", MENU
@@ -640,6 +708,11 @@ class WatchdogControlPanel:
         command = (
             command.replace("symbol:", "/symbol ", 1)
             if command.startswith("symbol:")
+            else command
+        )
+        command = (
+            command.replace("detail:", "/detail ", 1)
+            if command.startswith("detail:")
             else command
         )
         command = (

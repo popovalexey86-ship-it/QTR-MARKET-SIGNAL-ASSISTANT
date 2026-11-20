@@ -13,7 +13,7 @@ WorkingDirectory=__WATCHDOG_CHECKOUT__
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/etc/qtr/watchdog-telegram.env
-ExecStart=__PYTHON__ -m market_signal_assistant.watchdog.runtime.telegram --event-journal __WATCHDOG_DATA_ROOT__/events/events.jsonl --state-db __ADAPTER_STATE_ROOT__/delivery.sqlite3 --panel-root __WATCHDOG_DATA_ROOT__ --poll-seconds 2 --minimum-spacing-seconds 1
+ExecStart=__PYTHON__ -m market_signal_assistant.watchdog.runtime.telegram --event-journal __WATCHDOG_DATA_ROOT__/events/events.jsonl --state-db __ADAPTER_STATE_ROOT__/delivery.sqlite3 --panel-root __WATCHDOG_DATA_ROOT__ --alert-policy-v1 --display-timezone Europe/Moscow --poll-seconds 2 --minimum-spacing-seconds 1
 Restart=no
 TimeoutStopSec=30s
 UMask=0077

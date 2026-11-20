@@ -33,7 +33,7 @@ def decide_alert(
         return AlertDecision(False, "EXPIRED_OR_FUTURE")
     score = event.anomaly_score
     watch_transition = (
-        event.state_before != event.state_after
+        event.state_before.value == "NORMAL"
         and event.state_after.value == "WATCH"
         and len(event.anomaly_types) >= 2
         and score >= 50
@@ -48,8 +48,17 @@ def decide_alert(
             and score >= last_score + 15
             and elapsed >= ESCALATION_COOLDOWN_SECONDS
         )
-        if elapsed < SYMBOL_COOLDOWN_SECONDS and not escalation:
+        new_episode = (
+            watch_transition and elapsed >= ESCALATION_COOLDOWN_SECONDS
+        )
+        if elapsed < SYMBOL_COOLDOWN_SECONDS and not (escalation or new_episode):
             return AlertDecision(False, "SYMBOL_COOLDOWN")
     if sent_last_day >= MAX_IMMEDIATE_PER_WINDOW:
         return AlertDecision(False, "GLOBAL_CAP")
-    return AlertDecision(True, "MATERIAL_ESCALATION" if previous else "NEW_STRONG")
+    if previous is None:
+        return AlertDecision(True, "NEW_STRONG")
+    if escalation:
+        return AlertDecision(True, "MATERIAL_ESCALATION")
+    if new_episode:
+        return AlertDecision(True, "NEW_EPISODE")
+    return AlertDecision(True, "COOLDOWN_EXPIRED")
