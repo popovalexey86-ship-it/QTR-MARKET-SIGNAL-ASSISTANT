@@ -191,6 +191,10 @@ class WatchdogTelegramAdapter:
         self.panel_enabled = panel_enabled
         self.alert_policy_enabled = alert_policy_enabled
         display_timezone(display_timezone_name)
+        if panel_root is not None and journal.resolve() != (
+            panel_root / "events/events.jsonl"
+        ).resolve():
+            raise ValueError("Control snapshot root does not match event journal")
         self.display_timezone_name = display_timezone_name
         self.panel_root = panel_root
         state_db.parent.mkdir(parents=True, exist_ok=True)

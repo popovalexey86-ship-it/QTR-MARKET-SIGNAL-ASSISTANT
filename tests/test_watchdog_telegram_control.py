@@ -335,6 +335,27 @@ def test_digest_separates_current_snapshot_from_historical_events(
     adapter.close()
 
 
+def test_unified_adapter_rejects_mismatched_snapshot_and_journal_roots(
+    tmp_path: Path,
+) -> None:
+    journal = tmp_path / "events/events.jsonl"
+    journal.parent.mkdir(parents=True)
+    journal.touch()
+    state = tmp_path / "delivery.sqlite3"
+    with pytest.raises(ValueError, match="does not match event journal"):
+        WatchdogTelegramAdapter(
+            journal,
+            state,
+            sender=AlertSender(),
+            token="private-test-token",
+            chat_id="123",
+            panel_enabled=True,
+            alert_policy_enabled=True,
+            panel_root=tmp_path / "other-root",
+        )
+    assert not state.exists()
+
+
 def test_authorization_callbacks_duplicates_cooldown_and_restart(
     tmp_path: Path,
 ) -> None:
