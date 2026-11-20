@@ -281,15 +281,29 @@ class WatchdogControlPanel:
 
     def _inputs(
         self,
-    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
-        snapshot = load_control_snapshot(self.data_root / "state/control-panel.json")
-        health = _read_json(self.data_root / "state/health.json", 1_048_576)
-        supervisor = _read_json(self.data_root / "state/observer.json", 65_536)
-        return snapshot, health, supervisor
+    ) -> tuple[
+        dict[str, Any] | None,
+        dict[str, Any] | None,
+        dict[str, Any] | None,
+        bool,
+    ]:
+        invalid_snapshot = False
+        try:
+            snapshot = load_control_snapshot(
+                self.data_root / "state/control-panel.json"
+            )
+        except ControlSnapshotError:
+            snapshot = None
+            invalid_snapshot = True
+        try:
+            health = _read_json(self.data_root / "state/health.json", 1_048_576)
+            supervisor = _read_json(self.data_root / "state/observer.json", 65_536)
+        except ControlSnapshotError:
+            health = supervisor = None
+        return snapshot, health, supervisor, invalid_snapshot
 
     def _status(
         self,
-        snapshot: dict[str, Any] | None,
         health: dict[str, Any] | None,
         supervisor: dict[str, Any] | None,
         now: datetime,
@@ -303,20 +317,10 @@ class WatchdogControlPanel:
         if health.get("degraded"):
             return "DEGRADED"
         loop_age = _age(now, health.get("last_loop_at"))
-        panel_age = _age(now, snapshot.get("published_at")) if snapshot else None
         due = _timestamp(health.get("next_market_update_due_at"))
-        if (
-            loop_age is not None
-            and loop_age <= FRESH_SNAPSHOT_SECONDS
-            and not health.get("baseline_ready_symbols")
-            and snapshot is None
-        ):
-            return "WARM-UP"
         if (
             loop_age is None
             or loop_age > FRESH_SNAPSHOT_SECONDS
-            or panel_age is None
-            or panel_age > FRESH_SNAPSHOT_SECONDS
             or (due is not None and now > due and (now - due).total_seconds() > 120)
         ):
             return "STALE"
@@ -345,18 +349,26 @@ class WatchdogControlPanel:
     ) -> tuple[str, tuple[tuple[tuple[str, str], ...], ...]]:
         now_ts = self.clock()
         now = datetime.fromtimestamp(now_ts, UTC)
-        try:
-            snapshot, health, supervisor = self._inputs()
-        except ControlSnapshotError:
-            snapshot = health = supervisor = None
-        state = self._status(snapshot, health, supervisor, now)
+        snapshot, health, supervisor, invalid_snapshot = self._inputs()
+        state = self._status(health, supervisor, now)
+        snapshot_age = _age(now, snapshot.get("published_at")) if snapshot else None
+        if invalid_snapshot:
+            snapshot_state = "INVALID"
+        elif snapshot is None:
+            snapshot_state = "UNKNOWN"
+        elif snapshot_age is None or snapshot_age > FRESH_SNAPSHOT_SECONDS:
+            snapshot_state = "STALE"
+        else:
+            snapshot_state = "FRESH"
+        current_available = snapshot_state == "FRESH" and state not in {
+            "STALE",
+            "OFFLINE",
+        }
         rows = snapshot.get("symbols", []) if snapshot else []
         fresh = [
             row
             for row in rows
-            if isinstance(row, dict)
-            and _row_fresh(row, now)
-            and state not in {"STALE", "OFFLINE"}
+            if isinstance(row, dict) and _row_fresh(row, now) and current_available
         ]
         active = [row for row in fresh if _active(row, now)]
         ranked = sorted(
@@ -412,6 +424,7 @@ class WatchdogControlPanel:
             text = (
                 f"📡 Watchdog: {state}\n"
                 f"Observer: {observer_status}\n"
+                f"Control Snapshot: {snapshot_state}\n"
                 "Telegram adapter: активен\n"
                 f"Uptime: {_age_text(uptime)}\n"
                 f"Market update: {_age_text(market_age)} назад\n"
@@ -441,12 +454,12 @@ class WatchdogControlPanel:
                 )
                 or "нет"
             )
-            active_count: str | int = len(active)
-            if state in {"STALE", "OFFLINE"}:
-                active_count = type_counts = top = "нет свежих данных"
+            active_count: str = f"{len(active)} среди {len(fresh)} свежих инструментов"
+            if not current_available or (not fresh and eligible != 0):
+                active_count = type_counts = top = "Нет свежих данных"
             text = (
                 f"{prefix} — {state}\n"
-                f"Снимок: {published}\n"
+                f"Control Snapshot: {snapshot_state}; время: {published}\n"
                 f"Eligible: {eligible if eligible is not None else 'нет данных'}; "
                 f"baseline-ready: {ready if ready is not None else 'нет данных'}\n"
                 f"Текущие аномалии: {active_count}\n"
@@ -468,7 +481,13 @@ class WatchdogControlPanel:
             )
             lines = [f"{title} — {state}"]
             if not selected:
-                lines.append("Нет свежих данных для этого раздела.")
+                if current_available and (fresh or eligible == 0):
+                    lines.append(
+                        "Подтверждено: активных аномалий нет "
+                        f"среди {len(fresh)} свежих инструментов."
+                    )
+                else:
+                    lines.append("Нет свежих данных для этого раздела.")
             for row in selected:
                 age = _age(now, row.get("detected_at"))
                 row_types = ",".join(map(str, row.get("anomaly_types", []))) or "нет"

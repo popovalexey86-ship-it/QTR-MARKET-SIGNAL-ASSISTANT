@@ -203,7 +203,7 @@ def test_routing_russian_menu_current_vs_history_and_status(tmp_path: Path) -> N
     commands = [
         ("/start", "🐺"),
         ("/status", "HEALTHY"),
-        ("/market", "Текущие аномалии: 1"),
+        ("/market", "Текущие аномалии: 1 среди 2 свежих инструментов"),
         ("/inplay", "AAAUSDT"),
         ("/top", "BBBUSDT"),
         ("/symbol AAAUSDT", "Цена за 1m: +2.00%"),
@@ -268,19 +268,75 @@ def test_first_panel_start_discards_queued_historical_commands(tmp_path: Path) -
     adapter.close()
 
 
-def test_stale_warmup_offline_and_corrupt_snapshot_fail_closed(tmp_path: Path) -> None:
+def test_snapshot_unknown_stale_invalid_and_warmup_are_distinct(tmp_path: Path) -> None:
     now = [NOW.timestamp()]
     _snapshot(tmp_path, ready=0)
     adapter, panel, _, _ = _panel(tmp_path, now)
-    assert "WARM-UP" in panel._render("/status")[0]
+    status = panel._render("/status")[0]
+    assert "Watchdog: WARM-UP" in status
+    assert "Control Snapshot: FRESH" in status
     (tmp_path / "state/control-panel.json").unlink()
-    assert "WARM-UP" in panel._render("/status")[0]
+    status = panel._render("/status")[0]
+    assert "Watchdog: WARM-UP" in status
+    assert "Observer: running" in status
+    assert "Control Snapshot: UNKNOWN" in status
+    assert "Текущие аномалии: Нет свежих данных" in panel._render("/market")[0]
     _snapshot(tmp_path, seconds_old=600)
-    assert "STALE" in panel._render("/status")[0]
+    status = panel._render("/status")[0]
+    assert "Watchdog: STALE" in status
+    assert "Control Snapshot: STALE" in status
     assert "AAAUSDT" not in panel._render("/inplay")[0]
-    assert "Текущие аномалии: нет свежих данных" in panel._render("/market")[0]
+    assert "Текущие аномалии: Нет свежих данных" in panel._render("/market")[0]
+    _snapshot(tmp_path, ready=0)
     (tmp_path / "state/control-panel.json").write_text("{broken")
-    assert "OFFLINE" in panel._render("/status")[0]
+    status = panel._render("/status")[0]
+    assert "Watchdog: WARM-UP" in status
+    assert "Control Snapshot: INVALID" in status
+    assert "Observer: running" in status
+    assert "Текущие аномалии: Нет свежих данных" in panel._render("/market")[0]
+    adapter.close()
+
+
+def test_valid_empty_snapshot_confirms_zero_without_claiming_missing_data(
+    tmp_path: Path,
+) -> None:
+    now = [NOW.timestamp()]
+    _snapshot(tmp_path, ready=0)
+    path = tmp_path / "state/control-panel.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    for row in payload["symbols"]:
+        row["anomaly_types"] = []
+        row["state"] = "NORMAL"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    adapter, panel, _, _ = _panel(tmp_path, now)
+    status = panel._render("/status")[0]
+    assert "Control Snapshot: FRESH" in status
+    assert "Watchdog: WARM-UP" in status
+    market = panel._render("/market")[0]
+    assert "Текущие аномалии: 0 среди 2 свежих инструментов" in market
+    assert "Нет свежих данных" not in market
+    assert "Подтверждено: активных аномалий нет" in panel._render("/inplay")[0]
+    payload["symbols"] = []
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    assert "Текущие аномалии: Нет свежих данных" in panel._render("/market")[0]
+    payload["eligible_count"] = 0
+    payload["eligible_symbols"] = []
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    assert (
+        "Текущие аномалии: 0 среди 0 свежих инструментов" in panel._render("/market")[0]
+    )
+    adapter.close()
+
+
+def test_missing_snapshot_does_not_hide_healthy_observer(tmp_path: Path) -> None:
+    now = [NOW.timestamp()]
+    _snapshot(tmp_path, ready=1)
+    (tmp_path / "state/control-panel.json").unlink()
+    adapter, panel, _, _ = _panel(tmp_path, now)
+    status = panel._render("/status")[0]
+    assert "Watchdog: HEALTHY" in status
+    assert "Control Snapshot: UNKNOWN" in status
+    assert "Текущие аномалии: Нет свежих данных" in panel._render("/market")[0]
     adapter.close()
 
 
