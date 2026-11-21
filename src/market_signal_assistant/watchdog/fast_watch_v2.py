@@ -6,6 +6,7 @@ Watchdog detector engine is reused without modifying its decision semantics.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import tempfile
@@ -42,11 +43,37 @@ MINUTE = timedelta(minutes=1)
 MAX_SYMBOLS = 8
 MAX_CANDLES = 240
 MAX_FRAME_BYTES = 65_536
+MAX_FRAME_ITEMS = 8
 SOURCE = "bybit-public-linear-ws-kline.1-confirmed"
+FRAME_DIAGNOSTIC_KEYS = frozenset({"topic", "type", "ts", "data", "op", "success"})
+ROW_DIAGNOSTIC_KEYS = frozenset(
+    {
+        "start",
+        "end",
+        "interval",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "turnover",
+        "confirm",
+        "timestamp",
+        "symbol",
+    }
+)
 
 
 class FastWatchIntegrityError(ValueError):
     """Shadow evidence is incomplete, ambiguous, or no longer prospective."""
+
+
+class FastWatchFrameError(FastWatchIntegrityError):
+    """Rejected frame with a fixed, non-sensitive diagnostic category."""
+
+    def __init__(self, category: str, message: str) -> None:
+        super().__init__(message)
+        self.category = category
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,75 +126,164 @@ def parse_confirmed_minute(
     received_at: datetime,
     allowed_symbols: frozenset[str],
 ) -> ConfirmedMinute | None:
-    """Validate a Bybit public frame; open candles are never market evidence."""
+    """Compatibility wrapper for callers expecting a single confirmed candle."""
+    minutes = parse_confirmed_minutes(
+        raw, received_at=received_at, allowed_symbols=allowed_symbols
+    )
+    if len(minutes) > 1:
+        raise FastWatchFrameError(
+            "multiple_confirmed", "Use the bounded batch parser for this frame."
+        )
+    return minutes[0] if minutes else None
+
+
+def parse_confirmed_minutes(
+    raw: str | bytes,
+    *,
+    received_at: datetime,
+    allowed_symbols: frozenset[str],
+) -> tuple[ConfirmedMinute, ...]:
+    """Validate every row before returning any closed-candle market evidence."""
     encoded = raw.encode("utf-8") if isinstance(raw, str) else raw
     if len(encoded) > MAX_FRAME_BYTES:
-        raise FastWatchIntegrityError("WebSocket frame exceeds the bounded size.")
+        raise FastWatchFrameError(
+            "frame_oversized", "WebSocket frame exceeds the bounded size."
+        )
     try:
         frame: Any = json.loads(encoded)
         if not isinstance(frame, dict):
-            raise ValueError
+            raise FastWatchFrameError("envelope_shape", "Invalid Bybit frame envelope.")
         if "op" in frame:
             if frame.get("op") == "subscribe" and frame.get("success") is False:
-                raise FastWatchIntegrityError("Bybit rejected the subscription.")
-            return None
+                raise FastWatchFrameError(
+                    "subscription_rejected", "Bybit rejected the subscription."
+                )
+            return ()
         topic = frame["topic"]
         if not isinstance(topic, str) or not topic.startswith("kline.1."):
-            return None
+            raise FastWatchFrameError("topic_mismatch", "Unexpected kline topic.")
         symbol = topic.removeprefix("kline.1.")
         if symbol not in allowed_symbols:
-            raise FastWatchIntegrityError("Unsubscribed symbol in kline stream.")
+            raise FastWatchFrameError(
+                "topic_mismatch", "Unsubscribed symbol in kline stream."
+            )
+        if frame.get("type") != "snapshot":
+            raise FastWatchFrameError("envelope_shape", "Invalid kline frame type.")
         rows = frame["data"]
-        if (
-            not isinstance(rows, list)
-            or len(rows) != 1
-            or not isinstance(rows[0], dict)
-        ):
-            raise ValueError
-        row = rows[0]
-        if row["interval"] != "1":
-            raise ValueError
-        if row["confirm"] is False:
-            return None
-        if row["confirm"] is not True:
-            raise ValueError
-        start_ms = _integer(row["start"])
-        end_ms = _integer(row["end"])
-        if start_ms % 60_000 or end_ms != start_ms + 59_999:
-            raise ValueError
-        start = datetime.fromtimestamp(start_ms / 1000, UTC)
-        close = start + MINUTE
+        if not isinstance(rows, list):
+            raise FastWatchFrameError("data_shape", "Kline data must be an array.")
+        if not rows:
+            raise FastWatchFrameError("data_empty", "Kline data array is empty.")
+        if len(rows) > MAX_FRAME_ITEMS:
+            raise FastWatchFrameError(
+                "data_oversized", "Kline data array exceeds bound."
+            )
         received = _utc(received_at)
-        if received < close:
-            raise FastWatchIntegrityError("Confirmed candle received before close.")
         source_ms = frame.get("ts")
         source_at = (
             datetime.fromtimestamp(_integer(source_ms) / 1000, UTC)
             if source_ms is not None
             else None
         )
-        trade_ms = row.get("timestamp")
-        last_trade_at = (
-            datetime.fromtimestamp(_integer(trade_ms) / 1000, UTC)
-            if trade_ms is not None
-            else None
-        )
-        candle = Candle(
-            start,
-            _number(row["open"]),
-            _number(row["high"]),
-            _number(row["low"]),
-            _number(row["close"]),
-            _number(row["volume"]),
-        )
-        return ConfirmedMinute(
-            symbol, candle, close, received, source_at, last_trade_at
-        )
+        confirmed: list[ConfirmedMinute] = []
+        previous_start: datetime | None = None
+        previous_candle: Candle | None = None
+        previous_confirm: bool | None = None
+        for row in rows:
+            if not isinstance(row, dict):
+                raise FastWatchFrameError(
+                    "row_shape", "Kline array contains a non-object."
+                )
+            if "symbol" in row and row["symbol"] != symbol:
+                raise FastWatchFrameError(
+                    "topic_mismatch", "Kline row symbol conflicts with topic."
+                )
+            if row["interval"] != "1":
+                raise FastWatchFrameError(
+                    "interval_mismatch", "Kline interval is not 1m."
+                )
+            confirm = row["confirm"]
+            if not isinstance(confirm, bool):
+                raise FastWatchFrameError(
+                    "confirm_type", "Kline confirm must be boolean."
+                )
+            start_ms = _integer(row["start"])
+            end_ms = _integer(row["end"])
+            if start_ms % 60_000 or end_ms != start_ms + 59_999:
+                raise FastWatchFrameError(
+                    "timestamp_conflict", "Kline interval boundaries conflict."
+                )
+            start = datetime.fromtimestamp(start_ms / 1000, UTC)
+            close = start + MINUTE
+            trade_ms = row.get("timestamp")
+            last_trade_at = (
+                datetime.fromtimestamp(_integer(trade_ms) / 1000, UTC)
+                if trade_ms is not None
+                else None
+            )
+            if (
+                (source_at is not None and source_at < start)
+                or (last_trade_at is not None and last_trade_at > received)
+                or (
+                    source_at is not None
+                    and last_trade_at is not None
+                    and last_trade_at > source_at
+                )
+            ):
+                raise FastWatchFrameError(
+                    "timestamp_conflict", "Kline source timestamps conflict."
+                )
+            candle = Candle(
+                start,
+                _number(row["open"]),
+                _number(row["high"]),
+                _number(row["low"]),
+                _number(row["close"]),
+                _number(row["volume"]),
+            )
+            if previous_start is not None:
+                if start < previous_start:
+                    raise FastWatchFrameError(
+                        "row_order", "Kline rows are out of order."
+                    )
+                if start == previous_start:
+                    if candle != previous_candle or confirm != previous_confirm:
+                        raise FastWatchFrameError(
+                            "duplicate_conflict", "Conflicting duplicate kline rows."
+                        )
+                    continue
+                if start != previous_start + MINUTE:
+                    raise FastWatchFrameError(
+                        "row_gap", "Kline array has a minute gap."
+                    )
+            previous_start = start
+            previous_candle = candle
+            previous_confirm = confirm
+            if not confirm:
+                continue
+            if received < close:
+                raise FastWatchFrameError(
+                    "timestamp_conflict", "Confirmed candle received before close."
+                )
+            if source_at is not None and source_at < close:
+                raise FastWatchFrameError(
+                    "timestamp_conflict", "Confirmed candle predates frame generation."
+                )
+            confirmed.append(
+                ConfirmedMinute(
+                    symbol, candle, close, received, source_at, last_trade_at
+                )
+            )
+        if source_at is not None and source_at > received:
+            raise FastWatchFrameError(
+                "timestamp_conflict", "Exchange frame timestamp follows receipt."
+            )
+        return tuple(confirmed)
     except FastWatchIntegrityError:
         raise
     except (KeyError, TypeError, ValueError, OverflowError) as error:
-        raise FastWatchIntegrityError(
-            "Malformed confirmed Bybit kline frame."
+        raise FastWatchFrameError(
+            "row_validation", "Malformed confirmed Bybit kline frame."
         ) from error
 
 
@@ -195,12 +311,14 @@ class FastWatchShadow:
         self._observations: ImmutableJsonlJournal | None = None
         self._gaps: ImmutableJsonlJournal | None = None
         self._transport: ImmutableJsonlJournal | None = None
+        self._rejections: ImmutableJsonlJournal | None = None
         self._baselines: RollingBaselineEngine | None = None
         self._states: WatchdogStateRepository | None = None
         self._engine: WatchdogDetectionEngine | None = None
         self.confirmed_count = 0
         self.event_count = 0
         self.transport_failures = 0
+        self.rejected_frames = 0
 
     def start(self) -> None:
         if self._started:
@@ -222,13 +340,21 @@ class FastWatchShadow:
                 self.root / "operational" / "transport.jsonl",
                 id_field="transport_id",
             )
+            self._rejections = ImmutableJsonlJournal(
+                self.root / "operational" / "frame_rejections.jsonl",
+                id_field="rejection_id",
+            )
             self._events.assert_complete()
             self._observations.assert_complete()
             self._gaps.assert_complete()
             self._transport.assert_complete()
+            self._rejections.assert_complete()
             self.transport_failures = self._transport.recovery.record_count
+            self.rejected_frames = self._rejections.recovery.record_count
             if self._gaps.recovery.record_count:
                 raise FastWatchIntegrityError("Prior shadow gap requires review.")
+            if self.rejected_frames:
+                raise FastWatchIntegrityError("Prior rejected frame requires review.")
             self._baselines = RollingBaselineEngine(
                 JsonBaselineStore(self.root / "state" / "baselines.json")
             )
@@ -293,55 +419,92 @@ class FastWatchShadow:
     ) -> str | None:
         if not self._started or self._floor is None:
             raise FastWatchIntegrityError("FAST WATCH subscription is not active.")
-        minute = parse_confirmed_minute(
-            raw,
-            received_at=received_at or self.clock(),
-            allowed_symbols=frozenset(self.config.symbols),
-        )
-        if minute is None:
-            return None
-        if minute.exchange_close_at <= self._floor and not self._candles[minute.symbol]:
-            return None  # Never process a retrospective subscription snapshot.
-        if (
-            minute.received_at - minute.exchange_close_at
-            > self.config.maximum_delivery_lag
-        ):
-            self._record_gap(
-                minute.symbol,
-                minute.candle.timestamp,
-                minute.candle.timestamp,
-                "late_confirmed",
-                minute.received_at,
+        try:
+            minutes = parse_confirmed_minutes(
+                raw,
+                received_at=received_at or self.clock(),
+                allowed_symbols=frozenset(self.config.symbols),
             )
-            raise FastWatchIntegrityError(
-                "Closed candle arrived too late for the pilot."
+            planned = self._preflight_frame(minutes)
+        except FastWatchIntegrityError as error:
+            self._record_frame_rejection(raw, error)
+            raise
+        latest_event: str | None = None
+        for minute in planned:
+            event_id = self._commit_minute(minute)
+            if event_id is not None:
+                latest_event = event_id
+        return latest_event
+
+    def _preflight_frame(
+        self, minutes: tuple[ConfirmedMinute, ...]
+    ) -> tuple[ConfirmedMinute, ...]:
+        """Validate all new candles against committed state before any market write."""
+        if self._floor is None:
+            raise FastWatchIntegrityError("FAST WATCH subscription is not active.")
+        planned: list[ConfirmedMinute] = []
+        for minute in minutes:
+            ring = self._candles[minute.symbol]
+            if not ring and minute.exchange_close_at <= self._floor:
+                continue  # Never process a retrospective subscription snapshot.
+            existing = next(
+                (item for item in ring if item.timestamp == minute.candle.timestamp),
+                None,
             )
-        ring = self._candles[minute.symbol]
-        if ring:
-            previous = ring[-1]
-            if minute.candle.timestamp == previous.timestamp:
-                if minute.candle != previous:
-                    raise FastWatchIntegrityError(
-                        "Conflicting duplicate minute candle."
+            if existing is not None:
+                if existing != minute.candle:
+                    raise FastWatchFrameError(
+                        "duplicate_conflict", "Conflicting duplicate minute candle."
                     )
-                return None
-            if minute.candle.timestamp != previous.timestamp + MINUTE:
-                if minute.candle.timestamp > previous.timestamp + MINUTE:
+                continue
+            previous_start = (
+                planned[-1].candle.timestamp
+                if planned and planned[-1].symbol == minute.symbol
+                else ring[-1].timestamp
+                if ring
+                else None
+            )
+            if (
+                previous_start is not None
+                and minute.candle.timestamp != previous_start + MINUTE
+            ):
+                if minute.candle.timestamp > previous_start + MINUTE:
                     self._record_gap(
                         minute.symbol,
-                        previous.timestamp + MINUTE,
+                        previous_start + MINUTE,
                         minute.candle.timestamp - MINUTE,
                         "missing_confirmed",
                         minute.received_at,
                     )
-                raise FastWatchIntegrityError(
-                    "Confirmed minute candle gap or reversal."
+                raise FastWatchFrameError(
+                    "continuity", "Confirmed minute candle gap or reversal."
                 )
-        previous_received = self._last_received.get(minute.symbol)
-        if previous_received is not None and minute.received_at <= previous_received:
-            raise FastWatchIntegrityError("Non-monotonic market receive time.")
+            if (
+                minute.received_at - minute.exchange_close_at
+                > self.config.maximum_delivery_lag
+            ):
+                self._record_gap(
+                    minute.symbol,
+                    minute.candle.timestamp,
+                    minute.candle.timestamp,
+                    "late_confirmed",
+                    minute.received_at,
+                )
+                raise FastWatchFrameError(
+                    "late_confirmed", "Closed candle arrived too late for the pilot."
+                )
+            previous_received = self._last_received.get(minute.symbol)
+            if previous_received is not None and minute.received_at < previous_received:
+                raise FastWatchFrameError(
+                    "receive_order", "Non-monotonic market receive time."
+                )
+            planned.append(minute)
+        return tuple(planned)
+
+    def _commit_minute(self, minute: ConfirmedMinute) -> str | None:
         if self._engine is None or self._events is None or self._observations is None:
             raise FastWatchIntegrityError("FAST WATCH engine is unavailable.")
+        ring = self._candles[minute.symbol]
         series = MarketSeries(
             Instrument(minute.symbol, AssetClass.CRYPTO),
             "1m",
@@ -401,6 +564,68 @@ class FastWatchShadow:
             self.event_count += 1
         return event_id
 
+    def _record_frame_rejection(
+        self, raw: str | bytes, error: FastWatchIntegrityError
+    ) -> None:
+        if self._rejections is None:
+            raise FastWatchIntegrityError("Frame rejection journal is unavailable.")
+        encoded = raw.encode("utf-8") if isinstance(raw, str) else raw
+        frame: Any = None
+        if len(encoded) <= MAX_FRAME_BYTES:
+            with contextlib.suppress(ValueError, UnicodeDecodeError):
+                frame = json.loads(encoded)
+        data = frame.get("data") if isinstance(frame, dict) else None
+        topic = frame.get("topic") if isinstance(frame, dict) else None
+        accepted_topics = {f"kline.1.{symbol}" for symbol in self.config.symbols}
+        key_sets = [
+            sorted(ROW_DIAGNOSTIC_KEYS.intersection(row))
+            if isinstance(row, dict)
+            else []
+            for row in (data[:MAX_FRAME_ITEMS] if isinstance(data, list) else ())
+        ]
+        other_key_counts = [
+            len(row) - len(ROW_DIAGNOSTIC_KEYS.intersection(row))
+            if isinstance(row, dict)
+            else 0
+            for row in (data[:MAX_FRAME_ITEMS] if isinstance(data, list) else ())
+        ]
+        sequence = self.rejected_frames + 1
+        record_id = f"fast-frame-rejection:{sequence}"
+        self._rejections.append(
+            record_id,
+            {
+                "rejection_id": record_id,
+                "recorded_at": _utc(self.clock()).isoformat(),
+                "size_bytes": len(encoded),
+                "topic": (
+                    topic
+                    if isinstance(topic, str) and topic in accepted_topics
+                    else "<invalid-or-absent>"
+                ),
+                "payload_type": type(frame).__name__,
+                "data_type": type(data).__name__,
+                "element_count": len(data) if isinstance(data, list) else None,
+                "frame_keys": (
+                    sorted(FRAME_DIAGNOSTIC_KEYS.intersection(frame))
+                    if isinstance(frame, dict)
+                    else []
+                ),
+                "frame_other_key_count": (
+                    len(frame) - len(FRAME_DIAGNOSTIC_KEYS.intersection(frame))
+                    if isinstance(frame, dict)
+                    else 0
+                ),
+                "row_key_sets": key_sets,
+                "row_other_key_counts": other_key_counts,
+                "error_category": (
+                    error.category
+                    if isinstance(error, FastWatchFrameError)
+                    else "integrity"
+                ),
+            },
+        )
+        self.rejected_frames = sequence
+
     @property
     def retained_counts(self) -> dict[str, int]:
         baseline = self._baselines.retained_counts if self._baselines else (0, 0, 240)
@@ -411,6 +636,7 @@ class FastWatchShadow:
                 self._observations,
                 self._gaps,
                 self._transport,
+                self._rejections,
             )
             if journal is not None
         )

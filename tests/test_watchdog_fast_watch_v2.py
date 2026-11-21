@@ -11,10 +11,13 @@ import pytest
 
 from market_signal_assistant.watchdog.fast_watch_v2 import (
     MAX_FRAME_BYTES,
+    MAX_FRAME_ITEMS,
     FastWatchConfig,
+    FastWatchFrameError,
     FastWatchIntegrityError,
     FastWatchShadow,
     parse_confirmed_minute,
+    parse_confirmed_minutes,
 )
 from market_signal_assistant.watchdog.runtime.fast_watch_v2 import consume_socket
 
@@ -56,6 +59,16 @@ def _frame(
 
 def _received(index: int, seconds: int = 1) -> datetime:
     return BASE + timedelta(minutes=index + 1, seconds=seconds)
+
+
+def _batch_frame(*indices: int, symbol: str = "DOTUSDT") -> str:
+    assert indices
+    frame = json.loads(_frame(indices[0], symbol=symbol))
+    frame["data"] = [
+        json.loads(_frame(index, symbol=symbol))["data"][0] for index in indices
+    ]
+    frame["ts"] = int((BASE + timedelta(minutes=max(indices) + 1)).timestamp() * 1000)
+    return json.dumps(frame)
 
 
 def _pilot(root: Path, *, symbols: tuple[str, ...] = ("DOTUSDT",)) -> FastWatchShadow:
@@ -103,6 +116,198 @@ def test_parser_accepts_only_finite_confirmed_closed_one_minute_candles() -> Non
             )
     with pytest.raises(FastWatchIntegrityError, match="before close"):
         parse_confirmed_minute(_frame(0), received_at=BASE, allowed_symbols=allowed)
+
+
+def test_bounded_multi_row_frame_commits_confirmed_minutes_in_order(
+    tmp_path: Path,
+) -> None:
+    allowed = frozenset({"DOTUSDT"})
+    assert (
+        len(
+            parse_confirmed_minutes(
+                _frame(0), received_at=_received(0), allowed_symbols=allowed
+            )
+        )
+        == 1
+    )
+    assert [
+        minute.candle.timestamp
+        for minute in parse_confirmed_minutes(
+            _batch_frame(0, 1), received_at=_received(1), allowed_symbols=allowed
+        )
+    ] == [BASE, BASE + timedelta(minutes=1)]
+    root = tmp_path / "watchdog-fast-watch-v2-batch"
+    pilot = _pilot(root)
+    pilot.ingest(_batch_frame(0, 1), received_at=_received(1))
+    assert pilot.confirmed_count == 2
+    assert len((root / "observations/confirmed.jsonl").read_text().splitlines()) == 2
+    pilot.close()
+    recovered = _pilot(root)
+    assert recovered.confirmed_count == 2
+    recovered.close()
+
+
+def test_open_rows_and_identical_duplicate_rows_are_not_double_committed(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "watchdog-fast-watch-v2-open-duplicate"
+    pilot = _pilot(root)
+    frame = json.loads(_batch_frame(0, 1))
+    frame["data"][1]["confirm"] = False
+    pilot.ingest(json.dumps(frame), received_at=_received(1))
+    assert pilot.confirmed_count == 1
+    pilot.ingest(_batch_frame(0, 0), received_at=_received(0, 2))
+    assert pilot.confirmed_count == 1
+    pilot.close()
+
+
+@pytest.mark.parametrize(
+    ("data", "category"),
+    [
+        ([], "data_empty"),
+        ([{}] * (MAX_FRAME_ITEMS + 1), "data_oversized"),
+        ({"start": 1}, "data_shape"),
+        ([1], "row_shape"),
+    ],
+)
+def test_invalid_array_shapes_fail_closed(
+    data: object, category: str, tmp_path: Path
+) -> None:
+    root = tmp_path / f"watchdog-fast-watch-v2-{category}"
+    pilot = _pilot(root)
+    frame = json.loads(_frame(0))
+    frame["data"] = data
+    with pytest.raises(FastWatchFrameError) as caught:
+        pilot.ingest(json.dumps(frame), received_at=_received(0))
+    assert caught.value.category == category
+    assert pilot.confirmed_count == 0
+    assert not (root / "observations/confirmed.jsonl").exists()
+    diagnostic = json.loads((root / "operational/frame_rejections.jsonl").read_text())
+    assert diagnostic["error_category"] == category
+    assert diagnostic["data_type"] == type(data).__name__
+    pilot.close()
+    with pytest.raises(FastWatchIntegrityError, match="Prior rejected frame"):
+        _pilot(root)
+
+
+def test_mixed_valid_invalid_frame_is_atomic_and_diagnostics_are_redacted(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "watchdog-fast-watch-v2-atomic"
+    pilot = _pilot(root)
+    frame = json.loads(_batch_frame(0, 1))
+    frame["data"][1]["close"] = "not-a-number"
+    frame["private_token"] = "DO_NOT_PERSIST_SECRET"
+    with pytest.raises(FastWatchFrameError):
+        pilot.ingest(json.dumps(frame), received_at=_received(1))
+    assert pilot.confirmed_count == 0
+    assert pilot.retained_counts["baseline_observations"] == 0
+    assert not (root / "observations/confirmed.jsonl").exists()
+    assert not (root / "events/events.jsonl").exists()
+    assert not (root / "state/symbols.json").exists()
+    diagnostic = (root / "operational/frame_rejections.jsonl").read_text()
+    assert "DO_NOT_PERSIST_SECRET" not in diagnostic
+    assert "not-a-number" not in diagnostic
+    row = json.loads(diagnostic)
+    assert row["size_bytes"] == len(json.dumps(frame).encode())
+    assert row["topic"] == "kline.1.DOTUSDT"
+    assert row["element_count"] == 2
+    assert row["row_key_sets"]
+    assert row["frame_other_key_count"] == 1
+    pilot.close()
+
+
+def test_invalid_later_row_preserves_existing_state_without_partial_append(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "watchdog-fast-watch-v2-atomic-existing"
+    pilot = _pilot(root)
+    pilot.ingest(_frame(0), received_at=_received(0))
+    observations = (root / "observations/confirmed.jsonl").read_bytes()
+    state = (root / "state/symbols.json").read_bytes()
+    baseline_count = pilot.retained_counts["baseline_observations"]
+    frame = json.loads(_batch_frame(1, 2))
+    frame["data"][1]["symbol"] = "ETHUSDT"
+    with pytest.raises(FastWatchFrameError) as caught:
+        pilot.ingest(json.dumps(frame), received_at=_received(2))
+    assert caught.value.category == "topic_mismatch"
+    assert (root / "observations/confirmed.jsonl").read_bytes() == observations
+    assert (root / "state/symbols.json").read_bytes() == state
+    assert pilot.retained_counts["baseline_observations"] == baseline_count
+    pilot.close()
+
+
+def test_oversized_unparseable_frame_captures_only_bounded_structure(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "watchdog-fast-watch-v2-oversized-diagnostic"
+    pilot = _pilot(root)
+    raw = "DO_NOT_PERSIST_SECRET" + " " * MAX_FRAME_BYTES
+    with pytest.raises(FastWatchFrameError) as caught:
+        pilot.ingest(raw, received_at=_received(0))
+    assert caught.value.category == "frame_oversized"
+    diagnostic = (root / "operational/frame_rejections.jsonl").read_text()
+    assert "DO_NOT_PERSIST_SECRET" not in diagnostic
+    row = json.loads(diagnostic)
+    assert row["size_bytes"] == len(raw.encode())
+    assert row["topic"] == "<invalid-or-absent>"
+    assert row["row_key_sets"] == []
+    assert len(diagnostic) < 1024
+    pilot.close()
+
+
+def test_order_duplicate_topic_and_timestamp_conflicts_fail_closed() -> None:
+    allowed = frozenset({"DOTUSDT"})
+    cases: list[tuple[str, str]] = []
+    cases.append((_batch_frame(1, 0), "row_order"))
+    conflicting = json.loads(_batch_frame(0, 0))
+    conflicting["data"][1]["close"] = "9.9"
+    conflicting["data"][1]["low"] = "9.9"
+    cases.append((json.dumps(conflicting), "duplicate_conflict"))
+    wrong_topic = json.loads(_frame(0))
+    wrong_topic["topic"] = "kline.5.DOTUSDT"
+    cases.append((json.dumps(wrong_topic), "topic_mismatch"))
+    wrong_symbol = json.loads(_frame(0))
+    wrong_symbol["topic"] = "kline.1.ETHUSDT"
+    cases.append((json.dumps(wrong_symbol), "topic_mismatch"))
+    wrong_row_symbol = json.loads(_frame(0))
+    wrong_row_symbol["data"][0]["symbol"] = "ETHUSDT"
+    cases.append((json.dumps(wrong_row_symbol), "topic_mismatch"))
+    bad_source_time = json.loads(_frame(0))
+    bad_source_time["ts"] = int(
+        (_received(1) + timedelta(seconds=1)).timestamp() * 1000
+    )
+    cases.append((json.dumps(bad_source_time), "timestamp_conflict"))
+    bad_end = json.loads(_frame(0))
+    bad_end["data"][0]["end"] += 1
+    cases.append((json.dumps(bad_end), "timestamp_conflict"))
+    before_close = json.loads(_frame(0))
+    before_close["ts"] = int((BASE + timedelta(seconds=30)).timestamp() * 1000)
+    cases.append((json.dumps(before_close), "timestamp_conflict"))
+    last_trade_after_source = json.loads(_frame(0))
+    last_trade_after_source["data"][0]["timestamp"] = int(
+        (_received(0) + timedelta(seconds=1)).timestamp() * 1000
+    )
+    cases.append((json.dumps(last_trade_after_source), "timestamp_conflict"))
+    for raw, category in cases:
+        with pytest.raises(FastWatchFrameError) as caught:
+            parse_confirmed_minutes(
+                raw, received_at=_received(1), allowed_symbols=allowed
+            )
+        assert caught.value.category == category
+
+
+def test_reconnect_snapshot_reuses_matching_history_without_retro_detection(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "watchdog-fast-watch-v2-reconnect-batch"
+    pilot = _pilot(root)
+    pilot.ingest(_frame(0), received_at=_received(0))
+    pilot.begin_subscription(BASE + timedelta(minutes=1, seconds=30))
+    pilot.ingest(_batch_frame(0, 1), received_at=_received(1))
+    assert pilot.confirmed_count == 2
+    assert len((root / "observations/confirmed.jsonl").read_text().splitlines()) == 2
+    pilot.close()
 
 
 def test_subscription_snapshot_duplicate_gap_and_late_close_fail_closed(
@@ -211,11 +416,14 @@ def test_crash_after_engine_state_before_observation_is_quarantined(
 
     candles = tuple(pilot._candles["DOTUSDT"])
     next_candle = Candle(BASE + timedelta(minutes=5), 10, 10, 10, 10, 100)
+    assert pilot._states is not None
+    last_state = pilot._states.persisted("DOTUSDT")
+    assert last_state is not None
     pilot._engine.evaluate(
         MarketSeries(
             Instrument("DOTUSDT", AssetClass.CRYPTO), "1m", (*candles, next_candle)
         ),
-        detected_at=_received(5),
+        detected_at=last_state.symbol_state.last_detected_at + timedelta(seconds=1),
     )
     pilot.close()
     with pytest.raises(FastWatchIntegrityError, match="cursor diverged"):
